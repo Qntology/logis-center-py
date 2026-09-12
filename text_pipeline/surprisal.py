@@ -5,6 +5,8 @@ import numpy as np
 
 from .field_bank import FieldBank, FieldEntry
 
+BANK_PENALTY_DAMP = 0.25
+
 
 def gumbel_expected_z(n: int) -> float:
     if n <= 1:
@@ -53,6 +55,8 @@ class SurprisalScore:
         surprisal: float,
         bank_size: int,
         best_phrase: str = "",
+        raw_label: float = 0.0,
+        label_phrase: str = "",
     ):
         self.field_name = field_name
         self.raw_bias = float(raw_bias)
@@ -63,24 +67,34 @@ class SurprisalScore:
         self.surprisal = float(surprisal)
         self.bank_size = int(bank_size)
         self.best_phrase = best_phrase
+        self.raw_label = float(raw_label)
+        self.label_phrase = label_phrase
+
+    @property
+    def label_dominant(self) -> bool:
+        return self.raw_label > self.raw_bias
 
     def to_dict(self) -> dict:
         return {
             "field_name": self.field_name,
             "raw_bias": round(self.raw_bias, 6),
             "raw_prejudice": round(self.raw_prejudice, 6),
+            "raw_label": round(self.raw_label, 6),
             "net": round(self.net, 6),
             "z": round(self.z, 6),
             "penalty": round(self.penalty, 6),
             "surprisal": round(self.surprisal, 6),
             "bank_size": self.bank_size,
             "best_phrase": self.best_phrase,
+            "label_phrase": self.label_phrase,
+            "label_dominant": self.label_dominant,
         }
 
     def __repr__(self) -> str:
+        mark = " [LABEL]" if self.label_dominant else ""
         return (
             f"<Surprisal {self.field_name} net={self.net:+.4f} "
-            f"z={self.z:+.4f} −{self.penalty:.4f} = {self.surprisal:+.4f}>"
+            f"z={self.z:+.4f} −{self.penalty:+.4f} = {self.surprisal:+.4f}{mark}>"
         )
 
 
@@ -96,7 +110,7 @@ def surprisal_dual_scores(
     names = list(field_names) if field_names else bank.field_names
 
     raw_nets: List[float] = []
-    details: List[Tuple[str, float, float, int, str]] = []
+    details: List[Tuple[str, float, float, int, str, float, str]] = []
 
     for name in names:
         entry: Optional[FieldEntry] = bank.get(name)
@@ -114,9 +128,21 @@ def surprisal_dual_scores(
             prej_sim, _pidx = weighted_max_pool(v, pmat, pwts)
             prej_sim = max(0.0, prej_sim)
 
+        lmat, lwts = entry.label_matrix()
+        label_sim = 0.0
+        label_phrase = ""
+        if lmat.size:
+            label_sim, lidx = weighted_max_pool(v, lmat, lwts)
+            label_sim = max(0.0, label_sim)
+            if 0 <= lidx < len(entry.label):
+                label_phrase = entry.label[lidx].text
+
         net = bias_sim - prej_sim
         raw_nets.append(net)
-        details.append((name, bias_sim, prej_sim, entry.bank_size(), best_phrase))
+        details.append((
+            name, bias_sim, prej_sim, entry.bank_size(),
+            best_phrase, label_sim, label_phrase,
+        ))
 
     if not details:
         return []
@@ -125,10 +151,18 @@ def surprisal_dual_scores(
     mean = float(arr.mean())
     std = float(arr.std())
 
+    penalties = np.asarray(
+        [gumbel_expected_z(max(1, d[3])) for d in details], dtype=np.float64
+    )
+    penalty_mu = float(penalties.mean())
+
     out: List[SurprisalScore] = []
-    for (name, bias_sim, prej_sim, bank_size, best_phrase), net in zip(details, raw_nets):
+    for idx, (
+        name, bias_sim, prej_sim, bank_size, best_phrase, label_sim, label_phrase
+    ) in enumerate(details):
+        net = raw_nets[idx]
         z = 0.0 if std < 1e-8 else (net - mean) / std
-        penalty = gumbel_expected_z(max(1, bank_size))
+        penalty = (float(penalties[idx]) - penalty_mu) * BANK_PENALTY_DAMP
         out.append(
             SurprisalScore(
                 field_name=name,
@@ -140,11 +174,33 @@ def surprisal_dual_scores(
                 surprisal=z - penalty,
                 bank_size=bank_size,
                 best_phrase=best_phrase,
+                raw_label=label_sim,
+                label_phrase=label_phrase,
             )
         )
 
     out.sort(key=lambda s: s.surprisal, reverse=True)
     return out
+
+
+def strip_label_prefix(text: str, label: str) -> str:
+    body = (text or "").strip()
+    lab = (label or "").strip()
+    if not body or not lab:
+        return body
+
+    low_body = body.lower()
+    low_lab = lab.lower()
+
+    if low_body == low_lab:
+        return ""
+
+    if low_body.startswith(low_lab):
+        rest = body[len(lab):]
+        rest = rest.lstrip(" \t:：=-—·|,")
+        return rest.strip()
+
+    return body
 
 
 def score_chunks(
@@ -163,16 +219,25 @@ def score_chunks(
         scores = surprisal_dual_scores(vectors[idx], bank)
         if not scores:
             continue
+
+        top = scores[0]
+        margin = (
+            top.surprisal - scores[1].surprisal if len(scores) > 1 else top.surprisal
+        )
+
         passed = [s for s in scores if s.surprisal > gate]
         if not passed:
+            chunk.margin = margin
             continue
+
         results[idx] = passed
-        top = passed[0]
         chunk.score = top.surprisal
         chunk.property = top.field_name
-        chunk.margin = (
-            top.surprisal - passed[1].surprisal if len(passed) > 1 else top.surprisal
-        )
+        chunk.margin = margin
+
+        if not chunk.value_part:
+            chunk.value_part = strip_label_prefix(chunk.text, top.label_phrase)
+
     return results
 
 

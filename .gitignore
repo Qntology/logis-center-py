@@ -20,8 +20,12 @@ build/
 *.bak
 
 # ── 모델 / 인덱스 (AppData에 저장되지만 실수 방지) ────────
+models/
 *.safetensors
+*.safetensors.part
 *.npz
+*.bin
+*.model
 zvec_index.*
 config.json
 model.safetensors

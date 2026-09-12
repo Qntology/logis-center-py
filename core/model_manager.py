@@ -2,6 +2,8 @@ import shutil
 from pathlib import Path
 from typing import Dict, List, Optional
 
+from .lang_codes import normalize_lang_code
+
 BASE_DIR = Path(__file__).resolve().parent.parent
 MODELS_ROOT = BASE_DIR / "models"
 
@@ -24,11 +26,21 @@ class MissingModelError(RuntimeError):
 
 MODEL_SPECS: Dict[str, dict] = {
     "alphaedge-ai": {
-        "label": "AlphaEdge AI (LLM + 멀티모달 임베딩)",
-        "role": "llm",
+        "label": "AlphaEdge AI (선택 · 로컬 배치 전용)",
+        "role": "optional",
         "dir": LLM_PATH,
         "asset_source": None,
         "min_size": 100_000_000,
+        "repo": "",
+        "files": (),
+        "required": (),
+        "optional": (),
+        "manual_only": True,
+        "note": (
+            "원격 저장소가 없습니다. 사용하려면 models/alphaedge-ai/ 에 "
+            "직접 배치하세요. 배치하지 않으면 언어 스코프 모델"
+            "(Qwen3-Embedding / Qwen3.5-2B)이 그 역할을 대신합니다."
+        ),
     },
     "ax-ve": {
         "label": "A.X-VE 비전 인코더",
@@ -36,6 +48,18 @@ MODEL_SPECS: Dict[str, dict] = {
         "dir": VISION_ENC_PATH,
         "asset_source": BASE_DIR / "ax-ve",
         "min_size": 10_000_000,
+        "repo": "skt/A.X-VE",
+        "files": (
+            "config.json",
+            "model.safetensors",
+            "preprocessor_config.json",
+            "configuration_ax_ve.py",
+            "modeling_ax_ve.py",
+            "image_processing_ax_ve.py",
+            "processing_ax_ve.py",
+        ),
+        "required": ("config.json", "model.safetensors"),
+        "optional": ("processing_ax_ve.py",),
     },
     "hayai": {
         "label": "Hayai OCR v2",
@@ -43,17 +67,150 @@ MODEL_SPECS: Dict[str, dict] = {
         "dir": OCR_PATH,
         "asset_source": BASE_DIR / "hayai",
         "min_size": 10_000_000,
+        "repo": "JustANormalTinkerer/hayai-ocr-v2",
+        "files": (
+            "config.json",
+            "model.safetensors",
+            "configuration_hayai.py",
+            "modeling_hayai.py",
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "special_tokens_map.json",
+            "vocab.json",
+            "merges.txt",
+            "tokenizer.model",
+            "spiece.model",
+        ),
+        "required": ("config.json", "model.safetensors"),
+        "optional": (
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "special_tokens_map.json",
+            "vocab.json",
+            "merges.txt",
+            "tokenizer.model",
+            "spiece.model",
+        ),
+    },
+    "siglip2-naflex": {
+        "label": "SigLIP2 NaFlex (Hayai 비전 설정)",
+        "role": "support",
+        "dir": SIGLIP2_LOCAL_DIR,
+        "asset_source": None,
+        "min_size": 0,
+        "repo": "google/siglip2-base-patch16-naflex",
+        "files": (
+            "config.json",
+            "preprocessor_config.json",
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "special_tokens_map.json",
+        ),
+        "required": ("config.json", "preprocessor_config.json"),
+        "optional": ("special_tokens_map.json", "tokenizer_config.json"),
     },
 }
 
 MODEL_KEYS = tuple(MODEL_SPECS.keys())
 
+CORE_MODEL_KEYS = ("ax-ve", "hayai", "siglip2-naflex")
+
+OPTIONAL_MODEL_KEYS = ("alphaedge-ai",)
+
+
+def model_repo_id(key: str) -> str:
+    return str(_spec(key).get("repo", "") or "")
+
+
+def is_manual_only(key: str) -> bool:
+    return bool(_spec(key).get("manual_only", False))
+
+
+def model_note(key: str) -> str:
+    return str(_spec(key).get("note", "") or "")
+
+
+def model_all_files(key: str) -> tuple:
+    return tuple(_spec(key).get("files", ()) or ())
+
+
+def model_required_files(key: str) -> tuple:
+    return tuple(_spec(key).get("required", ()) or ())
+
+
+def model_optional_files(key: str) -> tuple:
+    return tuple(_spec(key).get("optional", ()) or ())
+
+
+def delete_model(key: str) -> dict:
+    spec = _spec(key)
+    target: Path = spec["dir"]
+    removed = 0
+    freed = 0
+
+    if not target.is_dir():
+        return {"ok": True, "key": key, "removed": 0, "freed": 0}
+
+    for p in sorted(target.rglob("*")):
+        if not p.is_file():
+            continue
+        if p.suffix not in WEIGHT_SUFFIXES:
+            continue
+        try:
+            freed += p.stat().st_size
+            p.unlink()
+            removed += 1
+        except Exception:
+            continue
+
+    for p in sorted(target.rglob("*.part")):
+        try:
+            p.unlink()
+        except Exception:
+            continue
+
+    return {"ok": True, "key": key, "removed": removed, "freed": freed}
+
+
+def delete_lang_model(kind: str, code: str) -> dict:
+    import shutil
+
+    d = lang_model_dir(kind, code)
+    if not d.is_dir():
+        return {"ok": True, "kind": kind, "code": code, "freed": 0}
+
+    freed = sum(p.stat().st_size for p in d.rglob("*") if p.is_file())
+    try:
+        shutil.rmtree(d)
+        return {"ok": True, "kind": kind, "code": code, "freed": freed}
+    except Exception as e:
+        return {"ok": False, "kind": kind, "code": code, "error": str(e)}
+
+
+def delete_stanza(iso1: str) -> dict:
+    import shutil
+
+    d = stanza_lang_dir(iso1)
+    if not d.is_dir():
+        return {"ok": True, "iso1": iso1, "freed": 0}
+
+    freed = sum(p.stat().st_size for p in d.rglob("*") if p.is_file())
+    try:
+        shutil.rmtree(d)
+        return {"ok": True, "iso1": iso1, "freed": freed}
+    except Exception as e:
+        return {"ok": False, "iso1": iso1, "error": str(e)}
+
 
 DEFAULT_LANGUAGE = "eng"
+
+BOOTSTRAP_LANGUAGES = ("eng", "kor")
 
 ACTIVE_LANGUAGE_FILE = MODELS_ROOT / ".active_language.json"
 
 LANG_MODEL_KINDS = ("siglip2", "qwen3emb", "qwen35")
+
+LANG_KIND_PRIORITY = ("qwen3emb", "siglip2", "qwen35")
 
 LANG_REPO_TEMPLATES: Dict[str, dict] = {
     "siglip2": {
@@ -120,6 +277,10 @@ LANG_REPO_TEMPLATES: Dict[str, dict] = {
 STANZA_OWNER = "stanfordnlp"
 STANZA_REPO_TEMPLATE = "stanza-{iso1}"
 STANZA_RESOURCE_FILE = "models/resources.json"
+STANZA_RESOURCE_CANDIDATES = (
+    "models/resources.json",
+    "resources.json",
+)
 STANZA_ROOT = MODELS_ROOT / "stanza"
 STANZA_MIN_SIZE = 1_000_000
 
@@ -367,6 +528,75 @@ def installed_language_codes() -> List[str]:
     return codes
 
 
+def embedder_ready_codes() -> List[str]:
+    out = []
+    for code in installed_language_codes():
+        if lang_model_ready("qwen3emb", code):
+            out.append(code)
+    for code in BOOTSTRAP_LANGUAGES:
+        if code not in out and lang_model_ready("qwen3emb", code):
+            out.append(code)
+    return out
+
+
+def any_embedder_ready() -> bool:
+    return bool(embedder_ready_codes())
+
+
+def bootstrap_ready(kinds: Optional[List[str]] = None) -> bool:
+    kinds = list(kinds or ["qwen3emb"])
+    for code in BOOTSTRAP_LANGUAGES:
+        for kind in kinds:
+            if not lang_model_ready(kind, code):
+                return False
+    return True
+
+
+def missing_bootstrap(kinds: Optional[List[str]] = None) -> List[tuple]:
+    kinds = list(kinds or ["qwen3emb"])
+    out = []
+    for code in BOOTSTRAP_LANGUAGES:
+        for kind in kinds:
+            if not lang_model_ready(kind, code):
+                out.append((kind, code))
+    return out
+
+
+def resolve_working_codes(
+    preferred: Optional[str] = None,
+    resolved: bool = False,
+) -> List[str]:
+    codes: List[str] = []
+
+    if resolved and preferred:
+        p = normalize_lang_code(preferred)
+        codes.append(p)
+
+    for c in BOOTSTRAP_LANGUAGES:
+        if c not in codes:
+            codes.append(c)
+
+    if not resolved and preferred:
+        p = normalize_lang_code(preferred)
+        if p not in codes:
+            codes.insert(0, p)
+
+    return codes
+
+
+def describe_bootstrap() -> dict:
+    out = {"languages": list(BOOTSTRAP_LANGUAGES), "entries": [], "ready": True}
+    for code in BOOTSTRAP_LANGUAGES:
+        for kind in LANG_KIND_PRIORITY:
+            info = describe_lang_model(kind, code)
+            info["scope"] = "bootstrap"
+            info["id"] = f"lang:{kind}:{code}"
+            out["entries"].append(info)
+            if kind == "qwen3emb" and not info["ready"]:
+                out["ready"] = False
+    return out
+
+
 def _spec(key: str) -> dict:
     spec = MODEL_SPECS.get(key)
     if spec is None:
@@ -410,11 +640,30 @@ def has_config(key: str) -> bool:
 
 def is_model_ready(key: str) -> bool:
     spec = _spec(key)
-    if not spec["dir"].is_dir():
+    d: Path = spec["dir"]
+    if not d.is_dir():
         return False
-    if total_weight_bytes(key) < spec["min_size"]:
+
+    if is_manual_only(key):
+        if not (d / "config.json").exists():
+            return False
+        min_size = int(spec.get("min_size", 0) or 0)
+        return total_weight_bytes(key) >= min_size
+
+    for fname in model_required_files(key):
+        p = d / fname
+        if not p.exists() or p.stat().st_size <= 0:
+            return False
+
+    min_size = int(spec.get("min_size", 0) or 0)
+    if min_size > 0 and total_weight_bytes(key) < min_size:
         return False
+
     return True
+
+
+def missing_core_models() -> List[str]:
+    return [k for k in CORE_MODEL_KEYS if not is_model_ready(k)]
 
 
 def missing_models() -> List[str]:
@@ -481,15 +730,38 @@ def ensure_model_dir(key: str) -> Path:
 
 def describe_model(key: str) -> dict:
     spec = _spec(key)
+    d: Path = spec["dir"]
+
+    present = []
+    missing = []
+    for fname in model_all_files(key):
+        p = d / fname
+        if p.exists() and p.stat().st_size > 0:
+            present.append(fname)
+        else:
+            missing.append(fname)
+
+    total_bytes = 0
+    if d.is_dir():
+        total_bytes = sum(p.stat().st_size for p in d.rglob("*") if p.is_file())
+
     return {
         "key": key,
         "label": spec["label"],
         "role": spec["role"],
+        "core": key in CORE_MODEL_KEYS,
+        "optional": key in OPTIONAL_MODEL_KEYS,
+        "manual_only": is_manual_only(key),
+        "note": model_note(key),
         "ready": is_model_ready(key),
         "config": has_config(key),
-        "dir": str(spec["dir"]),
+        "dir": str(d),
         "path": str(get_model_path(key)),
-        "bytes": total_weight_bytes(key),
+        "repo": model_repo_id(key),
+        "bytes": total_bytes,
+        "weight_bytes": total_weight_bytes(key),
+        "present": present,
+        "missing": missing,
         "asset_source": str(spec["asset_source"]) if spec.get("asset_source") else "",
     }
 

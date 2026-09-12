@@ -7,16 +7,21 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 import requests
 
+from typing import Sequence
+
 from .lang_codes import iso1_of, language_name, normalize_lang_code
 from .model_manager import (
     DEFAULT_LANGUAGE,
     LANG_MODEL_KINDS,
     LANG_REPO_TEMPLATES,
     MODELS_ROOT,
+    MODEL_SPECS,
     STANZA_CORE_PROCESSORS,
     STANZA_OPTIONAL_PROCESSORS,
     STANZA_RESOURCE_FILE,
     STANZA_ROOT,
+    get_model_dir,
+    is_model_ready,
     lang_all_files,
     lang_model_dir,
     lang_model_ready,
@@ -24,11 +29,16 @@ from .model_manager import (
     lang_repo_id,
     lang_required_files,
     missing_lang_models,
+    model_all_files,
+    model_optional_files,
+    model_repo_id,
+    model_required_files,
     save_active_language,
     stanza_lang_dir,
     stanza_ready,
     stanza_repo_id,
     stanza_resources_path,
+    sync_model_assets,
 )
 
 HF_ENDPOINT = os.environ.get("HF_ENDPOINT", "https://huggingface.co").rstrip("/")
@@ -393,6 +403,274 @@ class LanguageModelFetcher:
         return {"ok": True, "code": normalize_lang_code(code)}
 
 
+def base_file_url(key: str, filename: str) -> str:
+    return f"{HF_ENDPOINT}/{model_repo_id(key)}/resolve/main/{filename}"
+
+
+def probe_base_file(key: str, filename: str, timeout: int = HEAD_TIMEOUT) -> Optional[int]:
+    repo = model_repo_id(key)
+    if not repo:
+        return None
+    try:
+        resp = requests.head(
+            base_file_url(key, filename),
+            headers=_headers(),
+            allow_redirects=True,
+            timeout=timeout,
+        )
+    except requests.exceptions.RequestException:
+        return None
+    if resp.status_code != 200:
+        return None
+    size = resp.headers.get("x-linked-size") or resp.headers.get("content-length")
+    try:
+        return int(size) if size is not None else 0
+    except (TypeError, ValueError):
+        return 0
+
+
+def probe_base_model(key: str, timeout: int = HEAD_TIMEOUT) -> bool:
+    if not model_repo_id(key):
+        return False
+    for fname in model_required_files(key):
+        if probe_base_file(key, fname, timeout=timeout) is None:
+            return False
+    return True
+
+
+class BaseModelFetcher:
+    def __init__(self, progress_callback: Optional[Callable[[dict], None]] = None):
+        self._cancel = threading.Event()
+        self._progress_callback = progress_callback
+        self._downloading = False
+        self._current = ""
+
+    def set_progress_callback(self, cb: Callable[[dict], None]):
+        self._progress_callback = cb
+
+    def cancel(self):
+        self._cancel.set()
+
+    @property
+    def is_downloading(self) -> bool:
+        return self._downloading
+
+    @property
+    def current(self) -> str:
+        return self._current
+
+    def _emit(
+        self,
+        status: str,
+        key: str,
+        filename: str,
+        downloaded: int,
+        total: int,
+        label: str,
+    ):
+        if self._progress_callback is None:
+            return
+        percent = 0
+        if total > 0:
+            percent = min(100, int(downloaded * 100 / total))
+        try:
+            self._progress_callback({
+                "status": status,
+                "scope": "base",
+                "kind": key,
+                "key": key,
+                "code": "",
+                "file": filename,
+                "label": label,
+                "downloaded": downloaded,
+                "total": total,
+                "percent": percent,
+            })
+        except Exception:
+            pass
+
+    def _download_file(self, key: str, filename: str, label: str) -> bool:
+        target_dir = get_model_dir(key)
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target = target_dir / filename
+        part = target_dir / (filename + ".part")
+
+        remote_size = probe_base_file(key, filename)
+        optional = filename in model_optional_files(key)
+
+        if remote_size is None:
+            if optional:
+                self._emit("skip", key, filename, 0, 0, f"{label} — {filename} 없음(선택)")
+                return True
+            self._emit("error", key, filename, 0, 0, f"{label} — {filename} 원격에 없음")
+            return False
+
+        if target.exists():
+            local = target.stat().st_size
+            if remote_size == 0 or local == remote_size:
+                self._emit("exists", key, filename, local, local, f"{label} — {filename} 준비됨")
+                return True
+            target.unlink()
+
+        resume_from = part.stat().st_size if part.exists() else 0
+        if remote_size and resume_from > remote_size:
+            part.unlink()
+            resume_from = 0
+
+        for attempt in range(1, MAX_RETRY + 1):
+            if self._cancel.is_set():
+                raise DownloadCancelled()
+
+            headers = _headers()
+            mode = "wb"
+            if resume_from > 0:
+                headers["Range"] = f"bytes={resume_from}-"
+                mode = "ab"
+
+            try:
+                resp = requests.get(
+                    base_file_url(key, filename),
+                    headers=headers,
+                    stream=True,
+                    timeout=GET_TIMEOUT,
+                    allow_redirects=True,
+                )
+                if resp.status_code == 416:
+                    resume_from = 0
+                    if part.exists():
+                        part.unlink()
+                    continue
+                if resp.status_code not in (200, 206):
+                    raise requests.exceptions.HTTPError(f"HTTP {resp.status_code}")
+                if resume_from > 0 and resp.status_code == 200:
+                    resume_from = 0
+                    mode = "wb"
+
+                downloaded = resume_from
+                total = remote_size or (downloaded + int(resp.headers.get("content-length", 0)))
+                self._emit("start", key, filename, downloaded, total, f"{label} — {filename}")
+
+                last = 0.0
+                with open(part, mode) as f:
+                    for chunk in resp.iter_content(chunk_size=CHUNK_SIZE):
+                        if self._cancel.is_set():
+                            raise DownloadCancelled()
+                        if not chunk:
+                            continue
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        now = time.time()
+                        if now - last >= 0.2:
+                            last = now
+                            self._emit(
+                                "progress", key, filename,
+                                downloaded, total, f"{label} — {filename}",
+                            )
+
+                if remote_size and part.stat().st_size != remote_size:
+                    resume_from = part.stat().st_size
+                    raise requests.exceptions.RequestException("불완전 전송")
+
+                part.replace(target)
+                self._emit(
+                    "file_done", key, filename,
+                    target.stat().st_size, target.stat().st_size,
+                    f"{label} — {filename} 완료",
+                )
+                return True
+
+            except DownloadCancelled:
+                raise
+            except requests.exceptions.RequestException as e:
+                if attempt >= MAX_RETRY:
+                    self._emit("error", key, filename, 0, 0, f"{label} — {filename} 실패: {e}")
+                    return optional
+                resume_from = part.stat().st_size if part.exists() else 0
+                self._emit(
+                    "retry", key, filename, resume_from, remote_size or 0,
+                    f"{label} — {filename} 재시도 {attempt}/{MAX_RETRY}",
+                )
+                time.sleep(1.0 * attempt)
+
+        return optional
+
+    def download(self, key: str) -> dict:
+        if self._downloading:
+            return {"ok": False, "error": "이미 다운로드 중입니다.", "key": key}
+
+        self._downloading = True
+        self._current = key
+        self._cancel.clear()
+
+        try:
+            spec = MODEL_SPECS[key]
+        except KeyError:
+            self._downloading = False
+            return {"ok": False, "error": f"알 수 없는 모델: {key}"}
+
+        label = spec["label"]
+        result = {"ok": False, "key": key, "files": 0}
+
+        try:
+            if is_model_ready(key):
+                self._emit("ready", key, "", 0, 0, f"{label} 이미 준비됨")
+                result["ok"] = True
+                return result
+
+            if spec.get("manual_only") or not model_repo_id(key):
+                note = str(spec.get("note", "") or "원격 저장소가 지정되지 않았습니다.")
+                self._emit("manual", key, "", 0, 0, f"{label} — 수동 배치 전용")
+                result["error"] = note
+                result["manual_only"] = True
+                return result
+
+            self._emit("repo_start", key, "", 0, 0, f"{label} 다운로드 시작")
+
+            done = 0
+            ok = True
+            for filename in model_all_files(key):
+                if self._cancel.is_set():
+                    raise DownloadCancelled()
+                if self._download_file(key, filename, label):
+                    done += 1
+                elif filename in model_required_files(key):
+                    ok = False
+                    break
+
+            sync_model_assets(key)
+
+            result["files"] = done
+            result["ok"] = ok and is_model_ready(key)
+
+            if result["ok"]:
+                self._emit("repo_done", key, "", 0, 0, f"{label} 준비 완료 ({done}개 파일)")
+            else:
+                self._emit("repo_error", key, "", 0, 0, f"{label} 필수 파일 누락")
+
+        except DownloadCancelled:
+            result["error"] = "사용자가 취소했습니다."
+            self._emit("cancelled", key, "", 0, 0, f"{label} 다운로드 취소됨")
+        except Exception as e:
+            result["error"] = str(e)
+            self._emit("repo_error", key, "", 0, 0, f"{label} 오류: {e}")
+        finally:
+            self._downloading = False
+            self._current = ""
+
+        return result
+
+    def download_many(self, keys: Sequence[str]) -> dict:
+        out = {"ok": True, "done": [], "failed": []}
+        for k in keys:
+            res = self.download(k)
+            if res.get("ok"):
+                out["done"].append(k)
+            else:
+                out["ok"] = False
+                out["failed"].append(k)
+        return out
+
+
 def stanza_file_url(iso1: str, rel_path: str) -> str:
     rel = rel_path.lstrip("/")
     return f"{HF_ENDPOINT}/{stanza_repo_id(iso1)}/resolve/main/{rel}"
@@ -417,8 +695,16 @@ def probe_stanza_file(iso1: str, rel_path: str, timeout: int = HEAD_TIMEOUT) -> 
         return 0
 
 
+def resolve_stanza_resource_path(iso1: str, timeout: int = HEAD_TIMEOUT) -> str:
+    from .model_manager import STANZA_RESOURCE_CANDIDATES
+    for rel in STANZA_RESOURCE_CANDIDATES:
+        if probe_stanza_file(iso1, rel, timeout=timeout) is not None:
+            return rel
+    return ""
+
+
 def probe_stanza(iso1: str, timeout: int = HEAD_TIMEOUT) -> bool:
-    return probe_stanza_file(iso1, STANZA_RESOURCE_FILE, timeout=timeout) is not None
+    return bool(resolve_stanza_resource_path(iso1, timeout=timeout))
 
 
 def _collect_stanza_targets(resources: dict, iso1: str) -> List[Tuple[str, str]]:
@@ -617,7 +903,16 @@ class StanzaFetcher:
 
             self._emit("repo_start", iso1, "", 0, 0, f"{label} 다운로드 시작")
 
-            if not self._download_rel(iso1, STANZA_RESOURCE_FILE, label):
+            rel_resources = resolve_stanza_resource_path(iso1)
+            if not rel_resources:
+                self._emit(
+                    "repo_error", iso1, "", 0, 0,
+                    f"{label} resources.json 을 원격에서 찾지 못했습니다 "
+                    f"(NLP 게이트는 선택 기능이므로 건너뜁니다)",
+                )
+                return result
+
+            if not self._download_rel(iso1, rel_resources, label):
                 self._emit("repo_error", iso1, "", 0, 0, f"{label} resources.json 취득 실패")
                 return result
 

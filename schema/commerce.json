@@ -1,85 +1,245 @@
 {
   "domain": "commerce",
   "doc_type": "product_list",
+  "code": "product_list",
+  "doc_anchors": [
+    "an online shopping product listing page with prices",
+    "an e-commerce order confirmation or purchase receipt",
+    "a retail catalog page with product names and prices",
+    "온라인 쇼핑몰 상품 목록 주문 내역 화면",
+    "ネットショップ 商品一覧 注文明細",
+    "电商 商品列表 订单详情"
+  ],
   "fields": {
     "goods_title": {
-      "semantic": "상품명, 의류명, 제품명, 품목명, 이름",
-      "bias": [
-        "상품명",
-        "상품제목",
+      "semantic": {
+        "eng": "the product title or item name shown to the shopper",
+        "kor": "구매자에게 보여지는 상품명 제품 제목",
+        "*": "product title item name"
+      },
+      "format": "text",
+      "label": {
+        "eng": ["PRODUCT NAME", "ITEM NAME", "PRODUCT", "ITEM", "TITLE", "DESCRIPTION"],
+        "kor": ["상품명", "제품명", "품목명", "상품제목", "상품 정보"],
+        "jpn": ["商品名", "品名"],
+        "zho": ["商品名称", "品名"],
+        "deu": ["Produktname", "Artikelbezeichnung"],
+        "*": ["Nombre del producto", "Nom du produit"]
+      },
+      "value": [
         "프리미엄 무선 헤드폰",
         "2026년형 스마트워치",
-        "남성용 가죽 지갑"
+        "남성용 가죽 지갑",
+        "Wireless Noise Cancelling Headphones",
+        "Men's Leather Wallet"
       ],
       "prejudice": [
-        "식별자",
-        "링크",
-        "등록일",
+        "가격",
+        "PRICE",
         "수량",
-        "재고"
+        "QUANTITY",
+        "재고상태",
+        "주문번호",
+        "등록일",
+        "브랜드"
       ]
     },
     "price": {
-      "semantic": "가격, 금액, 비용, 판매가",
-      "bias": [
-        "판매가",
-        "할인가",
-        "원가",
-        "15000",
-        "29900원",
-        "1,500,000"
-      ],
+      "semantic": {
+        "eng": "the selling price amount charged for the product",
+        "kor": "상품에 청구되는 판매 가격 금액",
+        "*": "product selling price amount"
+      },
+      "format": "numeric",
+      "label": {
+        "eng": ["PRICE", "SALE PRICE", "UNIT PRICE", "AMOUNT", "LIST PRICE", "MSRP"],
+        "kor": ["판매가", "가격", "할인가", "정가", "금액", "단가"],
+        "jpn": ["価格", "販売価格", "税込価格"],
+        "zho": ["价格", "售价", "单价"],
+        "deu": ["Preis", "Verkaufspreis"],
+        "*": ["Precio", "Prix"]
+      },
+      "value": ["15000", "29,900원", "1,500,000", "$129.99", "€89,50"],
       "prejudice": [
-        "수량",
-        "재고",
         "배송비",
+        "SHIPPING FEE",
+        "수량",
+        "QUANTITY",
+        "재고",
+        "할인율",
+        "리뷰수",
         "등록일"
       ]
     },
     "order_id": {
-      "semantic": "주문번호, 주문식별자",
-      "bias": [
-        "주문번호",
-        "주문코드",
-        "주문식별자",
-        "ORD-2026-0001"
-      ],
+      "semantic": {
+        "eng": "the order number identifying this purchase transaction",
+        "kor": "이 구매 거래를 식별하는 주문 번호",
+        "*": "order number transaction identifier"
+      },
+      "format": "identifier",
+      "top_region": true,
+      "label": {
+        "eng": ["ORDER NUMBER", "ORDER ID", "ORDER NO.", "TRANSACTION ID", "PURCHASE ID"],
+        "kor": ["주문번호", "주문코드", "거래번호", "결제번호"],
+        "jpn": ["注文番号", "ご注文番号"],
+        "zho": ["订单号", "订单编号"],
+        "deu": ["Bestellnummer", "Auftragsnummer"],
+        "*": ["Número de pedido", "Numéro de commande"]
+      },
+      "value": ["ORD-2026-0001", "20260315-8842190", "AMZ-113-7789012"],
       "prejudice": [
-        "상품명",
+        "운송장번호",
+        "TRACKING NUMBER",
+        "상품코드",
+        "SKU",
         "가격",
         "등록일"
       ]
     },
     "quantity": {
-      "semantic": "수량, 개수, 수량",
-      "bias": [
-        "수량",
-        "개수",
-        "주문수량",
-        "100",
-        "50"
-      ],
+      "semantic": {
+        "eng": "the number of units ordered for this item",
+        "kor": "해당 상품의 주문 수량 개수",
+        "*": "ordered unit quantity count"
+      },
+      "format": "numeric",
+      "label": {
+        "eng": ["QUANTITY", "QTY", "UNITS", "COUNT", "AMOUNT ORDERED"],
+        "kor": ["수량", "개수", "주문수량", "구매수량"],
+        "jpn": ["数量", "個数"],
+        "zho": ["数量", "件数"],
+        "deu": ["Menge", "Anzahl"],
+        "*": ["Cantidad", "Quantité"]
+      },
+      "value": ["1", "2", "100", "50", "3개"],
       "prejudice": [
         "가격",
+        "PRICE",
         "금액",
-        "등록일",
+        "재고",
+        "리뷰수",
+        "평점",
         "상품명"
       ]
     },
     "stock_status": {
-      "semantic": "재고상태, 판매상태",
-      "bias": [
-        "재고상태",
-        "판매상태",
+      "semantic": {
+        "eng": "the availability or selling state of the product",
+        "kor": "상품의 재고 보유 또는 판매 가능 상태",
+        "*": "product availability stock state"
+      },
+      "format": "enum",
+      "label": {
+        "eng": ["AVAILABILITY", "STOCK STATUS", "STATUS", "IN STOCK"],
+        "kor": ["재고상태", "판매상태", "재고", "판매여부"],
+        "jpn": ["在庫状況", "販売状況"],
+        "zho": ["库存状态", "销售状态"],
+        "deu": ["Verfügbarkeit", "Lagerstatus"],
+        "*": ["Disponibilidad", "Disponibilité"]
+      },
+      "value": [
         "판매중",
         "품절",
-        "재고있음"
+        "재고있음",
+        "일시품절",
+        "예약판매",
+        "In Stock",
+        "Out of Stock",
+        "Backorder",
+        "Pre-order"
       ],
-      "prejudice": [
-        "상품명",
-        "가격",
-        "등록일"
-      ]
+      "prejudice": ["상품명", "가격", "수량", "배송상태", "주문번호"]
+    },
+    "brand": {
+      "semantic": {
+        "eng": "the brand or manufacturer name of the product",
+        "kor": "상품의 브랜드 또는 제조사 이름",
+        "*": "product brand manufacturer name"
+      },
+      "format": "text",
+      "label": {
+        "eng": ["BRAND", "MANUFACTURER", "MAKER", "SOLD BY", "VENDOR"],
+        "kor": ["브랜드", "제조사", "제조업체", "판매자", "브랜드명"],
+        "jpn": ["ブランド", "メーカー"],
+        "zho": ["品牌", "制造商"],
+        "deu": ["Marke", "Hersteller"],
+        "*": ["Marca", "Marque"]
+      },
+      "value": ["Nike", "삼성전자", "Sony", "무신사 스탠다드", "Apple"],
+      "prejudice": ["상품명", "PRODUCT NAME", "가격", "카테고리", "주문번호"]
+    },
+    "option_spec": {
+      "semantic": {
+        "eng": "the selected product option such as size color or model variant",
+        "kor": "선택된 상품 옵션 사이즈 색상 모델 사양",
+        "*": "selected product option size color variant"
+      },
+      "format": "text",
+      "label": {
+        "eng": ["OPTION", "VARIANT", "SIZE", "COLOR", "SPECIFICATION", "MODEL"],
+        "kor": ["옵션", "선택옵션", "사이즈", "색상", "규격", "모델명"],
+        "jpn": ["オプション", "サイズ", "カラー"],
+        "zho": ["规格", "尺码", "颜色"],
+        "deu": ["Variante", "Größe", "Farbe"],
+        "*": ["Opción", "Talla", "Color"]
+      },
+      "value": ["블랙 / L", "270mm", "Space Gray, 256GB", "Size 9 US"],
+      "prejudice": ["상품명", "가격", "수량", "재고상태", "브랜드"]
+    },
+    "discount_rate": {
+      "semantic": {
+        "eng": "the discount percentage applied to the original price",
+        "kor": "정가 대비 적용된 할인율 퍼센트",
+        "*": "discount percentage rate"
+      },
+      "format": "numeric",
+      "label": {
+        "eng": ["DISCOUNT", "OFF", "SAVE", "DISCOUNT RATE", "SALE"],
+        "kor": ["할인율", "할인", "세일", "즉시할인"],
+        "jpn": ["割引率", "OFF"],
+        "zho": ["折扣", "优惠"],
+        "deu": ["Rabatt"],
+        "*": ["Descuento", "Remise"]
+      },
+      "value": ["30%", "-15%", "50% OFF", "반값"],
+      "prejudice": ["가격", "판매가", "수량", "배송비", "리뷰수"]
+    },
+    "category": {
+      "semantic": {
+        "eng": "the catalog category or department the product belongs to",
+        "kor": "상품이 속한 카탈로그 카테고리 분류",
+        "*": "product catalog category department"
+      },
+      "format": "text",
+      "label": {
+        "eng": ["CATEGORY", "DEPARTMENT", "COLLECTION", "SECTION"],
+        "kor": ["카테고리", "분류", "상품분류", "코너"],
+        "jpn": ["カテゴリ", "分類"],
+        "zho": ["分类", "类目"],
+        "deu": ["Kategorie"],
+        "*": ["Categoría", "Catégorie"]
+      },
+      "value": ["신발 > 운동화", "디지털/가전 > 음향기기", "Men's > Shoes"],
+      "prejudice": ["상품명", "브랜드", "가격", "옵션"]
+    },
+    "review_score": {
+      "semantic": {
+        "eng": "the average customer rating and number of reviews",
+        "kor": "고객 평균 별점과 리뷰 개수",
+        "*": "average customer rating and review count"
+      },
+      "format": "numeric",
+      "label": {
+        "eng": ["RATING", "REVIEWS", "STARS", "CUSTOMER RATING", "SCORE"],
+        "kor": ["평점", "리뷰", "별점", "후기", "리뷰수"],
+        "jpn": ["評価", "レビュー"],
+        "zho": ["评分", "评价"],
+        "deu": ["Bewertung"],
+        "*": ["Valoración", "Avis"]
+      },
+      "value": ["4.8 (1,203)", "★★★★☆ 4.5", "리뷰 2,341건", "4.7 out of 5"],
+      "prejudice": ["가격", "수량", "할인율", "재고상태"]
     }
   }
 }

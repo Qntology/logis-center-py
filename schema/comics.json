@@ -1,54 +1,330 @@
 {
   "domain": "comics",
   "doc_type": "comics_page",
+  "code": "comics_page",
+  "doc_anchors": [
+    "a comic book manga page with panels and speech balloons",
+    "a webtoon episode page with drawn characters and dialogue",
+    "hand drawn illustrated panels with sound effect lettering",
+    "만화 웹툰 페이지 말풍선과 컷 구성",
+    "漫画のページ コマ割りと吹き出し",
+    "漫画页面 分格与对话气泡"
+  ],
   "fields": {
     "title": {
-      "semantic": "제목, 타이틀, 작품명, 만화 제목, 화 제목, 에피소드",
-      "bias": [
-        "제목",
-        "타이틀",
-        "작품명",
-        "만화 제목",
-        "episode",
-        "화",
-        "제1화",
-        "EP.01",
-        "title"
+      "semantic": {
+        "eng": "the large decorative work title lettering placed at the very top of the comic page, a noun phrase naming the story rather than anything a character says",
+        "kor": "만화 페이지 최상단에 배치된 큰 장식 제목 레터링으로, 등장인물의 발화가 아니라 작품이나 화를 가리키는 명사구",
+        "*": "large decorative comic title lettering naming the work"
+      },
+      "format": "text",
+      "top_region": true,
+      "label": {},
+      "value": [
+        "제1화 새로운 시작",
+        "프롤로그 그날의 약속",
+        "Chapter One: The Awakening",
+        "Episode 12: Homecoming",
+        "第1話 旅立ち",
+        "序章 運命の扉"
       ],
       "prejudice": [
-        "대화",
-        "대사",
-        "말풍선",
-        "의성어",
-        "의태어",
+        "character dialogue asking a question to another person",
+        "inner monologue wrapped in round brackets",
+        "a time or place phrase that opens a scene",
+        "large onomatopoeia lettering drawn over the artwork",
+        "쾅",
+        "우당탕",
+        "두근두근",
+        "BOOM",
+        "CRASH",
+        "SLAM",
+        "ドキッ",
+        "ゴゴゴ",
+        "글 김작가 / 그림 이화백",
+        "Story by A. Writer",
+        "작가 크레딧 서명",
+        "페이지 번호"
+      ]
+    },
+    "episode_number": {
+      "semantic": {
+        "eng": "the episode or chapter number marking of the comic installment",
+        "kor": "만화 연재분의 화수 또는 챕터 번호 표기",
+        "*": "episode chapter installment number"
+      },
+      "format": "identifier",
+      "top_region": true,
+      "label": {
+        "eng": ["EPISODE", "CHAPTER", "PART", "ISSUE", "EP.", "CH."],
+        "kor": ["회차", "에피소드", "챕터", "제 화"],
+        "jpn": ["エピソード", "第 話"],
+        "zho": ["第 话", "第 集"],
+        "*": ["Episodio", "Épisode"]
+      },
+      "value": [
+        "제1화",
+        "제12화",
+        "1화",
+        "프롤로그",
+        "EP.01",
+        "Chapter 12",
+        "Ch. 045",
+        "#045",
+        "第3話"
+      ],
+      "prejudice": [
+        "페이지 번호",
+        "page number",
+        "말풍선 대사",
         "효과음",
-        "감탄사"
+        "작가명"
       ]
     },
     "dialogue": {
-      "semantic": "대화, 대사, 말풍선, 의성어, 의태어, 효과음, 감탄사, 독백",
-      "bias": [
-        "대화",
-        "대사",
-        "말풍선",
-        "의성어",
-        "의태어",
-        "효과음",
-        "감탄사",
-        "독백",
-        "삐걱",
-        "쾅",
-        "두근",
-        "왁",
-        "으악",
-        "휴",
-        "말풍선 텍스트"
+      "semantic": {
+        "eng": [
+          "an oval speech balloon with a pointed tail aimed at a character mouth",
+          "a spoken utterance addressed to another person using second person you",
+          "a question or a command or an exclamation spoken out loud",
+          "speech balloon speech bubble dialogue balloon word balloon"
+        ],
+        "kor": [
+          "등장인물 입을 향한 꼬리가 달린 타원형 말풍선",
+          "상대에게 말을 건네는 발화로 너 당신 같은 2인칭이 쓰인 문장",
+          "소리 내어 말한 의문문 명령문 감탄문",
+          "말풍선 대사 대화 발화"
+        ],
+        "*": "character dialogue inside an oval speech balloon with a tail"
+      },
+      "format": "synthesis",
+      "label": {},
+      "value": [
+        "그게 무슨 소리야?",
+        "정말 괜찮은 거야?",
+        "너도 같이 가자!",
+        "당장 여기서 나가!",
+        "What do you mean by that?",
+        "I won't let you go alone!",
+        "Are you seriously telling me that now?",
+        "そんなバカな…",
+        "君も一緒に来るのか?"
       ],
       "prejudice": [
-        "제목",
-        "타이틀",
-        "작품명",
-        "에피소드"
+        "a decorative story title noun phrase at the top of the page",
+        "a sentence wrapped entirely in round brackets as an inner thought",
+        "a time or place phrase that opens a scene without a speaker",
+        "large onomatopoeia lettering drawn across the artwork",
+        "쾅",
+        "우당탕",
+        "BOOM",
+        "CRASH",
+        "그로부터 3년 후.",
+        "Three years later.",
+        "(설마… 저 사람이?)",
+        "글 김작가 / 그림 이화백",
+        "페이지 번호"
+      ]
+    },
+    "thought_balloon": {
+      "semantic": {
+        "eng": [
+          "a cloud shaped thought balloon with small trailing bubbles instead of a tail",
+          "an unspoken inner thought wrapped in round brackets or parentheses",
+          "a first person self directed sentence that nobody else can hear",
+          "thought balloon thought bubble inner monologue cloud balloon"
+        ],
+        "kor": [
+          "꼬리 대신 작은 방울이 이어진 구름 모양 생각 풍선",
+          "괄호로 감싸인 소리 내지 않은 속마음",
+          "아무도 듣지 못하는 1인칭 혼잣말 문장",
+          "생각풍선 독백 속마음 마음의 소리"
+        ],
+        "*": "inner monologue inside a cloud shaped thought balloon"
+      },
+      "format": "synthesis",
+      "label": {},
+      "value": [
+        "(설마… 저 사람이?)",
+        "(이대로는 안 돼.)",
+        "(왜 하필 지금인 거지…)",
+        "(Could it really be him...?)",
+        "(I can't let her see me like this.)",
+        "(まさか… あの人が?)"
+      ],
+      "prejudice": [
+        "a spoken utterance addressed to another person with a balloon tail",
+        "a time or place phrase that opens a scene without a speaker",
+        "a decorative story title noun phrase at the top of the page",
+        "large onomatopoeia lettering drawn across the artwork",
+        "그게 무슨 소리야?",
+        "What do you mean by that?",
+        "그로부터 3년 후.",
+        "Three years later.",
+        "쾅",
+        "BOOM"
+      ]
+    },
+    "narration": {
+      "semantic": {
+        "eng": [
+          "a rectangular caption box with square corners placed at a panel edge",
+          "a third person narrator sentence that states when or where the scene happens",
+          "a scene transition phrase such as three years later or meanwhile elsewhere",
+          "caption box narration box narration text box"
+        ],
+        "kor": [
+          "컷 가장자리에 놓인 직각 모서리 사각 캡션 박스",
+          "장면의 시점이나 장소를 알리는 3인칭 서술문",
+          "그로부터 얼마 후 한편 같은 장면 전환 구절",
+          "나레이션 해설 지문 캡션 설명상자"
+        ],
+        "*": "narration caption inside a rectangular box"
+      },
+      "format": "synthesis",
+      "label": {},
+      "value": [
+        "그로부터 3년 후.",
+        "서울, 어느 비 오는 밤.",
+        "한편, 항구에서는.",
+        "같은 시각, 학교 옥상.",
+        "Three years later.",
+        "Meanwhile, at the harbor...",
+        "That winter, everything changed.",
+        "その三年後。"
+      ],
+      "prejudice": [
+        "a spoken utterance addressed to another person with a balloon tail",
+        "a sentence wrapped entirely in round brackets as an inner thought",
+        "a decorative story title noun phrase at the top of the page",
+        "large onomatopoeia lettering drawn across the artwork",
+        "그게 무슨 소리야?",
+        "너도 같이 가자!",
+        "(설마… 저 사람이?)",
+        "What do you mean by that?",
+        "쾅",
+        "BOOM",
+        "페이지 번호"
+      ]
+    },
+    "sound_effect": {
+      "semantic": {
+        "eng": [
+          "large stylized onomatopoeia lettering drawn directly over the artwork with no balloon",
+          "an imitative noise word with no subject verb or sentence structure",
+          "an impact or motion sound rendered as distorted display type",
+          "sound effect SFX onomatopoeia impact lettering"
+        ],
+        "kor": [
+          "말풍선 없이 그림 위에 직접 크게 그려진 의성어 의태어 레터링",
+          "주어 서술어가 없는 소리 흉내말 한 덩어리",
+          "충격이나 움직임을 찌그러진 장식체로 표현한 소리",
+          "효과음 의성어 의태어 SFX"
+        ],
+        "*": "stylized onomatopoeia sound effect lettering"
+      },
+      "format": "text",
+      "label": {},
+      "value": [
+        "쾅",
+        "삐걱",
+        "두근두근",
+        "으악",
+        "휘익",
+        "우당탕",
+        "털썩",
+        "쿠쿠쿵",
+        "BOOM",
+        "CRASH",
+        "THUD",
+        "SLAM",
+        "WHOOSH",
+        "KRAKOOM",
+        "ドキッ",
+        "ゴゴゴ",
+        "バキッ"
+      ],
+      "prejudice": [
+        "a complete sentence with a subject and a verb spoken by a character",
+        "a decorative story title noun phrase naming the work",
+        "a third person narrator sentence stating when or where",
+        "an author or artist credit line at the page margin",
+        "그게 무슨 소리야?",
+        "너도 같이 가자!",
+        "제1화 새로운 시작",
+        "그로부터 3년 후.",
+        "What do you mean by that?",
+        "Chapter One: The Awakening",
+        "글 김작가 / 그림 이화백",
+        "Story by A. Writer"
+      ]
+    },
+    "character_name": {
+      "semantic": {
+        "eng": "a speaker name tag attached to a balloon or a character name plate",
+        "kor": "말풍선에 붙은 화자 이름표 또는 등장인물 명찰",
+        "*": "speaker name tag or character name plate"
+      },
+      "format": "text",
+      "label": {},
+      "semantic": {
+        "eng": [
+          "a short speaker name tag attached to the edge of a balloon",
+          "a person given name of one to four syllables with no verb",
+          "a character name plate printed beside a portrait",
+          "character name speaker name tag cast"
+        ],
+        "kor": [
+          "말풍선 가장자리에 붙은 짧은 화자 이름표",
+          "서술어가 없는 한 음절에서 네 음절짜리 사람 이름",
+          "인물 그림 옆에 인쇄된 캐릭터 명찰",
+          "등장인물 화자 이름표 캐릭터명"
+        ],
+        "*": "speaker name tag or character name plate"
+      },
+      "value": ["지훈", "민서", "서연", "강태호", "SASUKE", "Alice", "Kaito", "田中", "さくら"],
+      "prejudice": [
+        "a complete sentence spoken by a character inside a balloon",
+        "large onomatopoeia lettering drawn over the artwork",
+        "a decorative story title noun phrase",
+        "an author or artist credit line",
+        "그게 무슨 소리야?",
+        "쾅",
+        "제1화 새로운 시작",
+        "글 김작가 / 그림 이화백"
+      ]
+    },
+    "credits": {
+      "semantic": {
+        "eng": "the author artist studio credit line printed at the page margin",
+        "kor": "페이지 여백에 인쇄된 작가 작화 스튜디오 크레딧",
+        "*": "author artist studio credit line"
+      },
+      "format": "text",
+      "label": {
+        "eng": ["ART BY", "STORY BY", "WRITTEN BY", "CREDITS", "AUTHOR", "ARTIST"],
+        "kor": ["작가", "작화", "원작", "제작", "글 그림"],
+        "jpn": ["原作", "作者", "作画"],
+        "zho": ["作者", "作画", "原作"],
+        "*": ["Guion", "Dibujo", "Scénario"]
+      },
+      "value": [
+        "글 김작가 / 그림 이화백",
+        "작화 이화백",
+        "원작 김작가",
+        "Story by A. Writer",
+        "Art by B. Penciller",
+        "作画 山田"
+      ],
+      "prejudice": [
+        "a complete sentence spoken by a character inside a balloon",
+        "large onomatopoeia lettering drawn over the artwork",
+        "a third person narrator sentence stating when or where",
+        "a decorative story title noun phrase",
+        "그게 무슨 소리야?",
+        "쾅",
+        "그로부터 3년 후.",
+        "제1화 새로운 시작"
       ]
     }
   }

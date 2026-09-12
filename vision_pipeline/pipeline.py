@@ -6,12 +6,19 @@ from PIL import Image
 
 from .doc_type_nms import DocTypeVerdict, classify_doc_type, load_doc_type_specs
 from .field_heatmap import (
+    apply_arena,
     build_field_heatmaps,
     spatial_residual,
     suppress_title_rows,
 )
+from .nms_arena import ArenaResult, run_arena
 from .ocr_extract import ExtractedField, extract_from_crops, fields_to_record
-from .patch_grid import VisionPatchGrid, build_patch_grid
+from .patch_grid import (
+    VisionPatchGrid,
+    build_patch_grid,
+    column_gutters,
+    row_gutters,
+)
 from .text_upscale import VISION_PATCH_PX
 from .value_grounding import GroundingClaim, apply_verdicts, verify_claims
 from .vision_nms import CropPlan, plan_crops
@@ -31,6 +38,12 @@ class VisionPipelineConfig:
         cross_prejudice: bool = True,
         keep_crop: bool = True,
         prefer_grid: str = "ocr",
+        lang_code: str = "",
+        enable_gutters: bool = True,
+        max_crop_cols: int = 0,
+        patch_margin: float = 0.12,
+        min_territory: int = 2,
+        arena_rounds: int = 3,
     ):
         self.iou_threshold = float(iou_threshold)
         self.margin_threshold = float(margin_threshold)
@@ -43,6 +56,12 @@ class VisionPipelineConfig:
         self.cross_prejudice = bool(cross_prejudice)
         self.keep_crop = bool(keep_crop)
         self.prefer_grid = prefer_grid
+        self.lang_code = str(lang_code or "")
+        self.enable_gutters = bool(enable_gutters)
+        self.max_crop_cols = int(max_crop_cols)
+        self.patch_margin = float(patch_margin)
+        self.min_territory = int(min_territory)
+        self.arena_rounds = int(arena_rounds)
 
 
 class VisionPipelineResult:
@@ -52,6 +71,8 @@ class VisionPipelineResult:
         self.grid: Optional[VisionPatchGrid] = None
         self.doc_type: Optional[DocTypeVerdict] = None
         self.heatmaps: List = []
+        self.arena: Optional[ArenaResult] = None
+        self.absent_fields: List[str] = []
         self.plans: List[CropPlan] = []
         self.fields: List[ExtractedField] = []
         self.verdicts: List = []
@@ -70,6 +91,8 @@ class VisionPipelineResult:
                           self.grid.cols if self.grid else 0)
                 for h in self.heatmaps
             ],
+            "arena": self.arena.to_dict() if self.arena else {},
+            "absent_fields": list(self.absent_fields),
             "plans": [p.to_dict() for p in self.plans],
             "results": [f.to_dict(include_image=include_images) for f in self.fields],
             "grounding": [v.to_dict() for v in self.verdicts],
@@ -141,6 +164,8 @@ class VisionPipeline:
                 prefer=self.config.prefer_grid,
             )
         specs, file_map = load_doc_type_specs(schema_dir)
+        if self.config.lang_code:
+            self._log(f"  🈯 문서 유형 앵커 스코프: {self.config.lang_code}")
         return classify_doc_type(
             grid, specs, self.embed_fn, file_map=file_map,
             margin_threshold=self.config.margin_threshold,
@@ -172,14 +197,15 @@ class VisionPipeline:
                 f"| dim={grid.dim} | src={grid.source}"
             )
 
-            self._log("═══ STEP 2: 필드 히트맵 (Column Cosine) ═══")
-            heatmaps = build_field_heatmaps(
+            self._log("═══ STEP 2: 필드 친화도 맵 (Column Cosine) ═══")
+            heatmaps, chrome_ref = build_field_heatmaps(
                 grid, schema, self.embed_fn,
                 cross_prejudice=self.config.cross_prejudice,
+                lang_code=self.config.lang_code,
                 log=self.logs,
             )
             if not heatmaps:
-                result.error = "필드 히트맵을 생성하지 못했습니다."
+                result.error = "필드 친화도 맵을 생성하지 못했습니다."
                 result.log = self.logs
                 return result
 
@@ -187,17 +213,54 @@ class VisionPipeline:
                 heatmaps, grid,
                 top_ratio=self.config.title_suppress_ratio,
                 penalty=self.config.title_penalty,
+                schema=schema,
                 log=self.logs,
             )
+
+            self._log("═══ STEP 2.5: NMS ARENA (패치 단위 배타 경쟁) ═══")
+            arena = run_arena(
+                [h.category for h in heatmaps],
+                {h.category: h.scores for h in heatmaps},
+                chrome_ref,
+                grid.num_patches,
+                patch_margin=self.config.patch_margin,
+                min_territory=self.config.min_territory,
+                rounds=self.config.arena_rounds,
+                log=self.logs,
+            )
+            result.arena = arena
+            result.absent_fields = list(arena.absent)
+
+            heatmaps = apply_arena(heatmaps, arena, grid.num_patches, log=self.logs)
+            if not heatmaps:
+                result.error = (
+                    "모든 필드가 NMS 경쟁에서 영토를 확보하지 못했습니다. "
+                    "문서 유형이 스키마와 맞지 않을 수 있습니다."
+                )
+                result.log = self.logs
+                return result
+
             if self.config.enable_spatial_residual:
                 heatmaps = spatial_residual(heatmaps, grid, log=self.logs)
             result.heatmaps = heatmaps
 
             self._log("═══ STEP 3: Vision NMS & Cropping ═══")
+            cgut = set()
+            rgut = set()
+            if self.config.enable_gutters:
+                try:
+                    cgut = column_gutters(image, grid.cols)
+                    rgut = row_gutters(image, grid.rows)
+                except Exception as e:
+                    self._log(f"  ⚠ 거터 검출 실패({e}) → 거터 없이 진행합니다.")
+
             plans = plan_crops(
                 heatmaps, grid,
                 iou_threshold=self.config.iou_threshold,
                 margin_threshold=self.config.margin_threshold,
+                col_gutters=cgut,
+                row_gutters=rgut,
+                max_crop_cols=self.config.max_crop_cols,
                 log=self.logs,
             )
             result.plans = plans
@@ -224,6 +287,13 @@ class VisionPipeline:
             result.fields = fields
 
             record = fields_to_record(fields, schema)
+            for name in result.absent_fields:
+                record[name] = None
+            if result.absent_fields:
+                self._log(
+                    f"  ⚪ 부재 판정 필드 {len(result.absent_fields)}개는 "
+                    f"null 로 기록합니다: {', '.join(sorted(result.absent_fields))}"
+                )
 
             if self.config.enable_grounding:
                 self._log("═══ STEP 5: Value Grounding ═══")

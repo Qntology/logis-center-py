@@ -3,6 +3,7 @@ from typing import Callable, Dict, List, Optional, Sequence
 
 DIGIT_RE = re.compile(r"\d")
 DIGITS_ONLY_RE = re.compile(r"\d")
+ALPHA_RE = re.compile(r"[^\W\d_]", re.UNICODE)
 
 DATE_LITERAL_RE = re.compile(
     r"(\d{4}\s*[^\w\s]?\s*\d{1,2}\s*[^\w\s]?\s*\d{1,2})"
@@ -128,9 +129,11 @@ def infer_format_by_anchor(
 
     parts = [str(field_name).replace("_", " ")]
     if definition:
-        sem = str(definition.get("semantic", "") or "")
-        if sem:
-            parts.append(sem)
+        from .field_bank import flatten_text_values
+        for sem in flatten_text_values(definition.get("semantic")):
+            if sem:
+                parts.append(sem)
+                break
     probe_text = " ".join(parts).strip()
     if not probe_text:
         return None
@@ -175,13 +178,14 @@ def detect_field_format(
         if explicit in FieldFormat.ALL:
             return explicit
 
-        inferred = infer_format_from_values(definition.get("bias") or [])
-        if inferred:
-            return inferred
-
-        inferred = infer_format_from_values(definition.get("examples") or [])
-        if inferred:
-            return inferred
+        for key in ("value", "bias", "examples"):
+            raw = definition.get(key)
+            if not raw:
+                continue
+            from .field_bank import flatten_text_values
+            inferred = infer_format_from_values(flatten_text_values(raw))
+            if inferred:
+                return inferred
 
     anchored = infer_format_by_anchor(field_name, definition, embed_fn, anchor_cache)
     if anchored:
@@ -232,6 +236,14 @@ def value_matches_format(value: str, fmt: str) -> bool:
 
     if fmt == FieldFormat.ENUM:
         return len(v) >= 1
+
+    if fmt == FieldFormat.SYNTHESIS:
+        if len(v) < 4:
+            return False
+        return bool(ALPHA_RE.search(v))
+
+    if fmt == FieldFormat.TEXT:
+        return bool(ALPHA_RE.search(v))
 
     return True
 

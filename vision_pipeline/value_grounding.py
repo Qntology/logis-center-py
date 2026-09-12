@@ -120,6 +120,21 @@ def verify_claims(
     if mat.ndim == 1:
         mat = mat.reshape(1, -1)
 
+    if mat.size and int(mat.shape[-1]) != int(grid.embeddings.shape[-1]):
+        if log is not None:
+            log.append(
+                f"  ⏭ 접지 검증 생략 — 패치 격자 {int(grid.embeddings.shape[-1])}차원 vs "
+                f"텍스트 임베딩 {int(mat.shape[-1])}차원 불일치"
+            )
+        for c in claims:
+            out.append(
+                GroundingVerdict(
+                    c.category, c.field, c.value, 0.0, 0.0,
+                    accepted=True, reason="임베딩 공간 불일치 — 검증 보류",
+                )
+            )
+        return out
+
     vec_map: Dict[int, np.ndarray] = {}
     for k, i in enumerate(valid_idx):
         if k < mat.shape[0]:

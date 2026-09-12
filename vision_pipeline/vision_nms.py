@@ -86,7 +86,8 @@ class CropPlan:
 
 
 def positive_stats(scores: np.ndarray) -> Tuple[float, float, int]:
-    pos = scores[scores > 0.0]
+    finite = scores[np.isfinite(scores)]
+    pos = finite[finite > 0.0]
     if pos.size < 2:
         return 0.0, 0.0, int(pos.size)
     return float(pos.mean()), float(pos.std()), int(pos.size)
@@ -104,10 +105,15 @@ def extract_components(
     rows: int,
     cols: int,
     gate: float,
+    blocked_cols: Optional[set] = None,
+    blocked_rows: Optional[set] = None,
 ) -> List[Component]:
     n = rows * cols
     if scores.size < n or n == 0:
         return []
+
+    bc = set(blocked_cols or ())
+    br = set(blocked_rows or ())
 
     visited = np.zeros((n,), dtype=bool)
     out: List[Component] = []
@@ -142,6 +148,10 @@ def extract_components(
                 nr, nc = r + dr, c + dc
                 if nr < 0 or nc < 0 or nr >= rows or nc >= cols:
                     continue
+                if dc != 0 and nc in bc:
+                    continue
+                if dr != 0 and nr in br:
+                    continue
                 idx = nr * cols + nc
                 if visited[idx] or scores[idx] <= gate:
                     continue
@@ -154,6 +164,43 @@ def extract_components(
     return out
 
 
+def split_oversized(
+    scores: np.ndarray,
+    comp: Component,
+    rows: int,
+    cols: int,
+    gate: float,
+    area_cap: int,
+    blocked_cols: Optional[set] = None,
+    blocked_rows: Optional[set] = None,
+    max_rounds: int = 4,
+) -> List[Component]:
+    n = rows * cols
+    if not comp.indices:
+        return [comp]
+
+    local = np.full((n,), -np.inf, dtype=np.float32)
+    local[comp.indices] = scores[comp.indices]
+    vals = np.asarray([float(scores[i]) for i in comp.indices], dtype=np.float32)
+
+    best: List[Component] = [comp]
+    cur_gate = float(gate)
+
+    for k in range(1, int(max_rounds) + 1):
+        q = float(np.quantile(vals, min(0.95, 0.35 + 0.15 * k)))
+        cur_gate = max(cur_gate, q)
+        subs = extract_components(
+            local, rows, cols, cur_gate, blocked_cols, blocked_rows
+        )
+        if not subs:
+            break
+        best = subs
+        if len(subs) > 1 and max(s.area for s in subs) <= area_cap:
+            return subs
+
+    return best
+
+
 def build_content_mask(
     heatmaps: Sequence[CategoryHeatmap],
     n: int,
@@ -161,7 +208,8 @@ def build_content_mask(
     mask = np.full((n,), -np.inf, dtype=np.float32)
     for h in heatmaps:
         m = min(n, h.scores.size)
-        mask[:m] = np.maximum(mask[:m], h.scores[:m])
+        seg = h.scores[:m]
+        mask[:m] = np.maximum(mask[:m], np.where(np.isfinite(seg), seg, -np.inf))
     mean, _std, cnt = positive_stats(mask)
     gate = 0.0 if cnt < 4 else mean
     return mask, gate
@@ -172,8 +220,12 @@ def expand_row_band(
     content: np.ndarray,
     gate: float,
     cols: int,
+    blocked_cols: Optional[set] = None,
+    max_width: int = 0,
 ) -> Tuple[int, int, int, int]:
+    bc = set(blocked_cols or ())
     c_min, c_max = comp.c_min, comp.c_max
+    cap = int(max_width) if max_width and max_width > 0 else int(cols)
 
     def band_has(c: int) -> bool:
         for r in range(comp.r_min, comp.r_max + 1):
@@ -182,9 +234,20 @@ def expand_row_band(
                 return True
         return False
 
-    while c_min > 0 and band_has(c_min - 1):
+    while (
+        c_min > 0
+        and (c_min - 1) not in bc
+        and (c_max - c_min + 1) < cap
+        and band_has(c_min - 1)
+    ):
         c_min -= 1
-    while c_max + 1 < cols and band_has(c_max + 1):
+
+    while (
+        c_max + 1 < cols
+        and (c_max + 1) not in bc
+        and (c_max - c_min + 1) < cap
+        and band_has(c_max + 1)
+    ):
         c_max += 1
 
     return (comp.r_min, comp.r_max, c_min, c_max)
@@ -236,29 +299,22 @@ def presence_gate(
     n: int,
     log: Optional[List[str]] = None,
 ) -> set:
-    wins: Dict[str, int] = {}
-    for i in range(n):
-        best = -np.inf
-        owner = ""
-        for h in heatmaps:
-            if i >= h.scores.size:
-                continue
-            if h.scores[i] > best:
-                best = float(h.scores[i])
-                owner = h.category
-        if owner and best > 0.0:
-            wins[owner] = wins.get(owner, 0) + 1
-
     out = set()
     for h in heatmaps:
-        w = wins.get(h.category, 0)
-        if w > 0:
-            out.add(h.category)
-        elif log is not None:
-            log.append(
-                f"  ⚪ PRESENCE GATE '{h.category}' 는 어떤 패치에서도 "
-                f"최강 설명이 되지 못했습니다. (top {h.top_score:+.4f})"
-            )
+        if getattr(h, "absent", False):
+            if log is not None:
+                log.append(
+                    f"  ⚪ PRESENCE GATE '{h.category}' 부재 — "
+                    f"{getattr(h, 'absent_reason', '') or '경쟁 영토 없음'}"
+                )
+            continue
+        if int(getattr(h, "territory", 0)) <= 0 and not np.isfinite(h.scores).any():
+            if log is not None:
+                log.append(
+                    f"  ⚪ PRESENCE GATE '{h.category}' 유효 패치 없음 → 제외"
+                )
+            continue
+        out.add(h.category)
     return out
 
 
@@ -267,6 +323,9 @@ def plan_crops(
     grid: VisionPatchGrid,
     iou_threshold: float = 0.80,
     margin_threshold: float = 0.28,
+    col_gutters: Optional[set] = None,
+    row_gutters: Optional[set] = None,
+    max_crop_cols: int = 0,
     log: Optional[List[str]] = None,
 ) -> List[CropPlan]:
     if not heatmaps or grid.num_patches == 0:
@@ -275,11 +334,18 @@ def plan_crops(
     rows, cols = grid.rows, grid.cols
     n = rows * cols
 
+    bc = set(col_gutters or ())
+    br = set(row_gutters or ())
+
     content, content_gate = build_content_mask(heatmaps, n)
     if log is not None:
         active = int(np.sum(content > content_gate))
         log.append(
             f"  🗺 CONTENT MASK 활성 {active}/{n} | gate {content_gate:+.4f}"
+        )
+        log.append(
+            f"  📏 거터 검출 — 세로 {len(bc)}개 {sorted(bc)} / "
+            f"가로 {len(br)}개 {sorted(br)}"
         )
 
     present = presence_gate(heatmaps, n, log=log)
@@ -292,9 +358,9 @@ def plan_crops(
             continue
 
         gate = core_threshold(h.scores)
-        comps = extract_components(h.scores, rows, cols, gate)
+        comps = extract_components(h.scores, rows, cols, gate, bc, br)
         if not comps:
-            comps = extract_components(h.scores, rows, cols, 0.0)
+            comps = extract_components(h.scores, rows, cols, 0.0, bc, br)
         if not comps:
             if log is not None:
                 log.append(f"  ⚪ '{h.category}' 활성 패치 없음 → 제외")
@@ -303,27 +369,38 @@ def plan_crops(
         boxes: List[Tuple[int, int, int, int]] = []
         peaks: List[float] = []
         counts: List[int] = []
+        split_hits = 0
 
         for comp in comps:
-            if comp.area > area_cap and len(comps) > 1:
-                sub_gate = core_threshold(h.scores[comp.indices])
-                local = np.full((n,), -np.inf, dtype=np.float32)
-                local[comp.indices] = h.scores[comp.indices]
-                subs = extract_components(local, rows, cols, max(sub_gate, gate))
-                if subs:
+            if comp.area > area_cap:
+                subs = split_oversized(
+                    h.scores, comp, rows, cols, gate, area_cap, bc, br
+                )
+                if len(subs) > 1:
+                    split_hits += 1
                     for s in subs:
-                        boxes.append(expand_row_band(s, content, content_gate, cols))
+                        boxes.append(
+                            expand_row_band(
+                                s, content, content_gate, cols, bc, max_crop_cols
+                            )
+                        )
                         peaks.append(s.peak)
                         counts.append(len(s.indices))
                     continue
-            boxes.append(expand_row_band(comp, content, content_gate, cols))
+            boxes.append(
+                expand_row_band(
+                    comp, content, content_gate, cols, bc, max_crop_cols
+                )
+            )
             peaks.append(comp.peak)
             counts.append(len(comp.indices))
 
         per_cat.append((h.category, boxes, peaks, counts))
         if log is not None:
+            extra = f" | 과대 분할 {split_hits}건" if split_hits else ""
             log.append(
-                f"  🧩 '{h.category}' 영역 {len(boxes)}개 | gate {gate:+.4f}"
+                f"  🧩 '{h.category}' 영역 {len(boxes)}개 | gate {gate:+.4f} "
+                f"| 면적상한 {area_cap}{extra}"
             )
 
     if not per_cat:
@@ -335,9 +412,16 @@ def plan_crops(
             px = grid.region_bbox(*gb)
             raw.append(CropPlan(category, px, peak, 0.0, cnt, gb))
 
+    terr_margin: Dict[str, float] = {}
+    terr_rival: Dict[str, str] = {}
+    for h in heatmaps:
+        terr_margin[h.category] = float(getattr(h, "mean_margin", 0.0) or 0.0)
+        terr_rival[h.category] = str(getattr(h, "top_rival", "") or "")
+
     by_region: Dict[Tuple[int, int, int, int], List[CropPlan]] = {}
     for p in raw:
         by_region.setdefault(p.grid_box, []).append(p)
+
     for _k, group in by_region.items():
         group.sort(key=lambda x: x.score, reverse=True)
         top = group[0]
@@ -345,10 +429,18 @@ def plan_crops(
             top.margin = top.score - group[1].score
             top.rival = group[1].category
         else:
-            top.margin = top.score
+            top.margin = max(top.score, terr_margin.get(top.category, 0.0))
+            top.rival = terr_rival.get(top.category, "")
         for loser in group[1:]:
             loser.margin = loser.score - top.score
             loser.rival = top.category
+
+    for p in raw:
+        tm = terr_margin.get(p.category, 0.0)
+        if tm > p.margin:
+            p.margin = tm
+            if not p.rival:
+                p.rival = terr_rival.get(p.category, "")
 
     raw.sort(key=lambda p: (p.score, p.area()), reverse=True)
 

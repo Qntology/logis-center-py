@@ -189,6 +189,28 @@ SCRIPT_CANDIDATES: Dict[str, Tuple[str, ...]] = {
 
 LANG_ANCHOR_TEMPLATE = "a document written in the {name} language"
 
+REFERENCE_LANGUAGE = "eng"
+
+LANG_ANCHOR_TEMPLATES: Tuple[str, ...] = (
+    "a document written in the {name} language",
+    "this printed text is written in {name}",
+    "{name} words sentences and grammar",
+    "an official form filled out in {name}",
+)
+
+NOISE_ANCHORS: Tuple[str, ...] = (
+    "random meaningless characters that belong to no language",
+    "machine generated placeholder tokens and markup fragments",
+    "html xml tags attributes and special control tokens",
+    "a shuffled list of unrelated words without grammar",
+    "garbled unreadable optical character recognition output",
+)
+
+NOISE_QUALITY_FLOOR = 0.0
+REFERENCE_DECISION_MARGIN = 0.020
+PEER_DECISION_MARGIN = 0.010
+STRONG_REFERENCE_MARGIN = 0.060
+
 CODEPOINT_SIGNATURES: Dict[str, Tuple[Tuple[int, int], ...]] = {
     "deu": ((0x00DF, 0x00DF), (0x00C4, 0x00C4), (0x00D6, 0x00D6), (0x00DC, 0x00DC),
             (0x00E4, 0x00E4), (0x00F6, 0x00F6), (0x00FC, 0x00FC)),
@@ -350,3 +372,18 @@ def exclusive_language_of(script: Optional[str]) -> Optional[str]:
     if script in ("Han", "Latin", "Cyrillic", "Arabic", "Devanagari"):
         return None
     return SCRIPT_EXCLUSIVE_LANG.get(script)
+
+
+def lang_anchor_phrases(code: str) -> List[str]:
+    name = language_name(code)
+    return [tpl.format(name=name) for tpl in LANG_ANCHOR_TEMPLATES]
+
+
+def reference_language_of(script: Optional[str]) -> str:
+    excl = SCRIPT_EXCLUSIVE_LANG.get(script or "")
+    if excl:
+        return excl
+    priors = priors_for_script(script)
+    if not priors:
+        return REFERENCE_LANGUAGE
+    return max(priors.items(), key=lambda kv: kv[1])[0]

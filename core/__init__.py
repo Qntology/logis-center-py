@@ -66,15 +66,19 @@ from .scoring import FieldScorer
 from .nms import NMSProcessor, Candidate, gumbel_expected_z
 from .cropper import RegionCropper
 
+from .registry import ModelRegistry, STEP_REQUIREMENTS, ROLE_LABELS
+
 _LAZY = {
     "AXVEEmbedder": (".embedding", "AXVEEmbedder"),
     "PatchGrid": (".embedding", "PatchGrid"),
     "HayaiOCR": (".ocr", "HayaiOCR"),
     "LanguageModelFetcher": (".model_fetcher", "LanguageModelFetcher"),
+    "BaseModelFetcher": (".model_fetcher", "BaseModelFetcher"),
     "ensure_language_models": (".model_fetcher", "ensure_language_models"),
     "resolve_available_language": (".model_fetcher", "resolve_available_language"),
     "probe_language": (".model_fetcher", "probe_language"),
     "probe_repo": (".model_fetcher", "probe_repo"),
+    "probe_base_model": (".model_fetcher", "probe_base_model"),
     "StanzaFetcher": (".model_fetcher", "StanzaFetcher"),
     "ensure_stanza_models": (".model_fetcher", "ensure_stanza_models"),
     "probe_stanza": (".model_fetcher", "probe_stanza"),
@@ -152,6 +156,11 @@ __all__ = [
     "StanzaNLP",
     "MorphVerdict",
     "load_stanza",
+    "ModelRegistry",
+    "STEP_REQUIREMENTS",
+    "ROLE_LABELS",
+    "BaseModelFetcher",
+    "probe_base_model",
     "ISO1_TO_ISO3",
     "ISO3_TO_ISO1",
     "LANGUAGE_NAMES",

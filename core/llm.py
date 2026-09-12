@@ -6,8 +6,10 @@ import torch
 
 from .device import configure_backends, detect_accelerator, select_dtype
 from .model_manager import (
+    BOOTSTRAP_LANGUAGES,
     LLM_PATH,
     MissingModelError,
+    embedder_ready_codes,
     ensure_lang_model_dir,
     ensure_model_dir,
     lang_model_dir,
@@ -114,6 +116,8 @@ class RefinerLLM:
         max_new_tokens: int = 256,
         label: str = "refiner",
         log=None,
+        low_vram: bool = False,
+        budget_gb: float = 0.0,
     ):
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -121,6 +125,9 @@ class RefinerLLM:
         self.label = label
         self.max_new_tokens = int(max_new_tokens)
         self._log_fn = log or (lambda m: None)
+        self.low_vram = bool(low_vram)
+        self.budget_gb = float(budget_gb or 0.0)
+        self.load_mode = "standard"
 
         self.device, self.accel_label = detect_accelerator(device)
         self.dtype = select_dtype(self.device)
@@ -129,18 +136,70 @@ class RefinerLLM:
         self.tokenizer = AutoTokenizer.from_pretrained(
             self.model_path, trust_remote_code=True
         )
+
+        kwargs = {"trust_remote_code": True}
+
+        if self.device.type == "cuda":
+            if self.low_vram:
+                quant = self._try_quant_config()
+                if quant is not None:
+                    kwargs["quantization_config"] = quant
+                    kwargs["device_map"] = "auto"
+                    self.load_mode = "4bit"
+                else:
+                    kwargs["device_map"] = "auto"
+                    kwargs["low_cpu_mem_usage"] = True
+                    if self.budget_gb > 0:
+                        cap = max(1.0, self.budget_gb - 0.8)
+                        kwargs["max_memory"] = {0: f"{cap:.1f}GiB", "cpu": "16GiB"}
+                    self.load_mode = "offload"
+            else:
+                kwargs["device_map"] = "auto"
+
         self.model = _load_with_dtype(
-            AutoModelForCausalLM,
-            self.model_path,
-            self.dtype,
-            trust_remote_code=True,
-            device_map="auto" if self.device.type == "cuda" else None,
+            AutoModelForCausalLM, self.model_path, self.dtype, **kwargs
         )
-        if self.device.type != "cuda":
+
+        if self.device.type != "cuda" and self.load_mode == "standard":
             self.model.to(self.device)
         self.model.eval()
 
-        self._log(f"  ✅ [{self.label}] 정제 LLM 로드 ({self.model_path} | {self.dtype})")
+        placement = ""
+        dev_map = getattr(self.model, "hf_device_map", None)
+        if isinstance(dev_map, dict):
+            devs = sorted(set(str(v) for v in dev_map.values()))
+            placement = " | 배치: " + ", ".join(devs)
+            if any(d in ("cpu", "disk") for d in devs):
+                self._log(f"  ⚠ [{self.label}] 일부 레이어가 CPU/디스크로 오프로드되었습니다.")
+
+        self._log(
+            f"  ✅ [{self.label}] 정제 LLM 로드 "
+            f"({self.load_mode} | {self.dtype}{placement})"
+        )
+
+    def _try_quant_config(self):
+        try:
+            import bitsandbytes  # noqa: F401
+        except Exception:
+            self._log(
+                f"  ⏭ [{self.label}] bitsandbytes 미설치 → 4bit 양자화 대신 오프로드를 씁니다.\n"
+                f"     설치하면 4GB VRAM 에서도 안정적으로 동작합니다: "
+                f"pip install bitsandbytes"
+            )
+            return None
+
+        try:
+            from transformers import BitsAndBytesConfig
+            import torch as _t
+            return BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=_t.float16,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_use_double_quant=True,
+            )
+        except Exception as e:
+            self._log(f"  ⏭ [{self.label}] 양자화 설정 실패({e}) → 오프로드로 진행합니다.")
+            return None
 
     def _log(self, msg: str):
         try:
@@ -159,11 +218,24 @@ class RefinerLLM:
             text = prompt
 
         enc = self.tokenizer([text], return_tensors="pt").to(self.model.device)
-        out = self.model.generate(
-            **enc,
-            max_new_tokens=int(max_new_tokens or self.max_new_tokens),
-            do_sample=False,
-        )
+
+        try:
+            out = self.model.generate(
+                **enc,
+                max_new_tokens=int(max_new_tokens or self.max_new_tokens),
+                do_sample=False,
+            )
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            self._log(f"  ⚠ [{self.label}] VRAM 부족으로 생성을 건너뜁니다.")
+            return ""
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower():
+                torch.cuda.empty_cache()
+                self._log(f"  ⚠ [{self.label}] VRAM 부족으로 생성을 건너뜁니다.")
+                return ""
+            raise
+
         gen = out[0][len(enc["input_ids"][0]):]
         return self.tokenizer.decode(gen, skip_special_tokens=True).strip()
 
@@ -222,6 +294,22 @@ class EmbeddingRouter:
         if not self.active:
             self.active = name
 
+    def promote(self, name: str, priority: int = 80) -> bool:
+        found = False
+        rebuilt: List[tuple] = []
+        for prio, n, fn in self._providers:
+            if n == name:
+                rebuilt.append((int(priority), n, fn))
+                found = True
+            else:
+                rebuilt.append((prio, n, fn))
+        if not found:
+            return False
+        rebuilt.sort(key=lambda t: t[0], reverse=True)
+        self._providers = rebuilt
+        self._log(f"  🔝 임베딩 제공자 우선순위 승격 → '{name}'")
+        return True
+
     def encode(self, texts: Sequence[str]) -> np.ndarray:
         items = list(texts)
         for _prio, name, fn in self._providers:
@@ -250,17 +338,70 @@ class EmbeddingRouter:
         return [name for _p, name, _f in self._providers]
 
 
+def _alphaedge_available() -> bool:
+    if not LLM_PATH.is_dir():
+        return False
+    if not (LLM_PATH / "config.json").exists():
+        return False
+    weights = [p for p in LLM_PATH.glob("*.safetensors") if p.is_file()]
+    if not weights:
+        weights = [p for p in LLM_PATH.glob("*.bin") if p.is_file()]
+    return bool(weights)
+
+
 def resolve_embedder_path(lang_code: str) -> tuple:
     if lang_model_ready("qwen3emb", lang_code):
         return str(lang_model_dir("qwen3emb", lang_code)), f"qwen3emb/{lang_code}"
-    if LLM_PATH.is_dir() and (LLM_PATH / "config.json").exists():
+    if _alphaedge_available():
         return str(LLM_PATH), "alphaedge-ai"
     return "", ""
 
 
-def resolve_refiner_path(lang_code: str) -> tuple:
-    if lang_model_ready("qwen35", lang_code):
-        return str(lang_model_dir("qwen35", lang_code)), f"qwen35/{lang_code}"
-    if LLM_PATH.is_dir() and (LLM_PATH / "config.json").exists():
+def resolve_embedder_paths(codes: Sequence[str]) -> List[tuple]:
+    out: List[tuple] = []
+    seen = set()
+
+    for code in codes:
+        if not code or code in seen:
+            continue
+        seen.add(code)
+        if lang_model_ready("qwen3emb", code):
+            out.append((
+                code,
+                str(lang_model_dir("qwen3emb", code)),
+                f"qwen3emb/{code}",
+            ))
+
+    if not out:
+        for code in embedder_ready_codes():
+            if code in seen:
+                continue
+            seen.add(code)
+            out.append((
+                code,
+                str(lang_model_dir("qwen3emb", code)),
+                f"qwen3emb/{code}",
+            ))
+
+    if not out and _alphaedge_available():
+        out.append(("", str(LLM_PATH), "alphaedge-ai"))
+
+    return out
+
+
+def resolve_refiner_path(
+    lang_code: str,
+    codes: Optional[Sequence[str]] = None,
+) -> tuple:
+    wanted: List[str] = []
+    for c in [lang_code] + list(codes or []):
+        if c and c not in wanted:
+            wanted.append(c)
+
+    for code in wanted:
+        if lang_model_ready("qwen35", code):
+            return str(lang_model_dir("qwen35", code)), f"qwen35/{code}"
+
+    if _alphaedge_available():
         return str(LLM_PATH), "alphaedge-ai"
     return "", ""

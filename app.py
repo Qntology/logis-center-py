@@ -21,6 +21,7 @@ OUTPUT_DIR = BASE_DIR / "output"
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
+from core import devtools as devtools_mod
 from core.crossover import (
     CrossoverSwitch,
     PHASE_EMBEDDING,
@@ -33,36 +34,52 @@ from core.crossover import (
     SLOT_VISION,
 )
 from core.device import detect_accelerator, get_vram_info, select_dtype
-from core.lang_codes import iso1_of, language_name, normalize_lang_code
-from core.language import LanguageDetector, LanguageVerdict
+from core.lang_codes import (
+    REFERENCE_LANGUAGE,
+    iso1_of,
+    language_name,
+    normalize_lang_code,
+)
+from core.language import (
+    UNRESOLVED_STAGES as LANG_UNRESOLVED_STAGES,
+    LanguageDetector,
+    LanguageVerdict,
+)
 from core.llm import (
     EmbeddingRouter,
     RefinerLLM,
     TextEmbedder,
     resolve_embedder_path,
+    resolve_embedder_paths,
     resolve_refiner_path,
 )
 from core.phrase_cache import CachedEmbedder
 from core.model_manager import (
+    BOOTSTRAP_LANGUAGES,
     DEFAULT_LANGUAGE,
     LANG_MODEL_KINDS,
     MODELS_ROOT,
     MissingModelError,
     active_language_code,
+    any_embedder_ready,
     check_all_models,
     describe_lang_models,
     describe_stanza,
+    embedder_ready_codes,
     ensure_model_dir,
     format_lang_report,
     format_model_report,
     format_stanza_report,
     installed_language_codes,
+    lang_model_ready,
     lang_models_ready,
+    missing_core_models,
     missing_lang_models,
     missing_models,
     save_active_language,
     stanza_ready,
 )
+from core.registry import ModelRegistry
 from text_pipeline import TextPipelineConfig, run_text_pipeline
 from vision_pipeline import VisionPipelineConfig, VisionPipeline
 
@@ -72,24 +89,58 @@ TEXT_EXT = (".txt", ".md", ".csv", ".json")
 
 
 class NMSOcrApp:
+    LOW_VRAM_THRESHOLD_GB = 6.0
+
     def __init__(
         self,
         log: Optional[Callable[[str], None]] = None,
         crossover_enabled: bool = True,
+        auto_fetch: bool = True,
+        vram_budget: float = 0.0,
+        force_low_vram: bool = False,
     ):
         self._external_log = log
         self.log_lines: List[str] = []
 
-        self.crossover = CrossoverSwitch(log=self._log, enabled=crossover_enabled)
+        self.vram_budget = float(vram_budget or 0.0)
+        if self.vram_budget <= 0.0:
+            info = get_vram_info()
+            self.vram_budget = float(info.get("total_gb", 0.0) or 0.0)
+
+        self.low_vram = bool(force_low_vram) or (
+            0.0 < self.vram_budget < self.LOW_VRAM_THRESHOLD_GB
+        )
+
+        self.crossover = CrossoverSwitch(
+            log=self._log,
+            enabled=crossover_enabled,
+            budget_gb=self.vram_budget,
+        )
+        self.registry = ModelRegistry(
+            log=self._log,
+            event=self._download_progress,
+            notify=self._model_notify,
+            auto_fetch=auto_fetch,
+        )
 
         self.text_embedder: Optional[TextEmbedder] = None
         self.refiner: Optional[RefinerLLM] = None
         self.nlp = None
 
         self.router = EmbeddingRouter(log=self._log)
+        self.vision_router = EmbeddingRouter(log=self._log)
         self.cached_router: Optional[CachedEmbedder] = None
+        self.cached_vision: Optional[CachedEmbedder] = None
         self.language: Optional[LanguageVerdict] = None
-        self.lang_code: str = active_language_code(DEFAULT_LANGUAGE)
+        self.saved_lang_code: str = normalize_lang_code(
+            active_language_code(DEFAULT_LANGUAGE)
+        )
+        self.lang_code: str = DEFAULT_LANGUAGE
+        self.language_resolved: bool = False
+        self.active_codes: List[str] = list(BOOTSTRAP_LANGUAGES)
+        self._embedder_slots: Dict[str, str] = {}
+        self._primary_embedder_slot: str = ""
+        self._hayai_provider_registered: bool = False
 
         self.current_image: Optional[Image.Image] = None
         self.current_path: str = ""
@@ -97,6 +148,10 @@ class NMSOcrApp:
 
         self.last_result: Optional[dict] = None
         self._download_lock = threading.Lock()
+        self._models_lock = threading.RLock()
+        self.base_ready: bool = False
+        self.models_ready: bool = False
+        self._language_pending: bool = True
 
     @property
     def embedder(self):
@@ -110,6 +165,11 @@ class NMSOcrApp:
         if self.cached_router is not None:
             return self.cached_router(texts)
         return self.router(texts)
+
+    def vision_embed_fn(self, texts):
+        if self.cached_vision is not None:
+            return self.cached_vision(texts)
+        return self.vision_router(texts)
 
     def _log(self, msg: str):
         self.log_lines.append(msg)
@@ -134,11 +194,66 @@ class NMSOcrApp:
         self._push_ui(f"updateProgress({int(pct)}, {json.dumps(label)})")
 
     def _download_progress(self, info: dict):
-        self._push_ui(f"onModelDownload({json.dumps(info)})")
+        self._push_ui(f"onModelEvent({json.dumps(info)})")
         status = info.get("status", "")
         if status in ("repo_start", "repo_done", "repo_error", "lang_start",
-                      "lang_done", "lang_error", "cancelled", "skip"):
+                      "lang_done", "lang_error", "cancelled", "skip",
+                      "deleted", "all_done"):
             self._log(f"  📦 {info.get('label', '')}")
+
+    def _model_notify(self, payload: dict):
+        self._push_ui(f"onModelRequired({json.dumps(payload)})")
+        msg = payload.get("message", "")
+        if msg:
+            for line in str(msg).splitlines():
+                self._log(f"  🔔 {line}")
+
+    def _sync_registry_language(self):
+        self.registry.set_language(self.lang_code, resolved=self.language_resolved)
+        if not self.language_resolved:
+            self.registry.reset_language_resolution()
+
+    def ensure_step(self, step: str, required: bool = True) -> bool:
+        self._sync_registry_language()
+        res = self.registry.ensure_step(step, code=self.lang_code, required=required)
+        codes = res.get("codes") or []
+        if codes:
+            self.active_codes = list(codes)
+        if not res.get("ok") and required:
+            names = ", ".join(m["label"] for m in res.get("missing", []))
+            self._log(f"❌ '{step}' 단계 모델 준비 실패: {names}")
+        return bool(res.get("ok"))
+
+    def ensure_bootstrap(self) -> bool:
+        self._sync_registry_language()
+
+        if any(lang_model_ready("qwen3emb", c) for c in self.active_codes):
+            return True
+
+        self._log("═══ 부트스트랩 임베딩 준비 ═══")
+        self._log(
+            "  ℹ 언어 기준이 아직 없어 기본 언어 "
+            + ", ".join(f"{language_name(c)}({c})" for c in BOOTSTRAP_LANGUAGES)
+            + " 임베딩을 함께 준비합니다."
+        )
+
+        res = self.registry.ensure_bootstrap(code=self.lang_code)
+        codes = res.get("codes") or list(BOOTSTRAP_LANGUAGES)
+        self.active_codes = list(codes)
+
+        ready = [c for c in codes if lang_model_ready("qwen3emb", c)]
+        if ready:
+            self._log(f"  ✅ 사용 가능한 임베딩 언어: {', '.join(ready)}")
+            return True
+
+        if any_embedder_ready():
+            fallback = embedder_ready_codes()
+            self.active_codes = fallback
+            self._log(f"  ↩ 다른 언어 임베딩으로 진행합니다: {', '.join(fallback)}")
+            return True
+
+        self._log("  ❌ 사용 가능한 임베딩 모델이 없습니다.")
+        return False
 
     def get_gpu_info(self) -> dict:
         device, accel = detect_accelerator()
@@ -147,32 +262,73 @@ class NMSOcrApp:
             "accel_label": accel,
             "dtype": str(select_dtype(device)),
             "vram": get_vram_info(),
+            "budget_gb": round(self.vram_budget, 2),
+            "low_vram": self.low_vram,
         }
 
+    def _log_vram_profile(self):
+        if self.vram_budget <= 0.0:
+            self._log("  💻 CPU 모드 — VRAM 프로파일을 적용하지 않습니다.")
+            return
+
+        self._log(f"  📊 VRAM 예산 {self.vram_budget:.1f} GB")
+        if self.low_vram:
+            self._log(
+                "  ⚠️ 저VRAM 모드: 정제 LLM 은 지연 로드 + 양자화/오프로드로 실행합니다."
+            )
+            self._log(
+                "     Qwen3.5-2B(fp16 ≈ 4.0GB)가 예산을 초과하면 "
+                "OCR 원문으로 자동 폴백합니다."
+            )
+
     def check_models(self) -> dict:
-        base = check_all_models()
-        out = {
-            "base": base,
-            "language": {},
-            "stanza": {},
-            "lang_code": self.lang_code,
-            "lang_name": language_name(self.lang_code) if self.lang_code else "",
-            "crossover": self.crossover.stats(),
-        }
-        if self.lang_code:
-            out["language"] = describe_lang_models(self.lang_code)
-            out["stanza"] = describe_stanza(iso1_of(self.lang_code))
+        self._sync_registry_language()
+        out = self.registry.status()
+        out["crossover"] = self.crossover.stats()
+        out["active_codes"] = list(self.active_codes)
+        out["base_ready"] = self.base_ready
+        out["models_ready"] = self.models_ready
+        out["language_pending"] = self._language_pending
         return out
+
+    def download_model(self, target_id: str) -> dict:
+        self._sync_registry_language()
+        return self.registry.download_async(target_id)
+
+    def download_all_missing(self) -> dict:
+        self._sync_registry_language()
+        return self.registry.download_all_missing_async()
+
+    def download_bootstrap(self) -> dict:
+        self._sync_registry_language()
+        import threading as _t
+        _t.Thread(
+            target=self.registry.ensure_bootstrap,
+            kwargs={"code": self.lang_code},
+            daemon=True,
+        ).start()
+        return {"ok": True, "started": "bootstrap", "codes": list(BOOTSTRAP_LANGUAGES)}
+
+    def delete_model(self, target_id: str) -> dict:
+        return self.registry.delete(target_id)
+
+    def delete_all_models(self) -> dict:
+        return self.registry.delete_all()
+
+    def cancel_download(self) -> dict:
+        self.registry.cancel()
+        return {"ok": True}
+
+    def set_auto_fetch(self, enabled: bool) -> dict:
+        self.registry.auto_fetch = bool(enabled)
+        self._log(f"  ⚙ 모델 자동 취득: {'켬' if enabled else '끔'}")
+        return {"ok": True, "auto_fetch": self.registry.auto_fetch}
 
     def print_model_report(self):
         self._log("═══ 모델 상태 ═══")
-        for line in format_model_report().splitlines():
+        self._sync_registry_language()
+        for line in self.registry.report_lines():
             self._log(line)
-        if self.lang_code:
-            for line in format_lang_report(self.lang_code).splitlines():
-                self._log(line)
-            for line in format_stanza_report(iso1_of(self.lang_code)).splitlines():
-                self._log(line)
 
     def _register_slots(self):
         def _load_vision():
@@ -183,10 +339,15 @@ class NMSOcrApp:
             from core.ocr import HayaiOCR
             return HayaiOCR(str(ensure_model_dir("hayai")))
 
-        self.crossover.register(SLOT_VISION, _load_vision)
-        self.crossover.register(SLOT_OCR, _load_ocr)
+        if SLOT_VISION not in self.crossover.slots:
+            self.crossover.register(SLOT_VISION, _load_vision, est_gb=0.9)
+        if SLOT_OCR not in self.crossover.slots:
+            self.crossover.register(SLOT_OCR, _load_ocr, est_gb=0.7)
 
     def _register_embed_provider(self):
+        if self._hayai_provider_registered:
+            return
+
         def _hayai_embed(texts):
             ocr = self.crossover.get(SLOT_OCR)
             if ocr is None:
@@ -196,18 +357,41 @@ class NMSOcrApp:
             return ocr.embed_text_batch(texts)
 
         self.router.register("hayai", _hayai_embed, priority=10)
+        self.vision_router.register("hayai", _hayai_embed, priority=100)
+        self._hayai_provider_registered = True
+
+        probe = self.vision_router(["__dim_probe__"])
+        dim = int(probe.shape[-1]) if probe is not None and probe.size else 0
+        self.cached_vision = CachedEmbedder(
+            self.vision_router, recipe="hayai-joint", dim=dim, log=self._log
+        )
+        self._log(
+            f"  🪢 비전-텍스트 공동 임베딩 채널 준비 (hayai, dim={dim}) — "
+            f"패치 격자와 동일 공간에서만 코사인을 계산합니다."
+        )
 
     def load_base_models(self) -> dict:
-        missing = missing_models()
+        missing = missing_core_models()
         if missing:
-            self._log("❌ 필수 모델이 준비되지 않았습니다:")
-            for line in format_model_report().splitlines():
-                self._log(line)
+            self._log(f"📥 필수 모델 {len(missing)}개 누락 → 자동 취득을 시도합니다.")
+            if not self.ensure_step("patch_grid", required=True):
+                return {
+                    "ok": False,
+                    "error": (
+                        f"필수 모델 누락: {', '.join(missing)}\n"
+                        f"환경설정 → 모델 관리에서 내려받거나 "
+                        f"models/ 하위에 직접 배치해 주세요."
+                    ),
+                }
+
+        if not self.ensure_bootstrap():
             return {
                 "ok": False,
                 "error": (
-                    f"모델 누락: {', '.join(missing)}\n"
-                    f"models/ 하위에 직접 배치해 주세요. (자동 다운로드 없음)"
+                    "임베딩 모델을 확보하지 못했습니다.\n"
+                    f"기본 언어 {', '.join(BOOTSTRAP_LANGUAGES)} 중 "
+                    f"최소 하나의 Qwen3-Embedding 이 필요합니다.\n"
+                    "환경설정 → 모델 관리에서 내려받아 주세요."
                 ),
             }
 
@@ -233,16 +417,49 @@ class NMSOcrApp:
 
         self._register_embed_provider()
         self.crossover.phase = PHASE_EMBEDDING
+        self._log_vram_profile()
         self._progress(65, "기본 모델 로드 완료")
+        self.base_ready = True
         return {"ok": True}
+
+    UNRESOLVED_STAGES = LANG_UNRESOLVED_STAGES
 
     def detect_language(self, image: Optional[Image.Image] = None) -> LanguageVerdict:
         img = image if image is not None else self.current_image
 
         self._log("═══ 언어 판별 ═══")
+        self.ensure_bootstrap()
+        self.ensure_step("language", required=False)
+
+        judge_codes: List[str] = [REFERENCE_LANGUAGE]
+        for c in list(BOOTSTRAP_LANGUAGES) + list(self.active_codes):
+            if c and c not in judge_codes:
+                judge_codes.append(c)
+
+        entries = self._register_text_embedders(judge_codes, promote=True)
+        if entries:
+            self._log(
+                f"  ⚖ 판별 기준 임베딩 '{entries[0][2]}' | 후보 "
+                + ", ".join(lbl for _c, _p, lbl in entries)
+            )
+        else:
+            self._log("  ⏭ 다국어 임베딩이 없어 Hayai 임베딩으로 판별합니다.")
+
         if self.crossover.get(SLOT_OCR) is None:
             self.crossover.acquire(SLOT_OCR)
-        detector = LanguageDetector(ocr=self.ocr, log=self._log, nlp=self.nlp)
+
+        if self.ocr is not None and not getattr(self.ocr, "vocab_aligned", True):
+            self._log(
+                "  ⚠️ Hayai OCR 토크나이저 어휘가 모델과 어긋나 OCR 표본이 "
+                "예약 토큰으로 나올 수 있습니다. 이 경우 언어 확정은 보류됩니다."
+            )
+
+        detector = LanguageDetector(
+            ocr=self.ocr,
+            embed_fn=self.embed_fn,
+            log=self._log,
+            nlp=self.nlp,
+        )
 
         if img is not None:
             verdict = detector.detect(img)
@@ -255,12 +472,34 @@ class NMSOcrApp:
             )
 
         self.language = verdict
-        self.lang_code = verdict.code
-        save_active_language(verdict.code, {"source": "detector", "stage": verdict.stage})
-        self._log(
-            f"  🌐 확정 언어: {verdict.code} ({verdict.name}) "
-            f"| script={verdict.script} | margin={verdict.margin:+.4f}"
+        self._language_pending = False
+
+        resolved = (
+            verdict.stage not in self.UNRESOLVED_STAGES
+            and bool(verdict.script)
         )
+
+        if resolved:
+            self.lang_code = verdict.code
+            self.language_resolved = True
+            self.active_codes = [verdict.code]
+            save_active_language(
+                verdict.code, {"source": "detector", "stage": verdict.stage}
+            )
+            self._log(
+                f"  🌐 확정 언어: {verdict.code} ({verdict.name}) "
+                f"| script={verdict.script} | margin={verdict.margin:+.4f}"
+            )
+        else:
+            self.language_resolved = False
+            self.active_codes = list(BOOTSTRAP_LANGUAGES)
+            self.lang_code = verdict.code or DEFAULT_LANGUAGE
+            self._log(
+                f"  ⚠️ 언어를 확정하지 못했습니다 (stage={verdict.stage}). "
+                f"기본 언어 {', '.join(BOOTSTRAP_LANGUAGES)} 로 진행합니다."
+            )
+
+        self._sync_registry_language()
         return verdict
 
     def ensure_language_models(self, code: Optional[str] = None, fetch: bool = True) -> dict:
@@ -307,46 +546,99 @@ class NMSOcrApp:
             )
         return res
 
+    def _register_text_embedders(
+        self,
+        codes: Sequence[str],
+        promote: bool = False,
+    ) -> List[tuple]:
+        entries = resolve_embedder_paths(list(codes))
+        if not entries:
+            return []
+
+        for idx, (ecode, epath, elabel) in enumerate(entries):
+            key = ecode or "default"
+            slot_name = self._embedder_slots.get(key)
+
+            if slot_name is None:
+                slot_name = (
+                    SLOT_EMBEDDER if not self._primary_embedder_slot
+                    else f"{SLOT_EMBEDDER}:{key}"
+                )
+                self._embedder_slots[key] = slot_name
+                if not self._primary_embedder_slot:
+                    self._primary_embedder_slot = slot_name
+
+                def _make_loader(p=epath, l=elabel):
+                    return lambda: TextEmbedder(p, label=l, log=self._log)
+
+                def _make_embed(sn=slot_name):
+                    def _fn(texts):
+                        obj = self.crossover.get(sn)
+                        if obj is None:
+                            obj = self.crossover.acquire(sn)
+                        if obj is None:
+                            return None
+                        if sn == self._primary_embedder_slot:
+                            self.text_embedder = obj
+                        return obj.encode(texts)
+                    return _fn
+
+                self.crossover.register(
+                    slot_name, _make_loader(), label=elabel, est_gb=1.4
+                )
+                self.router.register(
+                    elabel, _make_embed(), priority=50 - idx
+                )
+
+            if promote and idx == 0 and slot_name != self._primary_embedder_slot:
+                if self.router.promote(elabel, priority=80):
+                    self._primary_embedder_slot = slot_name
+
+        return entries
+
     def load_language_models(self, fetch: bool = True) -> dict:
         code = self.lang_code or DEFAULT_LANGUAGE
 
         self._log("═══ 언어 스코프 모델 준비 ═══")
-        self.ensure_language_models(code, fetch=fetch)
-        code = self.lang_code
+        self.registry.auto_fetch = bool(fetch)
+        self._sync_registry_language()
 
-        emb_path, emb_label = resolve_embedder_path(code)
-        if emb_path:
-            def _load_embedder():
-                return TextEmbedder(emb_path, label=emb_label, log=self._log)
+        if self.language_resolved:
+            self.ensure_language_models(code, fetch=fetch)
+            code = self.lang_code
+            self.active_codes = [code]
+        else:
+            self.ensure_bootstrap()
+            if not self.active_codes:
+                self.active_codes = list(BOOTSTRAP_LANGUAGES)
+            code = self.active_codes[0]
+            self.lang_code = code
+            self._log(
+                "  ℹ 언어 미확정 — 기본 언어 "
+                + ", ".join(self.active_codes)
+                + f" 모델을 사용합니다. (스코프 기준 '{code}')"
+            )
+        self._sync_registry_language()
 
-            def _embed(texts):
-                obj = self.crossover.get(SLOT_EMBEDDER)
-                if obj is None:
-                    obj = self.crossover.acquire(SLOT_EMBEDDER)
-                if obj is None:
-                    return None
-                self.text_embedder = obj
-                return obj.encode(texts)
+        entries = self._register_text_embedders(self.active_codes, promote=True)
+        if entries:
+            self._log(
+                f"  🔤 임베딩 후보 {len(entries)}개: "
+                + ", ".join(lbl for _c, _p, lbl in entries)
+            )
 
-            self.crossover.register(SLOT_EMBEDDER, _load_embedder, label=emb_label)
-            self.router.register(emb_label, _embed, priority=50)
-
-            try:
-                self._progress(75, "텍스트 임베딩 로드 중")
-                self.text_embedder = self.crossover.acquire(SLOT_EMBEDDER)
-            except Exception as e:
-                self._log(f"  ⚠ 텍스트 임베딩 로드 실패({emb_label}): {e}")
+            if self._primary_embedder_slot:
+                try:
+                    self._progress(75, "텍스트 임베딩 로드 중")
+                    self.text_embedder = self.crossover.acquire(
+                        self._primary_embedder_slot
+                    )
+                except Exception as e:
+                    self._log(f"  ⚠ 텍스트 임베딩 로드 실패: {e}")
         else:
             self._log("  ⏭ 텍스트 임베딩 모델을 찾지 못해 Hayai 임베딩만 사용합니다.")
 
-        ref_path, ref_label = resolve_refiner_path(code)
-        if ref_path:
-            def _load_refiner():
-                return RefinerLLM(ref_path, label=ref_label, log=self._log)
-
-            self.crossover.register(SLOT_REFINER, _load_refiner, label=ref_label)
-            self._log(f"  ⏳ [{ref_label}] 정제 LLM 은 생성 페이즈에서 지연 로드합니다.")
-        else:
+        if not self._ensure_refiner_slot():
             self._log("  ⏭ 정제 LLM 을 찾지 못해 OCR 원문을 그대로 사용합니다.")
 
         self._log("═══ NLP 게이트 준비 ═══")
@@ -360,7 +652,7 @@ class NMSOcrApp:
 
         probe = self.router(["__dim_probe__"])
         dim = int(probe.shape[-1]) if probe is not None and probe.size else 0
-        recipe = f"{self.router.active or 'router'}-{code}"
+        recipe = f"{self.router.active or 'router'}-{'+'.join(self.active_codes)}"
         self.cached_router = CachedEmbedder(
             self.router, recipe=recipe, dim=dim, log=self._log
         )
@@ -370,15 +662,55 @@ class NMSOcrApp:
         self._log(f"  🔀 임베딩 제공자: {', '.join(self.router.providers())}")
         for line in self.crossover.report_lines():
             self._log(line)
-        return {"ok": True, "code": code, "providers": self.router.providers()}
+        self.models_ready = True
+        return {
+            "ok": True,
+            "code": code,
+            "codes": list(self.active_codes),
+            "resolved": self.language_resolved,
+            "providers": self.router.providers(),
+        }
 
     def load_models(self, fetch: bool = True) -> dict:
-        base = self.load_base_models()
-        if not base.get("ok"):
-            return base
-        if self.current_image is not None or self.current_text:
-            self.detect_language()
-        return self.load_language_models(fetch=fetch)
+        with self._models_lock:
+            self.registry.auto_fetch = bool(fetch)
+
+            base = self.load_base_models()
+            if not base.get("ok"):
+                self.models_ready = False
+                return base
+
+            if self.current_image is not None or self.current_text:
+                self.detect_language()
+            else:
+                self._log(
+                    "  ℹ 입력이 없어 언어를 판별하지 않았습니다. "
+                    f"기본 언어 {', '.join(BOOTSTRAP_LANGUAGES)} 로 준비합니다."
+                )
+                self.language_resolved = False
+                self.active_codes = list(BOOTSTRAP_LANGUAGES)
+
+            return self.load_language_models(fetch=fetch)
+
+    def ensure_models_ready(self, fetch: bool = True) -> dict:
+        with self._models_lock:
+            has_input = self.current_image is not None or bool(self.current_text)
+            need_base = (not self.base_ready) or self.crossover.get(SLOT_OCR) is None
+
+            if need_base or not self.models_ready:
+                self._log("🧩 모델이 준비되지 않아 실행과 함께 자동 로드합니다.")
+                res = dict(self.load_models(fetch=fetch) or {})
+                res["auto_loaded"] = True
+                return res
+
+            if has_input and self._language_pending and not self.language_resolved:
+                self._log("🌐 입력이 바뀌어 언어를 다시 판별합니다.")
+                self.detect_language()
+                res = dict(self.load_language_models(fetch=fetch) or {})
+                res["auto_loaded"] = True
+                return res
+
+            return {"ok": True, "auto_loaded": False}
 
     def open_file_dialog(self) -> Optional[str]:
         try:
@@ -410,6 +742,10 @@ class NMSOcrApp:
         self.current_path = str(p)
         self.current_image = None
         self.current_text = ""
+        self.language_resolved = False
+        self.language = None
+        self._language_pending = True
+        self._sync_registry_language()
         ext = p.suffix.lower()
 
         self._log(f"📂 입력 로드: {p.name}")
@@ -488,13 +824,23 @@ class NMSOcrApp:
         if self.current_image is None:
             return {"ok": False, "error": "이미지가 로드되지 않았습니다."}
 
+        ready = self.ensure_models_ready()
+        if not ready.get("ok"):
+            return {
+                "ok": False,
+                "error": ready.get("error", "모델 자동 로드에 실패했습니다."),
+            }
+
+        if not self.ensure_step("doc_type", required=True):
+            return {"ok": False, "error": "문서 유형 분류에 필요한 모델이 없습니다."}
+
         self.crossover.enter_embedding_phase()
         if self.ocr is None:
             return {"ok": False, "error": "모델이 로드되지 않았습니다."}
 
         self._log("═══ 문서 유형 분류 (Doc Type NMS) ═══")
         pipeline = VisionPipeline(
-            self.embed_fn, ocr=self.ocr, embedder=self.embedder,
+            self.vision_embed_fn, ocr=self.ocr, embedder=self.embedder,
             log=self._log, nlp=self.nlp,
         )
         verdict = pipeline.classify(self.current_image, SCHEMA_DIR)
@@ -502,11 +848,47 @@ class NMSOcrApp:
         if not verdict.code:
             return {"ok": False, "error": "문서 유형을 판정하지 못했습니다."}
 
+        if verdict.needs_llm:
+            self._log(
+                f"  ⚠️ 문서 유형 '{verdict.group}/{verdict.code}' 는 마진 미달입니다. "
+                f"스키마를 직접 선택하면 정확도가 크게 올라갑니다."
+            )
+
         return {
             "ok": True,
             "schema": verdict.schema_file,
             "verdict": verdict.to_dict(),
+            "low_confidence": bool(verdict.needs_llm),
         }
+
+    def _ensure_refiner_slot(self) -> bool:
+        if SLOT_REFINER in self.crossover.slots:
+            return True
+
+        ref_path, ref_label = resolve_refiner_path(
+            self.lang_code, codes=self.active_codes
+        )
+        if not ref_path:
+            return False
+
+        low = self.low_vram
+        budget = self.vram_budget
+
+        def _load_refiner():
+            return RefinerLLM(
+                ref_path,
+                label=ref_label,
+                log=self._log,
+                low_vram=low,
+                budget_gb=budget,
+            )
+
+        self.crossover.register(
+            SLOT_REFINER, _load_refiner, label=ref_label, est_gb=4.2
+        )
+        mode = "저VRAM(양자화/오프로드)" if low else "표준"
+        self._log(f"  ⏳ [{ref_label}] 정제 LLM 지연 로드 예약 — {mode}")
+        return True
 
     def _refine_fn(self, hint: str = ""):
         if SLOT_REFINER not in self.crossover.slots:
@@ -532,6 +914,18 @@ class NMSOcrApp:
         use_refiner: bool = True,
     ) -> dict:
         self.log_lines = []
+
+        if self.current_image is None and not self.current_text:
+            return {"ok": False, "error": "입력이 로드되지 않았습니다."}
+
+        ready = self.ensure_models_ready()
+        if not ready.get("ok"):
+            return {
+                "ok": False,
+                "error": ready.get("error", "모델 자동 로드에 실패했습니다."),
+                "log": self.log_lines,
+                "models_ready": self.models_ready,
+            }
 
         schema: dict = {}
         if schema_json:
@@ -568,9 +962,15 @@ class NMSOcrApp:
         self._log("═══ 텍스트 파이프라인 ═══")
         self._progress(10, "텍스트 파이프라인 시작")
 
+        if not self.ensure_step("text_pipeline", required=True):
+            return {"ok": False, "error": "텍스트 파이프라인에 필요한 모델이 없습니다."}
+
         self.crossover.enter_embedding_phase()
 
-        cfg = TextPipelineConfig(margin_threshold=margin_threshold)
+        cfg = TextPipelineConfig(
+            margin_threshold=margin_threshold,
+            lang_code=self.lang_code if self.language_resolved else "",
+        )
         res = run_text_pipeline(
             self.current_text, schema, self.embed_fn,
             config=cfg, log=self._log, nlp=self.nlp,
@@ -583,6 +983,7 @@ class NMSOcrApp:
         payload["mode"] = "text"
         payload["language"] = self.language.to_dict() if self.language else {}
         payload["crossover"] = self.crossover.stats()
+        payload["models_ready"] = self.models_ready
         self.last_result = payload
         return payload
 
@@ -593,6 +994,18 @@ class NMSOcrApp:
         margin_threshold: float,
         use_refiner: bool,
     ) -> dict:
+        if not self.ensure_step("field_heatmap", required=True):
+            return {"ok": False, "error": "필드 히트맵에 필요한 모델이 없습니다."}
+
+        self.ensure_step("ocr_extract", required=False)
+        if use_refiner:
+            if not self.ensure_step("refine", required=False):
+                self._log("  ⏭ 정제 LLM 준비 실패 → OCR 원문으로 진행합니다.")
+                use_refiner = False
+            elif not self._ensure_refiner_slot():
+                self._log("  ⏭ 정제 LLM 슬롯을 등록하지 못해 OCR 원문으로 진행합니다.")
+                use_refiner = False
+
         self.crossover.enter_embedding_phase()
         if self.ocr is None:
             return {"ok": False, "error": "모델이 로드되지 않았습니다."}
@@ -603,9 +1016,10 @@ class NMSOcrApp:
         cfg = VisionPipelineConfig(
             iou_threshold=iou_threshold,
             margin_threshold=margin_threshold,
+            lang_code=self.lang_code if self.language_resolved else "",
         )
         pipeline = VisionPipeline(
-            self.embed_fn, ocr=self.ocr, embedder=self.embedder,
+            self.vision_embed_fn, ocr=self.ocr, embedder=self.embedder,
             config=cfg, log=self._log, nlp=self.nlp,
             crossover=self.crossover,
         )
@@ -621,6 +1035,13 @@ class NMSOcrApp:
         payload["mode"] = "vision"
         payload["language"] = self.language.to_dict() if self.language else {}
         payload["crossover"] = self.crossover.stats()
+        payload["models_ready"] = self.models_ready
+        absent = payload.get("absent_fields") or []
+        if absent:
+            self._log(
+                f"  ⚪ 이 문서에 존재하지 않는 필드 {len(absent)}개: "
+                + ", ".join(sorted(absent))
+            )
         self.last_result = payload
 
         for line in self.crossover.report_lines():
@@ -671,12 +1092,98 @@ class NMSOcrApp:
             return {"ok": False, "error": str(e)}
 
     def toggle_devtools(self) -> dict:
+        errors = []
+
+        native = devtools_mod.try_native_devtools()
+        if native.get("ok"):
+            return native
+        if native.get("error"):
+            errors.append(native["error"])
+
+        port = int(os.environ.get("NMS_DEVTOOLS_PORT", devtools_mod.DEFAULT_PORT))
+        if devtools_mod.is_port_open(port):
+            res = devtools_mod.open_in_browser(port)
+            if res.get("ok"):
+                self._log(f"  🛠 원격 DevTools 열기: {res['url']}")
+                return {"ok": True, "mode": "remote", "url": res["url"]}
+            errors.append(res.get("error", ""))
+        else:
+            errors.append(f"원격 디버깅 포트 {port} 가 닫혀 있습니다.")
+
+        st = devtools_mod.status(port)
+        return {
+            "ok": False,
+            "mode": "inapp",
+            "fallback": True,
+            "status": st,
+            "error": "\n".join(e for e in errors if e),
+            "hint": st.get("hint", ""),
+        }
+
+    def devtools_status(self) -> dict:
+        port = int(os.environ.get("NMS_DEVTOOLS_PORT", devtools_mod.DEFAULT_PORT))
+        return devtools_mod.status(port)
+
+    def debug_snapshot(self) -> dict:
+        import platform
+
         try:
-            import webview
-            webview.windows[0].toggle_devtools()
-            return {"ok": True}
-        except Exception as e:
-            return {"ok": False, "error": str(e)}
+            import torch
+            torch_ver = torch.__version__
+            cuda = torch.cuda.is_available()
+            cuda_ver = getattr(torch.version, "cuda", "") or ""
+        except Exception:
+            torch_ver, cuda, cuda_ver = "", False, ""
+
+        try:
+            import transformers
+            tf_ver = transformers.__version__
+        except Exception:
+            tf_ver = ""
+
+        try:
+            import numpy
+            np_ver = numpy.__version__
+        except Exception:
+            np_ver = ""
+
+        return {
+            "python": sys.version.split()[0],
+            "platform": platform.platform(),
+            "torch": torch_ver,
+            "cuda": cuda,
+            "cuda_version": cuda_ver,
+            "transformers": tf_ver,
+            "numpy": np_ver,
+            "gpu": self.get_gpu_info(),
+            "crossover": self.crossover.stats(),
+            "vram_budget": self.vram_budget,
+            "low_vram": self.low_vram,
+            "language": self.language.to_dict() if self.language else {},
+            "lang_code": self.lang_code,
+            "saved_lang_code": self.saved_lang_code,
+            "providers": self.router.providers(),
+            "vision_providers": self.vision_router.providers(),
+            "vision_cache": self.cached_vision.stats() if self.cached_vision else {},
+            "devtools": self.devtools_status(),
+            "input": {
+                "path": self.current_path,
+                "image": bool(self.current_image),
+                "text_chars": len(self.current_text),
+            },
+            "log_lines": len(self.log_lines),
+        }
+
+    def js_console(self, level: str, message: str) -> dict:
+        tag = {
+            "error": "🟥 JS",
+            "warn": "🟨 JS",
+            "info": "🟦 JS",
+            "log": "⬜ JS",
+        }.get(str(level).lower(), "⬜ JS")
+        for line in str(message).splitlines():
+            self._log(f"  {tag} {line}")
+        return {"ok": True}
 
     def get_crossover(self) -> dict:
         return self.crossover.stats()
@@ -687,18 +1194,50 @@ class NMSOcrApp:
         self.text_embedder = None
         self.nlp = None
         self.cached_router = None
+        self.cached_vision = None
+        self.base_ready = False
+        self.models_ready = False
 
 
 def run_cli(args) -> int:
-    app = NMSOcrApp(crossover_enabled=not args.no_crossover)
+    app = NMSOcrApp(
+        crossover_enabled=not args.no_crossover,
+        auto_fetch=not args.no_fetch,
+        vram_budget=args.vram_budget,
+        force_low_vram=args.low_vram,
+    )
     app.print_model_report()
+    app._log_vram_profile()
+
+    if args.fetch_all:
+        if args.lang:
+            app.lang_code = normalize_lang_code(args.lang)
+            app.language_resolved = True
+            app.active_codes = [app.lang_code]
+        app._sync_registry_language()
+        app.download_all_missing()
+        while app.registry.busy:
+            time.sleep(0.5)
+        time.sleep(1.0)
+        app.print_model_report()
+        return 0
 
     if args.check_only:
         return 0
 
     if args.lang:
         app.lang_code = normalize_lang_code(args.lang)
+        app.language_resolved = True
+        app.active_codes = [app.lang_code]
+        app._language_pending = False
+        app._sync_registry_language()
         app._log(f"🌐 언어 강제 지정: {app.lang_code} ({language_name(app.lang_code)})")
+    else:
+        app._log(
+            "🌐 언어 미지정 — 기본 언어 "
+            + ", ".join(f"{language_name(c)}({c})" for c in BOOTSTRAP_LANGUAGES)
+            + " 로 부트스트랩합니다."
+        )
 
     loaded = app.load_base_models()
     if not loaded.get("ok"):
@@ -744,13 +1283,44 @@ def run_cli(args) -> int:
 
 
 def run_ui(args) -> int:
+    dev_info = None
+    if not args.no_devtools:
+        port = devtools_mod.find_free_port(int(args.devtools_port))
+        dev_info = devtools_mod.enable_remote_debugging(port)
+        print("=" * 60)
+        print("  🛠 원격 디버깅 활성화")
+        print(f"     크롬 주소창에 입력:  http://127.0.0.1:{port}")
+        print(f"     또는 chrome://inspect 에서 localhost:{port} 추가")
+        print("     끄려면: python app.py --no-devtools")
+        print("=" * 60)
+
     try:
         import webview
     except ImportError:
         print("pywebview 가 설치되어 있지 않습니다. `pip install pywebview`", file=sys.stderr)
         return 1
 
-    app = NMSOcrApp(crossover_enabled=not args.no_crossover)
+    caps = devtools_mod.webview_capabilities()
+    print(
+        f"  pywebview {caps.get('version') or '?'} "
+        f"| 내장 DevTools {'O' if caps.get('toggle_devtools') else 'X'}"
+    )
+    if not caps.get("toggle_devtools"):
+        print("  ℹ 내장 DevTools 가 없습니다. 원격 디버깅 또는 인앱 패널(F12)을 사용하세요.")
+        print('     내장 DevTools 사용: pip install -U "pywebview>=5.0"')
+
+    app = NMSOcrApp(
+        crossover_enabled=not args.no_crossover,
+        auto_fetch=not args.no_fetch,
+        vram_budget=args.vram_budget,
+        force_low_vram=args.low_vram,
+    )
+    if dev_info:
+        app._log(f"🛠 원격 DevTools: {dev_info['url']} ({dev_info['platform']})")
+    app._log(
+        f"🖥 pywebview {caps.get('version') or '?'} "
+        f"| 내장 DevTools {'사용 가능' if caps.get('toggle_devtools') else '없음 → 인앱 패널'}"
+    )
 
     class JSApi:
         def check_models(self):
@@ -807,6 +1377,36 @@ def run_ui(args) -> int:
             app.unload()
             return {"ok": True, "crossover": app.get_crossover()}
 
+        def devtools_status(self):
+            return app.devtools_status()
+
+        def debug_snapshot(self):
+            return app.debug_snapshot()
+
+        def js_console(self, level: str = "log", message: str = ""):
+            return app.js_console(level, message)
+
+        def download_model(self, target_id: str):
+            return app.download_model(target_id)
+
+        def download_all_missing(self):
+            return app.download_all_missing()
+
+        def download_bootstrap(self):
+            return app.download_bootstrap()
+
+        def delete_model(self, target_id: str):
+            return app.delete_model(target_id)
+
+        def delete_all_models(self):
+            return app.delete_all_models()
+
+        def cancel_download(self):
+            return app.cancel_download()
+
+        def set_auto_fetch(self, enabled: bool):
+            return app.set_auto_fetch(bool(enabled))
+
     webview.create_window(
         title="NMS-OCR — Vision / Text NMS Extraction",
         url=str(UI_DIR / "index.html"),
@@ -815,7 +1415,15 @@ def run_ui(args) -> int:
         height=860,
         min_size=(960, 640),
     )
-    webview.start(debug=bool(args.debug))
+
+    start_kwargs = {"debug": bool(args.debug or not args.no_devtools)}
+    if args.gui:
+        start_kwargs["gui"] = args.gui
+
+    try:
+        webview.start(**start_kwargs)
+    except TypeError:
+        webview.start(debug=start_kwargs["debug"])
     return 0
 
 
@@ -830,11 +1438,39 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--iou", type=float, default=0.80, help="IoU 억제 임계값")
     p.add_argument("--margin", type=float, default=0.28, help="마진 임계값")
     p.add_argument("--save", action="store_true", help="결과를 output/ 에 저장")
-    p.add_argument("--no-fetch", action="store_true", help="언어 모델 자동 취득 비활성화")
+    p.add_argument("--no-fetch", action="store_true", help="모델 자동 취득 비활성화")
+    p.add_argument("--fetch-all", action="store_true", help="누락 모델 전체 내려받고 종료")
     p.add_argument("--no-refine", action="store_true", help="LLM 정제 추출 비활성화")
     p.add_argument("--check-only", action="store_true", help="모델 상태만 출력하고 종료")
     p.add_argument("--no-ui", action="store_true", help="UI 없이 CLI 로 실행")
-    p.add_argument("--debug", action="store_true", help="UI DevTools 활성화")
+    p.add_argument("--debug", action="store_true", help="pywebview 디버그 모드")
+    p.add_argument(
+        "--no-devtools",
+        action="store_true",
+        help="크롬 원격 디버깅 비활성화 (기본은 활성)",
+    )
+    p.add_argument(
+        "--devtools-port",
+        type=int,
+        default=devtools_mod.DEFAULT_PORT,
+        help="원격 디버깅 포트 (기본 9222)",
+    )
+    p.add_argument(
+        "--gui",
+        default="",
+        help="pywebview GUI 백엔드 강제 지정 (edgechromium / qt / gtk / cef)",
+    )
+    p.add_argument(
+        "--vram-budget",
+        type=float,
+        default=0.0,
+        help="VRAM 예산(GB) 강제 지정. 0 이면 자동 감지",
+    )
+    p.add_argument(
+        "--low-vram",
+        action="store_true",
+        help="저VRAM 모드 강제 (LLM 양자화 / CPU 오프로드)",
+    )
     p.add_argument(
         "--no-crossover",
         action="store_true",

@@ -142,21 +142,42 @@ class HayaiOCR:
         self.model.eval()
 
         try:
-            self.tokenizer = AutoTokenizer.from_pretrained(self.siglip2_ref)
             self.image_processor = AutoProcessor.from_pretrained(self.siglip2_ref)
         except Exception as e:
             raise MissingModelError(
-                "SigLIP2 토크나이저/프로세서를 불러오지 못했습니다.\n"
+                "SigLIP2 이미지 프로세서를 불러오지 못했습니다.\n"
                 f"  참조 : {self.siglip2_ref}\n"
                 f"  원인 : {e}\n"
                 "  오프라인 환경이라면 models/siglip2-base-patch16-naflex/ 에\n"
                 "  config.json / preprocessor_config.json / tokenizer.json 을 배치하세요."
             )
 
+        self.tokenizer, self.tokenizer_vocab, self.tokenizer_source = \
+            self._resolve_tokenizer()
+
+        self.vocab_aligned = (
+            self.tokenizer_vocab > 0
+            and abs(self.tokenizer_vocab - int(self.config.vocab_size)) <= 64
+        )
+
         self.patch_size = self._resolve_patch_size()
         self._loaded = True
         print(f"[GPU/HayaiOCR] Model loaded | device={self.device} | dtype={self.dtype}")
         print(f"[GPU/HayaiOCR] weights={self.model_path} | siglip2={self.siglip2_ref}")
+        print(
+            f"[GPU/HayaiOCR] tokenizer={self.tokenizer_source} "
+            f"| vocab={self.tokenizer_vocab} vs model={int(self.config.vocab_size)} "
+            f"| aligned={'YES' if self.vocab_aligned else 'NO'}"
+        )
+        if not self.vocab_aligned:
+            print(
+                "[HayaiOCR] ⚠ 토크나이저/모델 어휘 불일치입니다.\n"
+                f"    모델 vocab_size={int(self.config.vocab_size)} 인데 "
+                f"토크나이저 어휘는 {self.tokenizer_vocab} 개입니다.\n"
+                "    OCR 출력이 <unused..> 같은 예약 토큰으로, 텍스트 앵커 임베딩이\n"
+                "    서로 구분되지 않는 벡터로 붕괴합니다.\n"
+                f"    models/hayai/ 에 학습에 쓰인 토크나이저(tokenizer.json 등)를 배치하세요."
+            )
         _log_tensor_summary_ocr(self.model, "HayaiOCR")
 
     def _resolve_patch_size(self) -> int:
@@ -173,6 +194,60 @@ class HayaiOCR:
         if isinstance(vc, int) and vc > 0:
             return vc
         return 16
+
+    @staticmethod
+    def _vocab_size_of(tok) -> int:
+        try:
+            n = len(tok)
+            if isinstance(n, int) and n > 0:
+                return int(n)
+        except Exception:
+            pass
+        try:
+            return int(getattr(tok, "vocab_size", 0) or 0)
+        except Exception:
+            return 0
+
+    def _resolve_tokenizer(self):
+        want = int(getattr(self.config, "vocab_size", 0) or 0)
+
+        candidates = []
+        for ref in (self.model_path, str(OCR_PATH), self.siglip2_ref):
+            if ref and ref not in candidates:
+                candidates.append(ref)
+
+        best = None
+        best_size = 0
+        best_ref = ""
+        best_gap = None
+        errors = []
+
+        for ref in candidates:
+            try:
+                tok = AutoTokenizer.from_pretrained(ref, trust_remote_code=True)
+            except Exception as e:
+                errors.append(f"{ref}: {e}")
+                continue
+
+            size = self._vocab_size_of(tok)
+            gap = abs(size - want) if want else 0
+
+            if want and gap <= 64:
+                return tok, size, ref
+
+            if best is None or (best_gap is not None and gap < best_gap):
+                best, best_size, best_ref, best_gap = tok, size, ref, gap
+
+        if best is not None:
+            return best, best_size, best_ref
+
+        raise MissingModelError(
+            "Hayai OCR 토크나이저를 불러오지 못했습니다.\n"
+            f"  탐색 경로 : {', '.join(candidates)}\n"
+            f"  원인 : {' | '.join(errors) if errors else '알 수 없음'}\n"
+            "  models/hayai/ 또는 models/siglip2-base-patch16-naflex/ 에\n"
+            "  tokenizer.json / tokenizer_config.json 을 배치하세요."
+        )
 
     def get_device(self) -> torch.device:
         return self.device
@@ -194,8 +269,14 @@ class HayaiOCR:
         ).to(self.device)
         if token_ids.numel() == 0:
             return np.zeros(self.config.d_model, dtype=np.float32)
-        token_ids = token_ids.clamp(0, self.config.vocab_size - 1)
-        embeddings = self.model.decoder.token_embeddings(token_ids)
+
+        limit = int(self.config.vocab_size)
+        flat = token_ids.reshape(-1)
+        keep = flat[(flat >= 0) & (flat < limit)]
+        if keep.numel() == 0:
+            return np.zeros(self.config.d_model, dtype=np.float32)
+
+        embeddings = self.model.decoder.token_embeddings(keep.unsqueeze(0))
         pooled = embeddings.mean(dim=1)
         return pooled.float().cpu().numpy()[0]
 

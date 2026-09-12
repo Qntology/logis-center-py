@@ -1,5 +1,5 @@
 import threading
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Sequence
 
 PHASE_IDLE = "idle"
 PHASE_EMBEDDING = "embedding"
@@ -65,14 +65,17 @@ class Slot:
         loader: Callable[[], object],
         unloader: Optional[Callable[[object], None]] = None,
         label: str = "",
+        est_gb: float = 0.0,
     ):
         self.name = name
         self.loader = loader
         self.unloader = unloader
         self.label = label or SLOT_LABELS.get(name, name)
+        self.est_gb = float(est_gb)
         self.instance: Optional[object] = None
         self.load_count = 0
         self.release_count = 0
+        self.last_error = ""
 
     @property
     def loaded(self) -> bool:
@@ -108,17 +111,28 @@ class Slot:
             "loaded": self.loaded,
             "loads": self.load_count,
             "releases": self.release_count,
+            "est_gb": round(self.est_gb, 2),
+            "last_error": self.last_error,
         }
 
 
 class CrossoverSwitch:
-    def __init__(self, log: Optional[Callable[[str], None]] = None, enabled: bool = True):
+    def __init__(
+        self,
+        log: Optional[Callable[[str], None]] = None,
+        enabled: bool = True,
+        budget_gb: float = 0.0,
+        headroom_gb: float = 0.4,
+    ):
         self.phase = PHASE_IDLE
         self.enabled = bool(enabled)
+        self.budget_gb = float(budget_gb or 0.0)
+        self.headroom_gb = float(headroom_gb)
         self.slots: Dict[str, Slot] = {}
         self._lock = threading.RLock()
         self._log_fn = log or (lambda m: None)
         self.transitions: List[dict] = []
+        self.evictions: List[dict] = []
 
     def _log(self, msg: str):
         try:
@@ -132,11 +146,56 @@ class CrossoverSwitch:
         loader: Callable[[], object],
         unloader: Optional[Callable[[object], None]] = None,
         label: str = "",
+        est_gb: float = 0.0,
     ) -> Slot:
         with self._lock:
-            slot = Slot(name, loader, unloader, label)
+            slot = Slot(name, loader, unloader, label, est_gb)
             self.slots[name] = slot
             return slot
+
+    def loaded_estimate_gb(self) -> float:
+        return sum(s.est_gb for s in self.slots.values() if s.loaded)
+
+    def _make_room_for(self, name: str, protect: Sequence[str]) -> List[str]:
+        slot = self.slots.get(name)
+        if slot is None or slot.est_gb <= 0.0 or self.budget_gb <= 0.0:
+            return []
+
+        need = slot.est_gb + self.headroom_gb
+        free = _vram_free_gb()
+        if free >= need:
+            return []
+
+        protect_set = set(protect) | {name}
+        candidates = [
+            s for s in self.slots.values()
+            if s.loaded and s.name not in protect_set and s.est_gb > 0.0
+        ]
+        candidates.sort(key=lambda s: s.est_gb, reverse=True)
+
+        evicted: List[str] = []
+        for cand in candidates:
+            if _vram_free_gb() >= need:
+                break
+            self._log(
+                f"  🧹 [VRAM 압박] '{slot.label}'({slot.est_gb:.1f} GB) 적재를 위해 "
+                f"'{cand.label}'({cand.est_gb:.1f} GB) 를 먼저 반납합니다."
+            )
+            if self.release(cand.name):
+                evicted.append(cand.name)
+                self.evictions.append({
+                    "for": name,
+                    "evicted": cand.name,
+                    "need_gb": round(need, 2),
+                })
+
+        after = _vram_free_gb()
+        if after < need:
+            self._log(
+                f"  ⚠️ VRAM 여유 {after:.2f} GB < 필요 {need:.2f} GB. "
+                f"'{slot.label}' 로드가 실패할 수 있습니다."
+            )
+        return evicted
 
     def get(self, name: str) -> Optional[object]:
         with self._lock:
@@ -145,15 +204,27 @@ class CrossoverSwitch:
                 return None
             return slot.instance
 
-    def acquire(self, name: str) -> Optional[object]:
+    def acquire(self, name: str, protect: Optional[Sequence[str]] = None) -> Optional[object]:
         with self._lock:
             slot = self.slots.get(name)
             if slot is None:
                 return None
             if slot.loaded:
                 return slot.instance
+
+            if self.enabled:
+                self._make_room_for(name, protect or [])
+
             before = _vram_free_gb()
-            obj = slot.acquire()
+            try:
+                obj = slot.acquire()
+                slot.last_error = ""
+            except Exception as e:
+                slot.last_error = str(e)
+                self._log(f"  ❌ [{slot.label}] 로드 실패: {e}")
+                _empty_cache()
+                raise
+
             after = _vram_free_gb()
             if before > 0.0:
                 self._log(
@@ -206,13 +277,14 @@ class CrossoverSwitch:
                 self._log("  ⏭ CROSSOVER 비활성 — 모델 반납을 건너뜁니다.")
 
             acquired: List[str] = []
-            for name in plan["keep"]:
+            keep = list(plan["keep"])
+            for name in keep:
                 slot = self.slots.get(name)
                 if slot is None:
                     continue
                 if not slot.loaded:
                     try:
-                        self.acquire(name)
+                        self.acquire(name, protect=keep)
                         acquired.append(name)
                     except Exception as e:
                         self._log(f"  ⚠ [{slot.label}] 로드 실패: {e}")
@@ -257,9 +329,12 @@ class CrossoverSwitch:
             return {
                 "phase": self.phase,
                 "enabled": self.enabled,
+                "budget_gb": round(self.budget_gb, 2),
+                "loaded_est_gb": round(self.loaded_estimate_gb(), 2),
                 "vram_free_gb": round(_vram_free_gb(), 3),
                 "slots": {n: s.stats() for n, s in self.slots.items()},
                 "transitions": len(self.transitions),
+                "evictions": len(self.evictions),
             }
 
     def report_lines(self) -> List[str]:

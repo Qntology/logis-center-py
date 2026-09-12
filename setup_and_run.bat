@@ -93,23 +93,24 @@ if %errorlevel% neq 0 (
 
 echo.
 echo ============================================================
-echo   [STEP 4/5] CUDA acceleration kernels (optional)
+echo   [STEP 4/5] Low-VRAM support (optional)
 echo ============================================================
 
-echo [INFO] Trying causal-conv1d...
-pip install "causal-conv1d>=1.4.0" >nul 2>&1
-if !errorlevel! equ 0 (
-    echo   [OK] causal-conv1d installed.
-) else (
-    echo   [SKIP] causal-conv1d build failed. Using PyTorch fallback.
-)
+for /f "tokens=*" %%v in ('python -c "import torch;print(int(torch.cuda.get_device_properties(0).total_memory/1024**3)) if torch.cuda.is_available() else print(0)" 2^>nul') do set VRAM_GB=%%v
+if "%VRAM_GB%"=="" set VRAM_GB=0
 
-echo [INFO] Trying flash-linear-attention...
-pip install flash-linear-attention >nul 2>&1
-if !errorlevel! equ 0 (
-    echo   [OK] flash-linear-attention installed.
+echo [INFO] Detected VRAM: %VRAM_GB% GB
+
+if %VRAM_GB% GTR 0 if %VRAM_GB% LSS 6 (
+    echo [INFO] Low VRAM detected. Installing bitsandbytes for 4-bit quantization...
+    pip install bitsandbytes >nul 2>&1
+    if !errorlevel! equ 0 (
+        echo   [OK] bitsandbytes installed. 2B LLM will run in 4-bit.
+    ) else (
+        echo   [SKIP] bitsandbytes install failed. CPU offload will be used instead.
+    )
 ) else (
-    echo   [SKIP] flash-linear-attention build failed. Using PyTorch fallback.
+    echo [INFO] Sufficient VRAM. Skipping quantization package.
 )
 
 echo.
@@ -119,22 +120,19 @@ echo ============================================================
 python -c "import torch; print(f'  PyTorch: {torch.__version__} | CUDA: {torch.cuda.is_available()}')"
 python -c "import transformers; print(f'  transformers: {transformers.__version__}')"
 python -c "import numpy; print(f'  numpy: {numpy.__version__}')"
+python -c "import PIL; print(f'  pillow: {PIL.__version__}')"
 
-REM ✅ 수정: import 이름 확인
-python -c "import causal_conv1d; print(f'  causal-conv1d: {causal_conv1d.__version__}')" >nul 2>&1
-if !errorlevel! equ 0 (
-    python -c "import causal_conv1d; print(f'  causal-conv1d: {causal_conv1d.__version__}')"
-) else (
-    echo   causal-conv1d: NOT INSTALLED (slower fallback)
-)
+python -c "import webview; print(f'  pywebview: {webview.__version__}')" 2>nul
+if !errorlevel! neq 0 echo   pywebview: NOT INSTALLED
 
-REM ✅ 수정: 모듈명이 fla임
-python -c "import fla" >nul 2>&1
-if !errorlevel! equ 0 (
-    echo   flash-linear-attention: OK
-) else (
-    echo   flash-linear-attention: NOT INSTALLED (slower fallback)
-)
+python -c "import stanza; print(f'  stanza: {stanza.__version__}')" 2>nul
+if !errorlevel! neq 0 echo   stanza: NOT INSTALLED (NLP gate disabled)
+
+python -c "import bitsandbytes; print('  bitsandbytes: OK (4-bit available)')" 2>nul
+if !errorlevel! neq 0 echo   bitsandbytes: not installed (offload fallback)
+
+python -c "import fitz; print('  PyMuPDF: OK')" 2>nul
+if !errorlevel! neq 0 echo   PyMuPDF: NOT INSTALLED (PDF input disabled)
 
 echo.
 echo ============================================================
@@ -147,8 +145,16 @@ if "%GPU_TYPE%"=="cuda" (
 echo ============================================================
 echo.
 
-REM ✅ 수정: REM 주석에 %%~ 포함 금지 → 아래 한 줄만 남김
-python "%~dp0app.py"
+echo.
+echo ============================================================
+echo   Debugging
+echo     Remote DevTools : http://127.0.0.1:9222  (Chrome)
+echo     In-app console  : Ctrl+Shift+D
+echo     Disable remote  : setup_and_run.bat --no-devtools
+echo ============================================================
+echo.
+
+python "%~dp0app.py" %*
 
 if %errorlevel% neq 0 (
     echo.

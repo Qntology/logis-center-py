@@ -1,86 +1,308 @@
 {
   "domain": "logistics",
   "doc_type": "shipping_doc",
+  "code": "shipping_doc",
+  "doc_anchors": [
+    "a parcel shipping label or waybill with tracking number",
+    "a delivery note showing recipient address and shipping status",
+    "courier consignment note for domestic parcel delivery",
+    "택배 운송장 배송 조회 화면 물류 서류",
+    "配送伝票 宅配便 送り状",
+    "快递运单 物流面单"
+  ],
   "fields": {
     "tracking_number": {
-      "semantic": "운송장번호, 송장번호, 추적번호",
-      "bias": [
-        "운송장번호",
-        "송장번호",
-        "추적번호",
-        "택배번호",
+      "semantic": {
+        "eng": "the parcel tracking or waybill number used to trace the shipment",
+        "kor": "배송 조회에 사용되는 운송장 추적 번호",
+        "*": "parcel tracking waybill number"
+      },
+      "format": "tracking_code",
+      "top_region": true,
+      "label": {
+        "eng": [
+          "TRACKING NUMBER",
+          "TRACKING NO.",
+          "WAYBILL NUMBER",
+          "CONSIGNMENT NUMBER",
+          "SHIPMENT ID",
+          "PARCEL NUMBER",
+          "AWB"
+        ],
+        "kor": [
+          "운송장번호",
+          "송장번호",
+          "추적번호",
+          "택배번호",
+          "배송조회번호",
+          "운송장 No."
+        ],
+        "jpn": ["お問い合わせ番号", "送り状番号", "追跡番号"],
+        "zho": ["运单号", "快递单号", "物流单号"],
+        "deu": ["Sendungsnummer", "Trackingnummer"],
+        "*": ["Número de seguimiento", "Numéro de suivi"]
+      },
+      "value": [
         "603145678912",
-        "1Z9999999999999999"
+        "1Z9999999999999999",
+        "123456789012",
+        "EE123456789KR"
       ],
       "prejudice": [
         "배송상태",
-        "상품명",
-        "등록일",
-        "수령인"
+        "SHIPPING STATUS",
+        "주문번호",
+        "ORDER NUMBER",
+        "수령인",
+        "RECIPIENT"
       ]
     },
     "recipient_name": {
-      "semantic": "수령인, 받는사람, 구매자 이름",
-      "bias": [
-        "수령인",
-        "받는사람",
-        "구매자",
-        "김철수",
-        "이영희"
-      ],
+      "semantic": {
+        "eng": "the name of the person receiving the parcel",
+        "kor": "택배를 받는 수령인 이름",
+        "*": "recipient receiver person name"
+      },
+      "format": "text",
+      "label": {
+        "eng": [
+          "RECIPIENT",
+          "RECEIVER",
+          "SHIP TO",
+          "DELIVER TO",
+          "CONSIGNEE NAME",
+          "TO"
+        ],
+        "kor": ["수령인", "받는사람", "받는분", "수취인", "구매자명"],
+        "jpn": ["お届け先", "受取人", "宛名"],
+        "zho": ["收件人", "收货人"],
+        "deu": ["Empfänger", "Empfängername"],
+        "*": ["Destinatario", "Destinataire"]
+      },
+      "value": ["김철수", "이영희", "John Smith", "山田太郎"],
       "prejudice": [
+        "보내는사람",
+        "SENDER",
         "운송장번호",
-        "등록일",
+        "TRACKING NUMBER",
         "배송상태",
         "주소"
       ]
     },
     "recipient_address": {
-      "semantic": "수령지, 배송지, 받는사람 주소",
-      "bias": [
-        "수령지",
-        "배송지",
-        "받는사람 주소",
-        "서울특별시",
-        "부산광역시"
+      "semantic": {
+        "eng": "the full delivery street address of the recipient",
+        "kor": "수령인의 배송지 전체 주소",
+        "*": "recipient delivery street address"
+      },
+      "format": "address",
+      "label": {
+        "eng": [
+          "DELIVERY ADDRESS",
+          "SHIPPING ADDRESS",
+          "SHIP TO ADDRESS",
+          "DESTINATION ADDRESS",
+          "ADDRESS"
+        ],
+        "kor": ["배송지", "수령지", "받는분 주소", "배송주소", "도착지"],
+        "jpn": ["お届け先住所", "配送先住所"],
+        "zho": ["收货地址", "配送地址"],
+        "deu": ["Lieferadresse", "Zustelladresse"],
+        "*": ["Dirección de entrega", "Adresse de livraison"]
+      },
+      "value": [
+        "서울특별시 강남구 테헤란로 123",
+        "부산광역시 해운대구 센텀중앙로 45",
+        "1600 Pennsylvania Ave NW, Washington DC"
       ],
       "prejudice": [
+        "보내는분 주소",
+        "SENDER ADDRESS",
         "운송장번호",
-        "수령인",
-        "등록일"
+        "배송상태",
+        "수령인"
       ]
     },
     "shipping_status": {
-      "semantic": "배송상태, 진행상황",
-      "bias": [
-        "배송상태",
-        "진행상황",
+      "semantic": {
+        "eng": "the current delivery progress state of the parcel",
+        "kor": "택배의 현재 배송 진행 상태",
+        "*": "current delivery progress status"
+      },
+      "format": "enum",
+      "label": {
+        "eng": [
+          "STATUS",
+          "SHIPPING STATUS",
+          "DELIVERY STATUS",
+          "TRACKING STATUS",
+          "CURRENT STATUS"
+        ],
+        "kor": ["배송상태", "진행상황", "처리현황", "배송단계", "상태"],
+        "jpn": ["配送状況", "ステータス"],
+        "zho": ["物流状态", "配送状态"],
+        "deu": ["Sendungsstatus", "Lieferstatus"],
+        "*": ["Estado del envío", "Statut de livraison"]
+      },
+      "value": [
         "배송중",
         "배송완료",
         "집화처리",
-        "간선상차"
+        "간선상차",
+        "간선하차",
+        "배달출발",
+        "In Transit",
+        "Out for Delivery",
+        "Delivered",
+        "Picked Up",
+        "Exception"
       ],
       "prejudice": [
         "운송장번호",
+        "TRACKING NUMBER",
         "수령인",
-        "등록일"
+        "택배사",
+        "CARRIER"
       ]
     },
     "carrier": {
-      "semantic": "택배사, 운송업체, 배송업체",
-      "bias": [
-        "택배사",
-        "운송업체",
-        "배송업체",
+      "semantic": {
+        "eng": "the courier or logistics company handling the delivery",
+        "kor": "배송을 담당하는 택배사 또는 운송업체",
+        "*": "courier logistics carrier company"
+      },
+      "format": "text",
+      "label": {
+        "eng": ["CARRIER", "COURIER", "SHIPPING COMPANY", "SERVICE PROVIDER"],
+        "kor": ["택배사", "운송업체", "배송업체", "택배회사"],
+        "jpn": ["配送業者", "運送会社"],
+        "zho": ["快递公司", "承运商"],
+        "deu": ["Versanddienstleister", "Zusteller"],
+        "*": ["Transportista", "Transporteur"]
+      },
+      "value": [
         "CJ대한통운",
         "롯데택배",
-        "우체국택배"
+        "우체국택배",
+        "한진택배",
+        "로젠택배",
+        "DHL",
+        "FedEx",
+        "UPS",
+        "ヤマト運輸",
+        "顺丰速运"
       ],
       "prejudice": [
         "운송장번호",
+        "배송상태",
         "수령인",
-        "등록일"
+        "보내는사람"
       ]
+    },
+    "sender_name": {
+      "semantic": {
+        "eng": "the name of the sender shipping the parcel",
+        "kor": "택배를 보내는 발송인 이름",
+        "*": "sender shipper person or company name"
+      },
+      "format": "text",
+      "label": {
+        "eng": ["SENDER", "SHIPPER", "FROM", "RETURN TO"],
+        "kor": ["보내는사람", "보내는분", "발송인", "송하인"],
+        "jpn": ["ご依頼主", "差出人"],
+        "zho": ["寄件人", "发货人"],
+        "deu": ["Absender"],
+        "*": ["Remitente", "Expéditeur"]
+      },
+      "value": ["쿠팡", "마켓컬리", "Acme Store", "360 Footwear"],
+      "prejudice": ["수령인", "RECIPIENT", "받는사람", "배송지"]
+    },
+    "delivery_date": {
+      "semantic": {
+        "eng": "the expected or actual delivery date of the parcel",
+        "kor": "택배의 예정 또는 실제 배송 완료 일자",
+        "*": "expected or actual delivery date"
+      },
+      "format": "date",
+      "label": {
+        "eng": [
+          "DELIVERY DATE",
+          "ESTIMATED DELIVERY",
+          "EXPECTED DELIVERY",
+          "DELIVERED ON",
+          "SHIP DATE"
+        ],
+        "kor": ["배송일", "도착예정일", "배송완료일", "발송일", "출고일"],
+        "jpn": ["お届け予定日", "配達日"],
+        "zho": ["预计送达", "签收日期"],
+        "deu": ["Lieferdatum", "Voraussichtliche Zustellung"],
+        "*": ["Fecha de entrega", "Date de livraison"]
+      },
+      "value": ["2026-03-15", "3월 15일 (금)", "Mar 15, 2026", "오늘 도착"],
+      "prejudice": ["운송장번호", "주문일", "배송상태", "결제일"]
+    },
+    "package_weight": {
+      "semantic": {
+        "eng": "the weight of the parcel used for shipping charges",
+        "kor": "배송 요금 산정에 쓰이는 화물 중량",
+        "*": "parcel package weight"
+      },
+      "format": "numeric",
+      "label": {
+        "eng": ["WEIGHT", "PACKAGE WEIGHT", "GROSS WEIGHT", "BILLED WEIGHT"],
+        "kor": ["중량", "무게", "실중량", "부피중량"],
+        "jpn": ["重量", "サイズ"],
+        "zho": ["重量", "计费重量"],
+        "deu": ["Gewicht"],
+        "*": ["Peso", "Poids"]
+      },
+      "value": ["2.5kg", "20KG", "500g", "1.2 lbs"],
+      "prejudice": ["배송비", "SHIPPING FEE", "수량", "운송장번호"]
+    },
+    "service_type": {
+      "semantic": {
+        "eng": "the delivery service level or product type selected",
+        "kor": "선택된 배송 서비스 등급 또는 상품 유형",
+        "*": "delivery service level or product type"
+      },
+      "format": "enum",
+      "label": {
+        "eng": ["SERVICE", "SERVICE TYPE", "SHIPPING METHOD", "DELIVERY OPTION"],
+        "kor": ["배송방법", "배송유형", "서비스", "운송유형"],
+        "jpn": ["配送方法", "サービス"],
+        "zho": ["配送方式", "服务类型"],
+        "deu": ["Versandart", "Serviceart"],
+        "*": ["Tipo de servicio", "Mode de livraison"]
+      },
+      "value": [
+        "일반택배",
+        "새벽배송",
+        "당일배송",
+        "착불",
+        "선불",
+        "Express",
+        "Standard",
+        "Economy"
+      ],
+      "prejudice": ["배송상태", "택배사", "배송비", "운송장번호"]
+    },
+    "shipping_fee": {
+      "semantic": {
+        "eng": "the freight charge billed for the delivery",
+        "kor": "배송에 청구된 운임 금액",
+        "*": "shipping freight charge amount"
+      },
+      "format": "numeric",
+      "label": {
+        "eng": ["SHIPPING FEE", "FREIGHT CHARGE", "DELIVERY FEE", "POSTAGE"],
+        "kor": ["배송비", "운임", "택배비", "배송요금"],
+        "jpn": ["送料", "配送料"],
+        "zho": ["运费", "配送费"],
+        "deu": ["Versandkosten"],
+        "*": ["Gastos de envío", "Frais de port"]
+      },
+      "value": ["3,000원", "무료배송", "$12.50", "0"],
+      "prejudice": ["상품금액", "총액", "중량", "수량"]
     }
   }
 }

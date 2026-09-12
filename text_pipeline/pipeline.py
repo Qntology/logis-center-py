@@ -36,6 +36,8 @@ class TextPipelineConfig:
         cross_prejudice: bool = True,
         embed_batch_size: int = 32,
         multi_value_fields: Optional[Sequence[str]] = None,
+        lang_code: str = "",
+        external_dictionary: bool = True,
     ):
         self.min_words = int(min_words)
         self.max_words = int(max_words)
@@ -49,6 +51,8 @@ class TextPipelineConfig:
         self.cross_prejudice = bool(cross_prejudice)
         self.embed_batch_size = int(embed_batch_size)
         self.multi_value_fields = list(multi_value_fields or [])
+        self.lang_code = str(lang_code or "")
+        self.external_dictionary = bool(external_dictionary)
 
     def chunker(self) -> ChunkerConfig:
         return ChunkerConfig(
@@ -128,9 +132,24 @@ class TextPipeline:
             embed_fn=self.embed_fn,
             cross_prejudice=self.config.cross_prejudice,
             batch_size=self.config.embed_batch_size,
+            lang_code=self.config.lang_code,
+            external_dictionary=self.config.external_dictionary,
         )
         for line in self.bank.report_lines():
             self._log(line)
+
+        if self.config.external_dictionary:
+            try:
+                from core import bias_bridge
+                for line in bias_bridge.report(
+                    self.bank.domain,
+                    self.bank.field_names,
+                    self.config.lang_code,
+                ):
+                    self._log(line)
+            except Exception as e:
+                self._log(f"  ⏭ 보조 사전 진단 생략: {e}")
+
         return self.bank
 
     def _embed_chunks(self, chunks: Sequence[Chunk]) -> np.ndarray:

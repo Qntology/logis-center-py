@@ -135,9 +135,16 @@ def load_doc_type_specs(schema_dir) -> Tuple[List[GroupSpec], Dict[str, str]]:
 
 
 class _AnchorCache:
-    def __init__(self, embed_fn: Callable[[List[str]], np.ndarray]):
+    def __init__(
+        self,
+        embed_fn: Callable[[List[str]], np.ndarray],
+        expect_dim: int = 0,
+    ):
         self.embed_fn = embed_fn
+        self.expect_dim = int(expect_dim)
         self.store: Dict[str, np.ndarray] = {}
+        self.rejected: int = 0
+        self.seen_dim: int = 0
 
     def get_many(self, phrases: Sequence[str]) -> Dict[str, np.ndarray]:
         need = [p for p in phrases if p and p not in self.store]
@@ -150,6 +157,10 @@ class _AnchorCache:
                 mat = np.asarray(mat, dtype=np.float32)
                 if mat.ndim == 1:
                     mat = mat.reshape(1, -1)
+                self.seen_dim = int(mat.shape[-1]) if mat.size else 0
+                if self.expect_dim and self.seen_dim != self.expect_dim:
+                    self.rejected += len(need)
+                    return {p: self.store[p] for p in phrases if p in self.store}
                 for i, p in enumerate(need):
                     if i >= mat.shape[0]:
                         break
@@ -158,11 +169,22 @@ class _AnchorCache:
                         self.store[p] = v
         return {p: self.store[p] for p in phrases if p in self.store}
 
+    def report(self) -> str:
+        if not self.rejected:
+            return ""
+        return (
+            f"임베딩 공간 불일치 — 패치 격자 {self.expect_dim}차원 vs "
+            f"텍스트 앵커 {self.seen_dim}차원 (앵커 {self.rejected}구 폐기)"
+        )
+
 
 def _max_pool_over_patches(grid: VisionPatchGrid, vec: np.ndarray) -> float:
-    if grid.embeddings.size == 0:
+    if grid.embeddings.size == 0 or vec is None:
         return 0.0
-    sims = grid.embeddings @ vec
+    v = np.asarray(vec, dtype=np.float32).reshape(-1)
+    if v.shape[-1] != int(grid.embeddings.shape[-1]):
+        return 0.0
+    sims = grid.embeddings @ v
     return float(np.max(sims))
 
 
@@ -199,7 +221,7 @@ def classify_doc_type(
         _say("⚪ 문서 유형 스펙이 없습니다.")
         return DocTypeVerdict(logs=logs)
 
-    cache = _AnchorCache(embed_fn)
+    cache = _AnchorCache(embed_fn, expect_dim=int(grid.dim))
 
     all_phrases: List[str] = list(CHROME_ANCHORS)
     for spec in specs:
@@ -207,6 +229,11 @@ def classify_doc_type(
         for anchors in spec.codes.values():
             all_phrases.extend(anchors)
     vecs = cache.get_many(sorted(set(all_phrases)))
+
+    if not vecs:
+        msg = cache.report() or "텍스트 앵커 임베딩을 얻지 못했습니다."
+        _say(f"❌ 문서 유형 분류 중단 — {msg}")
+        return DocTypeVerdict(logs=logs)
 
     chrome_vecs = [vecs[p] for p in CHROME_ANCHORS if p in vecs]
 
@@ -267,6 +294,7 @@ def classify_doc_type(
         )
 
     code_raw: List[Tuple[str, float, int]] = []
+    raw_lookup: Dict[str, float] = {}
     for code, anchors in pool.items():
         bias = [vecs[p] for p in anchors if p in vecs]
         prej = list(chrome_vecs)
@@ -276,6 +304,7 @@ def classify_doc_type(
             prej.extend(vecs[p] for p in other_anchors if p in vecs)
         net, n = _bank_net_score(grid, bias, prej)
         code_raw.append((code, net, n))
+        raw_lookup[code] = float(net)
 
     zs = _z([v for _c, v, _n in code_raw])
     code_scores = [
@@ -285,19 +314,36 @@ def classify_doc_type(
     code_scores.sort(key=lambda kv: kv[1], reverse=True)
 
     for code, sc in code_scores[:8]:
-        _say(f"  📐 코드 {code:<16} {sc:+.4f}")
+        _say(f"  📐 코드 {code:<16} z={sc:+.4f} | raw={raw_lookup.get(code, 0.0):+.4f}")
 
     best_code, best_cscore = code_scores[0]
     cmargin = best_cscore - (code_scores[1][1] if len(code_scores) > 1 else best_cscore)
 
-    needs_llm = cmargin < margin_threshold
+    raw_margin = 0.0
+    if len(code_scores) > 1:
+        raw_margin = raw_lookup.get(best_code, 0.0) - raw_lookup.get(
+            code_scores[1][0], 0.0
+        )
+
+    if raw_margin <= 0.0 and len(code_scores) > 1:
+        _say(
+            f"  🚧 '{best_code}' 의 원시 코사인 우위가 없습니다 "
+            f"(raw 차 {raw_margin:+.4f}) → z-정규화가 만든 허위 마진"
+        )
+        needs_llm = True
+    else:
+        needs_llm = cmargin < margin_threshold
+
     if needs_llm:
         _say(
-            f"  ⚠ 코드 마진 {cmargin:+.4f} < {margin_threshold:.2f} "
-            f"→ LLM 재판정 후보 나열"
+            f"  ⚠ 코드 마진 z={cmargin:+.4f} raw={raw_margin:+.4f} "
+            f"(요구 {margin_threshold:.2f}) → LLM 재판정 후보 나열"
         )
     else:
-        _say(f"  👑 코드 확정 '{best_code}' (margin {cmargin:+.4f})")
+        _say(
+            f"  👑 코드 확정 '{best_code}' "
+            f"(z마진 {cmargin:+.4f} / raw마진 {raw_margin:+.4f})"
+        )
 
     schema_file = (file_map or {}).get(best_code, "")
 

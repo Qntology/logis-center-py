@@ -11,9 +11,19 @@ from .doc_type_nms import (
 )
 from .field_heatmap import (
     CategoryHeatmap,
+    HEATMAP_CHROME_ANCHORS,
+    apply_arena,
     build_field_heatmaps,
     suppress_title_rows,
     spatial_residual,
+)
+from .nms_arena import (
+    ArenaResult,
+    FieldTerritory,
+    PatchVerdict,
+    compete_patches,
+    run_arena,
+    territory_scores,
 )
 from .vision_nms import (
     Component,
@@ -52,9 +62,17 @@ __all__ = [
     "classify_doc_type",
     "load_doc_type_specs",
     "CategoryHeatmap",
+    "HEATMAP_CHROME_ANCHORS",
+    "apply_arena",
     "build_field_heatmaps",
     "suppress_title_rows",
     "spatial_residual",
+    "ArenaResult",
+    "FieldTerritory",
+    "PatchVerdict",
+    "compete_patches",
+    "run_arena",
+    "territory_scores",
     "Component",
     "CropPlan",
     "extract_components",

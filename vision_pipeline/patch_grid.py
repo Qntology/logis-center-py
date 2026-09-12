@@ -211,3 +211,73 @@ def ink_ratio_per_row(image: Image.Image, rows: int) -> np.ndarray:
             continue
         out[r] = float((seg > thr).mean())
     return out
+
+
+def ink_ratio_per_col(image: Image.Image, cols: int) -> np.ndarray:
+    gray = np.asarray(image.convert("L"), dtype=np.float32)
+    w = gray.shape[1]
+    if w == 0 or cols <= 0:
+        return np.zeros((max(1, cols),), dtype=np.float32)
+    ink = 255.0 - gray
+    thr = float(ink.mean() + ink.std() * 0.25)
+    out = np.zeros((cols,), dtype=np.float32)
+    step = w / float(cols)
+    for c in range(cols):
+        x0 = int(c * step)
+        x1 = max(x0 + 1, int((c + 1) * step))
+        seg = ink[:, x0:min(x1, w)]
+        if seg.size == 0:
+            continue
+        out[c] = float((seg > thr).mean())
+    return out
+
+
+def _gutter_indices(
+    profile: np.ndarray,
+    rel_floor: float = 0.30,
+    hard_floor: float = 0.020,
+    max_ratio: float = 0.45,
+) -> set:
+    if profile.size == 0:
+        return set()
+
+    active = profile[profile > hard_floor]
+    if active.size == 0:
+        return set()
+
+    gate = max(hard_floor, float(active.mean()) * float(rel_floor))
+    cand = [int(i) for i in range(profile.size) if float(profile[i]) <= gate]
+
+    limit = max(0, int(profile.size * max_ratio))
+    if len(cand) > limit:
+        cand.sort(key=lambda i: float(profile[i]))
+        cand = cand[:limit]
+
+    return set(cand)
+
+
+def column_gutters(
+    image: Image.Image,
+    cols: int,
+    rel_floor: float = 0.30,
+    hard_floor: float = 0.020,
+) -> set:
+    return _gutter_indices(
+        ink_ratio_per_col(image, cols),
+        rel_floor=rel_floor,
+        hard_floor=hard_floor,
+    )
+
+
+def row_gutters(
+    image: Image.Image,
+    rows: int,
+    rel_floor: float = 0.22,
+    hard_floor: float = 0.015,
+) -> set:
+    return _gutter_indices(
+        ink_ratio_per_row(image, rows),
+        rel_floor=rel_floor,
+        hard_floor=hard_floor,
+        max_ratio=0.35,
+    )

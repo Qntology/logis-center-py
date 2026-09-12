@@ -8,22 +8,93 @@
 </head>
 <body>
   <div id="app">
-    <div id="model-status-overlay" style="display:none;">
-      <div id="model-status-card">
-        <h2>모델 상태</h2>
-        <p id="ms-status-text">모델 상태를 확인 중입니다...</p>
-        <div id="ms-model-list"></div>
-        <div id="ms-lang-list"></div>
-        <div id="ms-progress-wrap" style="display:none;">
-          <div id="ms-progress-bar"><div id="ms-progress-fill"></div></div>
-          <span id="ms-progress-label"></span>
+    <div id="settings-overlay" style="display:none;">
+      <div id="settings-panel">
+        <div id="settings-head">
+          <h2>환경설정 — 모델 관리</h2>
+          <button id="btn-settings-close" onclick="closeSettings()">✕</button>
         </div>
-        <div id="ms-buttons">
-          <button id="btn-ms-retry" onclick="refreshModelStatus()">다시 확인</button>
-          <button id="btn-ms-close" onclick="closeModelStatus()">닫기</button>
+
+        <div id="settings-notice" style="display:none;"></div>
+
+        <div id="settings-toolbar">
+          <label class="settings-toggle">
+            <input type="checkbox" id="auto-fetch-toggle" checked
+                   onchange="onAutoFetchChange()" />
+            <span>작업 중 모델 자동 취득</span>
+          </label>
+          <span id="settings-total">총 - GB</span>
+          <button id="btn-fetch-boot" onclick="downloadBootstrap()">기본 언어(eng+kor) 받기</button>
+          <button id="btn-fetch-all" onclick="downloadAllMissing()">누락 모델 전체 받기</button>
+          <button id="btn-cancel-dl" onclick="cancelDownload()" style="display:none;">취소</button>
+          <button id="btn-delete-all" onclick="deleteAllModels()" class="danger">전체 삭제</button>
+          <button id="btn-refresh-models" onclick="refreshModelStatus()">새로고침</button>
+        </div>
+
+        <div id="dl-progress-wrap" style="display:none;">
+          <div id="dl-progress-bar"><div id="dl-progress-fill"></div></div>
+          <span id="dl-progress-label"></span>
+        </div>
+
+        <h3 class="settings-section">필수 모델</h3>
+        <div id="model-list-base"></div>
+
+        <h3 class="settings-section">언어 스코프 모델 <span id="lang-scope-label"></span></h3>
+        <div id="model-list-lang"></div>
+
+        <h3 class="settings-section" id="bootstrap-section" style="display:none;">
+          기본 언어 모델 (언어 미확정 시 사용)
+        </h3>
+        <div id="model-list-bootstrap" style="display:none;"></div>
+
+        <h3 class="settings-section">NLP 게이트</h3>
+        <div id="model-list-stanza"></div>
+      </div>
+    </div>
+
+    <div id="debug-overlay" style="display:none;">
+      <div id="debug-panel">
+        <div id="debug-head">
+          <h2>인앱 디버그 콘솔</h2>
+          <span id="debug-mode-badge"></span>
+          <button onclick="closeDebug()">✕</button>
+        </div>
+
+        <div id="debug-tabs">
+          <button class="dbg-tab active" data-tab="eval" onclick="switchDebugTab('eval')">Console</button>
+          <button class="dbg-tab" data-tab="env" onclick="switchDebugTab('env')">Environment</button>
+          <button class="dbg-tab" data-tab="dom" onclick="switchDebugTab('dom')">DOM</button>
+          <button class="dbg-tab" data-tab="api" onclick="switchDebugTab('api')">API</button>
+        </div>
+
+        <div id="dbg-eval" class="dbg-body">
+          <pre id="dbg-eval-out"></pre>
+          <div id="dbg-eval-input">
+            <span class="dbg-prompt">&gt;</span>
+            <input type="text" id="dbg-eval-line"
+                   placeholder="JS 표현식 입력 후 Enter (↑↓ 히스토리)"
+                   onkeydown="onEvalKey(event)" />
+          </div>
+        </div>
+
+        <div id="dbg-env" class="dbg-body" style="display:none;">
+          <pre id="dbg-env-out"></pre>
+        </div>
+
+        <div id="dbg-dom" class="dbg-body" style="display:none;">
+          <input type="text" id="dbg-dom-sel" placeholder="CSS 선택자 (예: #doc-list .logis-result)"
+                 onkeydown="if(event.key==='Enter') queryDom()" />
+          <button onclick="queryDom()">조회</button>
+          <pre id="dbg-dom-out"></pre>
+        </div>
+
+        <div id="dbg-api" class="dbg-body" style="display:none;">
+          <pre id="dbg-api-out"></pre>
         </div>
       </div>
     </div>
+
+    <div id="toast-wrap"></div>
 
     <header id="toolbar">
       <button id="btn-load-models" onclick="loadModels()">모델 로드</button>
@@ -33,8 +104,10 @@
       </select>
       <button id="btn-run" onclick="runPipeline()">실행</button>
       <button id="btn-save" onclick="saveResults()" disabled>결과 저장</button>
+      <button id="btn-settings" onclick="openSettings()" title="환경설정">⚙️</button>
       <button id="btn-unload" onclick="unloadModels()" title="VRAM 반납">♻️</button>
-      <button id="btn-devtools" onclick="toggleDevTools()" title="개발자 도구 (F12)">🛠️</button>
+      <button id="btn-devtools" onclick="toggleDevTools()" title="개발자 도구 (F12 / Ctrl+Shift+I)">🛠️</button>
+      <span id="devtools-badge" class="meta-badge" style="display:none;"></span>
       <span id="gpu-badge" class="gpu-cpu">💻 감지 중...</span>
     </header>
 
@@ -78,7 +151,17 @@
     </div>
 
     <div id="console-area">
-      <h3>콘솔 로그</h3>
+      <h3>
+        콘솔 로그
+        <span id="console-tools">
+          <label class="settings-toggle" style="display:inline-flex;">
+            <input type="checkbox" id="js-console-hook" checked onchange="toggleConsoleHook()" />
+            <span>JS 콘솔 캡처</span>
+          </label>
+          <button onclick="clearConsole()">지우기</button>
+          <button onclick="copyConsole()">복사</button>
+        </span>
+      </h3>
       <pre id="console-output"></pre>
     </div>
 
