@@ -1,0 +1,104 @@
+{
+  "domain": "trade",
+  "doc_type": "commercial_invoice",
+  "fields": {
+    "invoice_number": {
+      "semantic": "인보이스번호, 송장번호, 문서번호",
+      "bias": [
+        "인보이스번호",
+        "송장번호",
+        "문서번호",
+        "Invoice Number",
+        "Inv. No.",
+        "CI-2026-08001"
+      ],
+      "prejudice": [
+        "품명",
+        "수량",
+        "단가",
+        "발행일"
+      ]
+    },
+    "shipper_name": {
+      "semantic": "송하인, 수출자, 판매자 이름",
+      "bias": [
+        "송하인",
+        "수출자",
+        "판매자",
+        "Shipper",
+        "Exporter",
+        "Seller"
+      ],
+      "prejudice": [
+        "수하인",
+        "인보이스번호",
+        "발행일"
+      ]
+    },
+    "consignee_name": {
+      "semantic": "수하인, 수입자, 구매자 이름",
+      "bias": [
+        "수하인",
+        "수입자",
+        "구매자",
+        "Consignee",
+        "Importer",
+        "Buyer"
+      ],
+      "prejudice": [
+        "송하인",
+        "인보이스번호",
+        "발행일"
+      ]
+    },
+    "description_of_goods": {
+      "semantic": "품명, 상품명, 물품명세",
+      "bias": [
+        "품명",
+        "상품명",
+        "물품명",
+        "Description of Goods",
+        "Commodity",
+        "전자제품",
+        "의류"
+      ],
+      "prejudice": [
+        "수량",
+        "단가",
+        "인보이스번호"
+      ]
+    },
+    "total_amount": {
+      "semantic": "총액, 합계금액, 송장금액",
+      "bias": [
+        "총액",
+        "합계",
+        "송장금액",
+        "Total Amount",
+        "Grand Total",
+        "1,500,000"
+      ],
+      "prejudice": [
+        "품명",
+        "수량",
+        "단가",
+        "발행일"
+      ]
+    },
+    "issue_date": {
+      "semantic": "발행일, 작성일",
+      "bias": [
+        "발행일",
+        "작성일",
+        "Date",
+        "Issue Date",
+        "2026-03-15"
+      ],
+      "prejudice": [
+        "품명",
+        "수량",
+        "총액"
+      ]
+    }
+  }
+}

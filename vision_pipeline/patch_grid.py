@@ -1,0 +1,213 @@
+from typing import Dict, List, Optional, Sequence, Tuple
+
+import numpy as np
+from PIL import Image
+
+
+class VisionPatchGrid:
+    def __init__(
+        self,
+        embeddings: np.ndarray,
+        rows: int,
+        cols: int,
+        orig_width: int,
+        orig_height: int,
+        scale_x: float = 1.0,
+        scale_y: float = 1.0,
+        patch_size: int = 16,
+        source: str = "",
+    ):
+        self.embeddings = np.asarray(embeddings, dtype=np.float32)
+        self.rows = int(rows)
+        self.cols = int(cols)
+        self.orig_width = int(orig_width)
+        self.orig_height = int(orig_height)
+        self.scale_x = float(scale_x)
+        self.scale_y = float(scale_y)
+        self.patch_size = int(patch_size)
+        self.source = source
+        self.num_patches = self.rows * self.cols
+
+    @property
+    def dim(self) -> int:
+        if self.embeddings.size == 0:
+            return 0
+        return int(self.embeddings.shape[-1])
+
+    def index_of(self, row: int, col: int) -> int:
+        return int(row) * self.cols + int(col)
+
+    def row_col(self, index: int) -> Tuple[int, int]:
+        cols = max(1, self.cols)
+        return int(index) // cols, int(index) % cols
+
+    def vector(self, index: int) -> np.ndarray:
+        return self.embeddings[int(index)]
+
+    def cell_width(self) -> float:
+        return self.orig_width / float(max(1, self.cols))
+
+    def cell_height(self) -> float:
+        return self.orig_height / float(max(1, self.rows))
+
+    def patch_bbox(self, row: int, col: int) -> Tuple[int, int, int, int]:
+        cw = self.cell_width()
+        ch = self.cell_height()
+        x0 = int(col * cw)
+        y0 = int(row * ch)
+        x1 = int((col + 1) * cw)
+        y1 = int((row + 1) * ch)
+        x0 = max(0, min(x0, self.orig_width - 1))
+        y0 = max(0, min(y0, self.orig_height - 1))
+        x1 = min(max(x1, x0 + 1), self.orig_width)
+        y1 = min(max(y1, y0 + 1), self.orig_height)
+        return (x0, y0, x1, y1)
+
+    def index_bbox(self, index: int) -> Tuple[int, int, int, int]:
+        r, c = self.row_col(index)
+        return self.patch_bbox(r, c)
+
+    def region_bbox(self, r0: int, r1: int, c0: int, c1: int) -> Tuple[int, int, int, int]:
+        r0 = max(0, min(int(r0), self.rows - 1))
+        r1 = max(0, min(int(r1), self.rows - 1))
+        c0 = max(0, min(int(c0), self.cols - 1))
+        c1 = max(0, min(int(c1), self.cols - 1))
+        if r1 < r0:
+            r0, r1 = r1, r0
+        if c1 < c0:
+            c0, c1 = c1, c0
+        tx0, ty0, _, _ = self.patch_bbox(r0, c0)
+        _, _, bx1, by1 = self.patch_bbox(r1, c1)
+        return (tx0, ty0, max(bx1, tx0 + 1), max(by1, ty0 + 1))
+
+    def patch_center(self, index: int) -> Tuple[float, float]:
+        r, c = self.row_col(index)
+        cw = self.cell_width()
+        ch = self.cell_height()
+        return ((c + 0.5) * cw, (r + 0.5) * ch)
+
+    def indices_in_bbox(self, bbox: Tuple[int, int, int, int]) -> List[int]:
+        x0, y0, x1, y1 = bbox
+        out: List[int] = []
+        for i in range(self.num_patches):
+            cx, cy = self.patch_center(i)
+            if x0 <= cx <= x1 and y0 <= cy <= y1:
+                out.append(i)
+        return out
+
+    def to_dict(self) -> dict:
+        return {
+            "rows": self.rows,
+            "cols": self.cols,
+            "num_patches": self.num_patches,
+            "dim": self.dim,
+            "patch_size": self.patch_size,
+            "orig_width": self.orig_width,
+            "orig_height": self.orig_height,
+            "scale_x": round(self.scale_x, 6),
+            "scale_y": round(self.scale_y, 6),
+            "source": self.source,
+        }
+
+    def __repr__(self) -> str:
+        return (
+            f"<VisionPatchGrid {self.rows}x{self.cols}={self.num_patches} "
+            f"dim={self.dim} src={self.source}>"
+        )
+
+
+def _l2_rows(mat: np.ndarray, eps: float = 1e-8) -> np.ndarray:
+    norms = np.linalg.norm(mat, axis=-1, keepdims=True)
+    return mat / np.maximum(norms, eps)
+
+
+def _resample_to_grid(feats: np.ndarray, target: int) -> np.ndarray:
+    n = feats.shape[0]
+    if n == target:
+        return feats
+    if n == 0:
+        return np.zeros((target, 1), dtype=np.float32)
+    idx = np.linspace(0, n - 1, target)
+    lo = np.floor(idx).astype(int)
+    hi = np.minimum(lo + 1, n - 1)
+    w = (idx - lo).reshape(-1, 1).astype(np.float32)
+    return feats[lo] * (1.0 - w) + feats[hi] * w
+
+
+def build_patch_grid(
+    image: Image.Image,
+    embedder=None,
+    ocr=None,
+    prefer: str = "ocr",
+    align_to: Optional[VisionPatchGrid] = None,
+) -> VisionPatchGrid:
+    orig_w, orig_h = image.size
+
+    if prefer == "ocr" and ocr is not None:
+        out = ocr.embed_image_patches(image)
+        feats = np.asarray(out["valid_features"], dtype=np.float32)
+        rows = int(out["rows"])
+        cols = int(out["cols"])
+        expected = max(1, rows * cols)
+        if feats.shape[0] != expected:
+            feats = _resample_to_grid(feats, expected)
+        feats = _l2_rows(feats)
+        return VisionPatchGrid(
+            embeddings=feats,
+            rows=rows,
+            cols=cols,
+            orig_width=orig_w,
+            orig_height=orig_h,
+            patch_size=getattr(ocr, "patch_size", 16),
+            source="hayai",
+        )
+
+    if embedder is not None:
+        pg = embedder.embed_image(image)
+        feats = np.asarray(pg.embeddings, dtype=np.float32)
+        grid = VisionPatchGrid(
+            embeddings=feats,
+            rows=pg.grid_rows,
+            cols=pg.grid_cols,
+            orig_width=pg.orig_width,
+            orig_height=pg.orig_height,
+            scale_x=pg.scale_x,
+            scale_y=pg.scale_y,
+            patch_size=pg.patch_size,
+            source="ax-ve",
+        )
+        if align_to is not None and grid.num_patches != align_to.num_patches:
+            grid.embeddings = _l2_rows(
+                _resample_to_grid(grid.embeddings, align_to.num_patches)
+            )
+            grid.rows = align_to.rows
+            grid.cols = align_to.cols
+            grid.num_patches = align_to.num_patches
+        return grid
+
+    raise RuntimeError("패치 격자를 만들 수 있는 모델이 없습니다. (embedder / ocr 둘 다 None)")
+
+
+def row_band_profile(image: Image.Image) -> np.ndarray:
+    gray = np.asarray(image.convert("L"), dtype=np.float32)
+    ink = 255.0 - gray
+    return ink.mean(axis=1)
+
+
+def ink_ratio_per_row(image: Image.Image, rows: int) -> np.ndarray:
+    gray = np.asarray(image.convert("L"), dtype=np.float32)
+    h = gray.shape[0]
+    if h == 0 or rows <= 0:
+        return np.zeros((max(1, rows),), dtype=np.float32)
+    ink = 255.0 - gray
+    thr = float(ink.mean() + ink.std() * 0.25)
+    out = np.zeros((rows,), dtype=np.float32)
+    step = h / float(rows)
+    for r in range(rows):
+        y0 = int(r * step)
+        y1 = max(y0 + 1, int((r + 1) * step))
+        seg = ink[y0:min(y1, h), :]
+        if seg.size == 0:
+            continue
+        out[r] = float((seg > thr).mean())
+    return out

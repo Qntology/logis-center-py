@@ -1,0 +1,43 @@
+# ── Python 가상환경 ────────────────────────────────────────
+venv/
+env/
+.venv/
+
+# ── Python 캐시 / 컴파일 ──────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+
+# ── 로그 / 임시 파일 ──────────────────────────────────────
+*.log
+*.tmp
+*.bak
+
+# ── 모델 / 인덱스 (AppData에 저장되지만 실수 방지) ────────
+*.safetensors
+*.npz
+zvec_index.*
+config.json
+model.safetensors
+
+# ── IDE / 에디터 ──────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ── OS 파일 ────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── 환경변수 ──────────────────────────────────────────────
+.env
+.env.local

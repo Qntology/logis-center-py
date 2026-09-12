@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Vision NMS Crop Tool</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div id="app">
+    <div id="model-status-overlay" style="display:none;">
+      <div id="model-status-card">
+        <h2>모델 상태</h2>
+        <p id="ms-status-text">모델 상태를 확인 중입니다...</p>
+        <div id="ms-model-list"></div>
+        <div id="ms-lang-list"></div>
+        <div id="ms-progress-wrap" style="display:none;">
+          <div id="ms-progress-bar"><div id="ms-progress-fill"></div></div>
+          <span id="ms-progress-label"></span>
+        </div>
+        <div id="ms-buttons">
+          <button id="btn-ms-retry" onclick="refreshModelStatus()">다시 확인</button>
+          <button id="btn-ms-close" onclick="closeModelStatus()">닫기</button>
+        </div>
+      </div>
+    </div>
+
+    <header id="toolbar">
+      <button id="btn-load-models" onclick="loadModels()">모델 로드</button>
+      <button id="btn-open-image" onclick="openImage()">문서 열기</button>
+      <select id="schema-select" onchange="onSchemaChange()">
+        <option value="">스키마 자동 분류</option>
+      </select>
+      <button id="btn-run" onclick="runPipeline()">실행</button>
+      <button id="btn-save" onclick="saveResults()" disabled>결과 저장</button>
+      <button id="btn-unload" onclick="unloadModels()" title="VRAM 반납">♻️</button>
+      <button id="btn-devtools" onclick="toggleDevTools()" title="개발자 도구 (F12)">🛠️</button>
+      <span id="gpu-badge" class="gpu-cpu">💻 감지 중...</span>
+    </header>
+
+    <div id="params-bar">
+      <label>
+        IoU:
+        <input type="number" id="iou-threshold" value="0.80"
+               min="0.1" max="1.0" step="0.05" />
+      </label>
+      <label>
+        Margin:
+        <input type="number" id="margin-threshold" value="0.28"
+               min="0.0" max="1.0" step="0.02" />
+      </label>
+      <span id="lang-badge" class="meta-badge">🌐 언어 미판별</span>
+      <span id="phase-badge" class="meta-badge">🔀 idle</span>
+      <span id="vram-badge" class="meta-badge">📊 VRAM -</span>
+      <span id="status-text">대기 중</span>
+    </div>
+
+    <div id="main-area">
+      <div id="left-panel">
+        <h3>원본 이미지 (패치 오버레이)</h3>
+        <canvas id="canvas-overlay"></canvas>
+      </div>
+      <div id="right-panel">
+        <h3>언어 / 문서 유형</h3>
+        <div id="meta-panel"></div>
+
+        <h3>필드별 매칭 결과</h3>
+        <div id="field-results"></div>
+
+        <h3>NMS 억제 로그</h3>
+        <div id="nms-log"></div>
+      </div>
+    </div>
+
+    <div id="bottom-area">
+      <h3>Crop 결과 미리보기</h3>
+      <div id="crop-previews"></div>
+    </div>
+
+    <div id="console-area">
+      <h3>콘솔 로그</h3>
+      <pre id="console-output"></pre>
+    </div>
+
+    <div id="progress-bar-container">
+      <div id="progress-bar-fill"></div>
+      <span id="progress-label"></span>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
