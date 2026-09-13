@@ -1,0 +1,12 @@
+transformers>=4.52.0
+torch>=2.1.0
+numpy>=1.24.0,<2.3.0
+pillow>=10.0.0
+safetensors>=0.4.0
+requests>=2.31.0
+pywebview>=5.0
+PyMuPDF>=1.24.0
+accelerate>=0.30.0
+sentencepiece>=0.1.99
+protobuf>=4.25.0
+stanza>=1.8.0
