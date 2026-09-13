@@ -149,7 +149,34 @@ if !errorlevel! neq 0 (
 
 echo.
 echo ============================================================
-echo   [STEP 5/6] Low-VRAM support (optional)
+echo   [STEP 5/6] Memory check
+echo ============================================================
+
+for /f "tokens=*" %%m in ('python -c "import ctypes;class M(ctypes.Structure):_fields_=[('a',ctypes.c_ulong),('b',ctypes.c_ulong),('c',ctypes.c_ulonglong),('d',ctypes.c_ulonglong),('e',ctypes.c_ulonglong),('f',ctypes.c_ulonglong),('g',ctypes.c_ulonglong),('h',ctypes.c_ulonglong),('i',ctypes.c_ulonglong)]" 2^>nul') do set _DUMMY=%%m
+
+python -c "from core.memory import ram_info,usable_ram_gb;i=ram_info();print(f'  Total RAM     : {i[\"total_gb\"]:.1f} GB');print(f'  Available     : {i[\"available_gb\"]:.1f} GB');print(f'  Commit free   : {i[\"commit_available_gb\"]:.1f} GB');print(f'  Usable        : {usable_ram_gb():.1f} GB')" 2>nul
+if !errorlevel! neq 0 echo   [WARN] memory probe failed
+
+for /f "tokens=*" %%r in ('python -c "from core.memory import usable_ram_gb;print(int(usable_ram_gb()))" 2^>nul') do set RAM_GB=%%r
+if "%RAM_GB%"=="" set RAM_GB=0
+
+if %RAM_GB% GTR 0 if %RAM_GB% LSS 11 (
+    echo.
+    echo   [WARN] Usable RAM is %RAM_GB% GB.
+    echo          Qwen3.5-4B weights are staged in system RAM before
+    echo          they reach the GPU, even with 4-bit quantization.
+    echo          The app will refuse to load the refiner instead of
+    echo          being killed by the OS.
+    echo.
+    echo          Options:
+    echo            - Close other applications
+    echo            - Increase the Windows page file size
+    echo            - Force it with: setup_and_run.bat --allow-low-ram
+)
+
+echo.
+echo ============================================================
+echo   [STEP 6/6] Low-VRAM support (optional)
 echo ============================================================
 
 for /f "tokens=*" %%v in ('python -c "import torch;print(int(torch.cuda.get_device_properties(0).total_memory/1024**3)) if torch.cuda.is_available() else print(0)" 2^>nul') do set VRAM_GB=%%v
@@ -171,12 +198,15 @@ if %VRAM_GB% GTR 0 if %VRAM_GB% LSS 6 (
 
 echo.
 echo ============================================================
-echo   [STEP 6/6] Verify
+echo   Verify
 echo ============================================================
 python -c "import torch; print(f'  PyTorch: {torch.__version__} | CUDA: {torch.cuda.is_available()}')"
 python -c "import transformers; print(f'  transformers: {transformers.__version__}')"
 python -c "import numpy; print(f'  numpy: {numpy.__version__}')"
 python -c "import PIL; print(f'  pillow: {PIL.__version__}')"
+
+python -c "import psutil; print(f'  psutil: {psutil.__version__}')" 2>nul
+if !errorlevel! neq 0 echo   psutil: NOT INSTALLED (Windows API fallback)
 
 python -c "import paddle; print(f'  paddlepaddle: {paddle.__version__}')" 2>nul
 if !errorlevel! neq 0 echo   paddlepaddle: NOT INSTALLED (OCR draft disabled)
@@ -229,6 +259,10 @@ echo     oneDNN          : OFF (FLAGS_use_mkldnn=%FLAGS_use_mkldnn%)
 echo                       PP-OCRv5 det has a double-array attribute
 echo                       the oneDNN PIR executor cannot convert.
 echo                       Force on with: --paddle-mkldnn
+echo   Memory
+echo     Usable RAM      : %RAM_GB% GB
+echo     Cap RAM         : --ram-limit 8
+echo     Force load      : --allow-low-ram  (risk of process kill)
 echo ============================================================
 echo.
 

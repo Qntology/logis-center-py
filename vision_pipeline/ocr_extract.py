@@ -174,6 +174,7 @@ def read_by_lines(
     span: int = 1,
     stride: int = 1,
     overlap: int = 1,
+    ocr=None,
     log: Optional[List[str]] = None,
 ) -> Tuple[str, List[str], int]:
     if refiner is None or not getattr(refiner, "vision", False):
@@ -218,15 +219,23 @@ def read_by_lines(
         except Exception:
             return ""
 
+    ocr_fn = None
+    if ocr is not None and getattr(ocr, "available", False):
+        if hasattr(ocr, "recognize_lines"):
+            def ocr_fn(crops):
+                return ocr.recognize_lines(crops)
+
     merged, lines, windows = read_lines(
         cropped, _reader, boxes=local,
-        span=span, stride=stride, overlap=overlap, log=log,
+        span=span, stride=stride, overlap=overlap,
+        ocr_fn=ocr_fn, log=log,
     )
 
     if log is not None:
+        src = "VLM + 전용 인식기" if ocr_fn is not None else "VLM 단독"
         log.append(
-            f"    🔁 [LINE READ] '{category}' VLM 호출 {calls['n']}회 — "
-            f"한 번에 긴 문장을 읽지 않고 행 단위로 끊었습니다."
+            f"    🔁 [LINE READ] '{category}' VLM 호출 {calls['n']}회 "
+            f"({src}) — 한 번에 긴 문장을 읽지 않고 행 단위로 끊었습니다."
         )
 
     return merged, [l.text for l in lines if l.text], len(windows)
@@ -322,7 +331,7 @@ def extract_from_crops(
         if line_read_fn is not None:
             try:
                 merged, line_texts, windows_n = line_read_fn(
-                    image, plan.bbox, plan.category, tboxes, log
+                    image, plan.bbox, plan.category, tboxes, ocr, log
                 )
             except Exception as e:
                 if log is not None:

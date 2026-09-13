@@ -31,6 +31,19 @@ VOTE_MIN_LEN = 2
 
 WS_RE = re.compile(r"[\s\u00a0]+")
 
+OCR_WEIGHT_BASE = 2.6
+OCR_WEIGHT_FLOOR = 0.30
+VLM_WEIGHT_ALIGNED = 1.0
+VLM_WEIGHT_UNALIGNED = 0.35
+
+CONSENSUS_MARGIN = 0.80
+CONSENSUS_MIN_CANDS = 2
+LEN_TOLERANCE = 2
+
+GROUND_MIN_CONF = 0.50
+GROUND_MIN_OVERLAP = 0.25
+GROUND_PENALTY = 0.25
+
 
 class TextLine:
     def __init__(
@@ -362,9 +375,70 @@ def build_windows(
     return out
 
 
+class LineVote:
+    def __init__(self, text: str, weight: float, source: str):
+        self.text = str(text or "").strip()
+        self.weight = float(weight)
+        self.source = str(source)
+
+    def __repr__(self) -> str:
+        return f"<Vote {self.source} w={self.weight:.2f} '{self.text[:20]}'>"
+
+
 def normalize_for_match(text: str) -> str:
     s = unicodedata.normalize("NFKC", str(text or ""))
     return WS_RE.sub("", s)
+
+
+def char_overlap(a: str, b: str) -> float:
+    ca = set(normalize_for_match(a))
+    cb = set(normalize_for_match(b))
+    if not ca or not cb:
+        return 0.0
+    return len(ca & cb) / float(min(len(ca), len(cb)))
+
+
+def char_consensus(votes: Sequence[LineVote]) -> str:
+    items = [v for v in votes if v.text.strip()]
+    if len(items) < CONSENSUS_MIN_CANDS:
+        return items[0].text if items else ""
+
+    len_w: Dict[int, float] = {}
+    for v in items:
+        n = len(normalize_for_match(v.text))
+        len_w[n] = len_w.get(n, 0.0) + v.weight
+    if not len_w:
+        return items[0].text
+
+    target = max(len_w.items(), key=lambda kv: (kv[1], kv[0]))[0]
+    pool = [
+        v for v in items
+        if abs(len(normalize_for_match(v.text)) - target) <= LEN_TOLERANCE
+    ]
+    if not pool:
+        return max(items, key=lambda v: v.weight).text
+
+    exact = [v for v in pool if len(normalize_for_match(v.text)) == target]
+    if len(exact) < CONSENSUS_MIN_CANDS:
+        return max(pool, key=lambda v: v.weight).text
+
+    grid = [normalize_for_match(v.text) for v in exact]
+    weights = [v.weight for v in exact]
+
+    out: List[str] = []
+    for pos in range(target):
+        tally: Dict[str, float] = {}
+        for g, w in zip(grid, weights):
+            ch = g[pos]
+            tally[ch] = tally.get(ch, 0.0) + w
+        out.append(max(tally.items(), key=lambda kv: kv[1])[0])
+
+    body = "".join(out)
+
+    for v in exact:
+        if normalize_for_match(v.text) == body:
+            return v.text
+    return body
 
 
 def _lcs_suffix_prefix(a: str, b: str, min_len: int = MERGE_MIN_OVERLAP) -> int:
@@ -425,60 +499,188 @@ def stitch_windows(
     return joined, notes
 
 
+def _align_window(
+    w: ReadWindow,
+    ocr_hint: Dict[int, Tuple[str, float]],
+) -> List[Tuple[int, str, float]]:
+    rows = [r.strip() for r in str(w.text or "").splitlines() if r.strip()]
+    if not rows:
+        return []
+
+    if len(rows) == w.span:
+        return [
+            (w.start + off, row, VLM_WEIGHT_ALIGNED)
+            for off, row in enumerate(rows)
+        ]
+
+    if w.span == 1:
+        return [(w.start, " ".join(rows), VLM_WEIGHT_ALIGNED)]
+
+    if len(rows) < w.span and ocr_hint:
+        slots = list(range(w.start, w.end))
+        used: set = set()
+        out: List[Tuple[int, str, float]] = []
+        for row in rows:
+            best = -1
+            best_ov = 0.0
+            for s in slots:
+                if s in used:
+                    continue
+                ref = ocr_hint.get(s)
+                if ref is None:
+                    continue
+                ov = char_overlap(row, ref[0])
+                if ov > best_ov:
+                    best_ov = ov
+                    best = s
+            if best >= 0 and best_ov >= GROUND_MIN_OVERLAP:
+                used.add(best)
+                out.append((best, row, VLM_WEIGHT_ALIGNED))
+        if out:
+            return out
+
+    return [
+        (w.start + off, row, VLM_WEIGHT_UNALIGNED)
+        for off, row in enumerate(rows)
+        if w.start + off < w.end
+    ]
+
+
 def vote_lines(
     lines: Sequence[TextLine],
     windows: Sequence[ReadWindow],
+    ocr_votes: Optional[Dict[int, Tuple[str, float]]] = None,
     log: Optional[List[str]] = None,
 ) -> Dict[int, str]:
-    bucket: Dict[int, List[str]] = {}
+    hint = dict(ocr_votes or {})
+    bucket: Dict[int, List[LineVote]] = {}
 
-    for w in windows:
-        rows = [r for r in str(w.text or "").splitlines() if r.strip()]
-        if not rows:
+    for idx, (text, conf) in hint.items():
+        if len(normalize_for_match(text)) < VOTE_MIN_LEN:
             continue
-        if len(rows) == w.span:
-            for off, row in enumerate(rows):
-                bucket.setdefault(w.start + off, []).append(row.strip())
-        else:
-            bucket.setdefault(w.start, []).append(" ".join(r.strip() for r in rows))
+        weight = max(OCR_WEIGHT_FLOOR, OCR_WEIGHT_BASE * float(conf))
+        bucket.setdefault(idx, []).append(LineVote(text, weight, "ocr"))
+
+    unaligned = 0
+    for w in windows:
+        for idx, row, base_w in _align_window(w, hint):
+            if len(normalize_for_match(row)) < VOTE_MIN_LEN:
+                continue
+            weight = float(base_w)
+            if base_w < VLM_WEIGHT_ALIGNED:
+                unaligned += 1
+
+            ref = hint.get(idx)
+            if ref is not None and float(ref[1]) >= GROUND_MIN_CONF:
+                if char_overlap(row, ref[0]) < GROUND_MIN_OVERLAP:
+                    weight *= GROUND_PENALTY
+
+            bucket.setdefault(idx, []).append(LineVote(row, weight, "vlm"))
+
+    if log is not None and unaligned:
+        log.append(
+            f"       ⚖ 창 출력 행수가 창 크기와 달라 {unaligned}건은 "
+            f"가중치를 {VLM_WEIGHT_UNALIGNED:.2f} 로 낮춰 반영했습니다."
+        )
 
     out: Dict[int, str] = {}
     disputes = 0
+    consensus_used = 0
 
-    for idx, cands in bucket.items():
-        clean = [c for c in cands if len(normalize_for_match(c)) >= VOTE_MIN_LEN]
-        if not clean:
+    for idx in sorted(bucket.keys()):
+        votes = bucket[idx]
+        if not votes:
             continue
-        if len(clean) == 1:
-            out[idx] = clean[0]
+        if len(votes) == 1:
+            out[idx] = votes[0].text
             continue
 
-        tally: Dict[str, int] = {}
-        rep: Dict[str, str] = {}
-        for c in clean:
-            key = normalize_for_match(c)
-            tally[key] = tally.get(key, 0) + 1
-            rep.setdefault(key, c)
+        tally: Dict[str, float] = {}
+        rep: Dict[str, LineVote] = {}
+        for v in votes:
+            key = normalize_for_match(v.text)
+            tally[key] = tally.get(key, 0.0) + v.weight
+            if key not in rep or v.weight > rep[key].weight:
+                rep[key] = v
 
-        best_key = max(tally.items(), key=lambda kv: (kv[1], len(kv[0])))[0]
-        out[idx] = rep[best_key]
+        ranked = sorted(tally.items(), key=lambda kv: kv[1], reverse=True)
+        top_key, top_w = ranked[0]
+        second_w = ranked[1][1] if len(ranked) > 1 else 0.0
 
-        if len(tally) > 1:
+        if len(ranked) > 1 and (top_w - second_w) < CONSENSUS_MARGIN:
+            picked = char_consensus(votes)
+            consensus_used += 1
+            mode = "글자별 합의"
+        else:
+            picked = rep[top_key].text
+            mode = "가중 다수결"
+
+        out[idx] = picked
+
+        if len(ranked) > 1:
             disputes += 1
             if log is not None:
                 variants = " | ".join(
-                    f"{rep[k][:20]}({v}표)"
-                    for k, v in sorted(tally.items(), key=lambda kv: -kv[1])[:3]
+                    f"{rep[k].text[:18]}[{rep[k].source}]({v:.2f})"
+                    for k, v in ranked[:3]
                 )
                 log.append(
-                    f"       🗳 행 {idx}: {variants} → '{out[idx][:24]}' 채택"
+                    f"       🗳 행 {idx}: {variants} → '{picked[:24]}' "
+                    f"({mode})"
                 )
 
     if log is not None and disputes:
         log.append(
-            f"    🗳 [CROSS VOTE] 겹친 행 {disputes}곳에서 판독이 갈려 "
-            f"다수결로 확정했습니다."
+            f"    🗳 [CROSS VOTE] 겹친 행 {disputes}곳에서 판독이 갈렸습니다. "
+            f"OCR 확신도 가중 {disputes - consensus_used}건 / "
+            f"글자별 합의 {consensus_used}건으로 확정했습니다."
         )
+    return out
+
+
+def collect_ocr_votes(
+    lines: Sequence[TextLine],
+    ocr_fn: Optional[Callable[[List[Image.Image]], List[Tuple[str, float]]]],
+    target_px: float = TARGET_LINE_PX,
+    log: Optional[List[str]] = None,
+) -> Dict[int, Tuple[str, float]]:
+    if ocr_fn is None or not lines:
+        return {}
+
+    crops: List[Image.Image] = []
+    for ln in lines:
+        img, _f = upscale_line(ln, target_px=target_px)
+        crops.append(img)
+
+    try:
+        pairs = ocr_fn(crops)
+    except Exception as e:
+        if log is not None:
+            log.append(f"       ⚠ 행 OCR 실패 ({e})")
+        return {}
+
+    out: Dict[int, Tuple[str, float]] = {}
+    for i, ln in enumerate(lines):
+        if i >= len(pairs):
+            break
+        text, score = pairs[i]
+        text = str(text or "").strip()
+        if len(normalize_for_match(text)) < VOTE_MIN_LEN:
+            continue
+        out[ln.index] = (text, float(score))
+        ln.score = float(score)
+
+    if log is not None and out:
+        avg = sum(s for _t, s in out.values()) / float(len(out))
+        log.append(
+            f"    🔤 [LINE OCR] 행 {len(out)}/{len(lines)}개를 전용 인식기로 "
+            f"읽었습니다 (평균 확신도 {avg:.4f}) — VLM 판독과 함께 "
+            f"가중 투표에 넣습니다."
+        )
+        for idx in sorted(out.keys())[:6]:
+            t, s = out[idx]
+            log.append(f"       {idx:>2}. [{s:.3f}] {t[:46]}")
+
     return out
 
 
@@ -490,11 +692,16 @@ def read_lines(
     stride: int = WINDOW_STRIDE,
     overlap: int = WINDOW_OVERLAP,
     target_px: float = TARGET_LINE_PX,
+    ocr_fn: Optional[Callable[[List[Image.Image]], List[Tuple[str, float]]]] = None,
     log: Optional[List[str]] = None,
 ) -> Tuple[str, List[TextLine], List[ReadWindow]]:
     lines = split_lines(image, boxes=boxes, log=log)
     if not lines:
         return "", [], []
+
+    ocr_votes = collect_ocr_votes(
+        lines, ocr_fn, target_px=target_px, log=log
+    )
 
     windows = build_windows(
         lines, span=span, stride=stride, overlap=overlap, log=log
@@ -522,13 +729,27 @@ def read_lines(
             w.raw = ""
         w.text = w.raw.strip()
 
-    voted = vote_lines(lines, windows, log=log)
+    voted = vote_lines(lines, windows, ocr_votes=ocr_votes, log=log)
+
+    rescued = 0
     for ln in lines:
         if ln.index in voted:
             ln.text = voted[ln.index]
+            continue
+        ref = ocr_votes.get(ln.index)
+        if ref is not None:
+            ln.text = ref[0]
+            ln.source = "ocr-only"
+            rescued += 1
 
-    if voted:
-        ordered = [voted[i] for i in sorted(voted.keys()) if voted[i].strip()]
+    if log is not None and rescued:
+        log.append(
+            f"       🛟 VLM 이 읽지 못한 행 {rescued}개를 전용 인식기 "
+            f"결과로 채웠습니다."
+        )
+
+    ordered = [ln.text for ln in lines if ln.text.strip()]
+    if ordered:
         merged = "\n".join(ordered)
     else:
         merged, _notes = stitch_windows(windows, log=log)

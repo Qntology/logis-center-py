@@ -55,6 +55,7 @@ from core.llm import (
     resolve_joint_path,
     resolve_refiner_path,
 )
+from core import memory as memory_mod
 from core import paddle_bootstrap
 from core.phrase_cache import CachedEmbedder
 from core.model_manager import (
@@ -289,6 +290,21 @@ class NMSOcrApp:
         }
 
     def _log_vram_profile(self):
+        for line in memory_mod.report_lines():
+            self._log(line)
+
+        room = memory_mod.usable_ram_gb()
+        if 0.0 < room < 6.0:
+            self._log(
+                f"  ⚠️ 가용 시스템 RAM 이 {room:.1f} GB 뿐입니다. "
+                f"4B 정제 LLM 은 가중치를 RAM 에 먼저 펼치므로 "
+                f"로드가 중단될 수 있습니다."
+            )
+            self._log(
+                "     다른 프로그램을 닫거나, Windows 가상 메모리를 "
+                "늘리거나, 더 작은 모델을 쓰세요."
+            )
+
         if self.vram_budget <= 0.0:
             self._log("  💻 CPU 모드 — VRAM 프로파일을 적용하지 않습니다.")
             return
@@ -299,8 +315,12 @@ class NMSOcrApp:
                 "  ⚠️ 저VRAM 모드: 정제 LLM 은 지연 로드 + 양자화/오프로드로 실행합니다."
             )
             self._log(
-                "     Qwen3.5-2B(fp16 ≈ 4.0GB)가 예산을 초과하면 "
-                "OCR 원문으로 자동 폴백합니다."
+                "     Qwen3.5-4B(fp16 ≈ 8.6GB / 4bit ≈ 3.1GB)가 예산을 "
+                "초과하면 OCR 원문으로 자동 폴백합니다."
+            )
+            self._log(
+                "     4B 는 2B 보다 유사 글자 변별이 좋지만 4GB 카드에서는 "
+                "4bit 양자화가 필수입니다: pip install bitsandbytes"
             )
 
     def check_models(self) -> dict:
@@ -1361,6 +1381,9 @@ class NMSOcrApp:
             "low_confidence": bool(verdict.needs_llm),
         }
 
+    REFINER_EST_GB_4BIT = 3.1
+    REFINER_EST_GB_FP16 = 8.6
+
     def _ensure_refiner_slot(self) -> bool:
         if SLOT_REFINER in self.crossover.slots:
             return True
@@ -1375,6 +1398,7 @@ class NMSOcrApp:
         budget = self.vram_budget
 
         def _load_refiner():
+            memory_mod.reclaim(log=self._log, label="정제 LLM 적재 전")
             return RefinerLLM(
                 ref_path,
                 label=ref_label,
@@ -1383,11 +1407,26 @@ class NMSOcrApp:
                 budget_gb=budget,
             )
 
+        est = self.REFINER_EST_GB_4BIT if low else self.REFINER_EST_GB_FP16
+        disk = memory_mod.model_disk_gb(ref_path)
+
         self.crossover.register(
-            SLOT_REFINER, _load_refiner, label=ref_label, est_gb=4.2
+            SLOT_REFINER, _load_refiner, label=ref_label, est_gb=est
         )
         mode = "저VRAM(양자화/오프로드)" if low else "표준"
-        self._log(f"  ⏳ [{ref_label}] 정제 LLM 지연 로드 예약 — {mode}")
+        self._log(
+            f"  ⏳ [{ref_label}] 정제 LLM 지연 로드 예약 — {mode} "
+            f"| 예상 VRAM {est:.1f} GB | 가중치 {disk:.1f} GB"
+        )
+
+        stage = disk * 1.2 + memory_mod.RAM_SAFETY_GB
+        room = memory_mod.usable_ram_gb()
+        if room > 0.0 and room < stage:
+            self._log(
+                f"  ⚠️ [RAM] 현재 가용 {room:.1f} GB < 적재에 필요한 "
+                f"{stage:.1f} GB — 정제 LLM 로드 시점에 다른 모델을 "
+                f"먼저 반납합니다."
+            )
         return True
 
     def _refine_fn(self, hint: str = "", schema: Optional[dict] = None):
@@ -1551,7 +1590,7 @@ class NMSOcrApp:
         stride = int(os.environ.get("NMS_LINE_STRIDE", "1") or 1)
         overlap = int(os.environ.get("NMS_LINE_OVERLAP", "1") or 1)
 
-        def _fn(image, bbox, category, text_boxes, log):
+        def _fn(image, bbox, category, text_boxes, ocr, log):
             obj = self.crossover.get(SLOT_REFINER)
             if obj is None:
                 obj = self.crossover.acquire(SLOT_REFINER)
@@ -1559,12 +1598,17 @@ class NMSOcrApp:
                 return "", [], 0
             self.refiner = obj
 
+            rec = ocr if ocr is not None else self.ocr
+            if rec is None:
+                rec = self.crossover.get(SLOT_OCR)
+
             return read_by_lines(
                 image, bbox, obj, category,
                 lang_code=lang,
                 script=self._doc_script,
                 text_boxes=text_boxes,
                 span=span, stride=stride, overlap=overlap,
+                ocr=rec,
                 log=log,
             )
 
@@ -1705,6 +1749,22 @@ class NMSOcrApp:
             elif not self._ensure_refiner_slot():
                 self._log("  ⏭ 정제 LLM 슬롯을 등록하지 못해 OCR 원문으로 진행합니다.")
                 use_refiner = False
+            else:
+                try:
+                    self.crossover.acquire(SLOT_REFINER, protect=[SLOT_OCR])
+                except MissingModelError as e:
+                    self._log(f"  ⏭ 정제 LLM 적재 불가 — OCR 원문으로 진행합니다.")
+                    for ln in str(e).splitlines():
+                        self._log(f"     {ln}")
+                    self.crossover.slots.pop(SLOT_REFINER, None)
+                    use_refiner = False
+                except Exception as e:
+                    self._log(
+                        f"  ⏭ 정제 LLM 적재 실패({type(e).__name__}: {e}) "
+                        f"→ OCR 원문으로 진행합니다."
+                    )
+                    self.crossover.slots.pop(SLOT_REFINER, None)
+                    use_refiner = False
 
         self.crossover.enter_embedding_phase()
         if self.joint is None and self.embedder is None:
@@ -1728,7 +1788,7 @@ class NMSOcrApp:
                     SLOT_JOINT, protect=[SLOT_OCR]
                 )
             except Exception as e:
-                self._log(f"  ⚠ 조인트 선획득 실패({e}) → Hayai 격자로 진행")
+                self._log(f"  ⚠ 조인트 선획득 실패({e}) → A.X-VE 격자로 진행")
                 joint_obj = None
 
         prefer = self.prefer_grid
@@ -1739,6 +1799,21 @@ class NMSOcrApp:
             self._demote_joint()
             self._register_embed_provider()
             prefer = self.prefer_grid
+
+        for line in memory_mod.report_lines():
+            self._log(line)
+
+        if self.ocr is not None and getattr(self.ocr, "available", False):
+            self._log(
+                f"  🔤 행 판독에 전용 인식기를 함께 씁니다 — "
+                f"{getattr(self.ocr, 'label', 'PP-OCRv5 rec')} "
+                f"(백엔드 {getattr(self.ocr, 'backend', '-')})"
+            )
+        else:
+            self._log(
+                "  ⚠ 전용 인식기를 쓸 수 없어 행 판독이 VLM 단독으로 "
+                "진행됩니다. 겹침 투표만으로는 유사 글자 구분이 약해집니다."
+            )
 
         line_on = str(os.environ.get("NMS_LINE_READ", "1")).strip().lower() \
             not in ("0", "false", "no", "off")
@@ -2119,6 +2194,8 @@ class NMSOcrApp:
             },
             "doc_script": self._doc_script,
             "paddle": paddle_bootstrap.status(),
+            "ram": memory_mod.ram_info(),
+            "ram_usable_gb": round(memory_mod.usable_ram_gb(), 2),
             "joint": {
                 "label": self.joint_label,
                 "dim": self.joint_dim,
@@ -2174,6 +2251,10 @@ def run_cli(args) -> int:
         os.environ[paddle_bootstrap.ENV_DEVICE] = str(args.paddle_device)
     if args.paddle_mkldnn:
         os.environ[paddle_bootstrap.ENV_MKLDNN] = "1"
+    if args.ram_limit > 0.0:
+        os.environ[memory_mod.ENV_RAM_LIMIT] = f"{float(args.ram_limit):.2f}"
+    if args.allow_low_ram:
+        os.environ[memory_mod.ENV_ALLOW_LOW_RAM] = "1"
     paddle_bootstrap.configure_runtime()
 
     app = NMSOcrApp(
@@ -2297,6 +2378,10 @@ def run_ui(args) -> int:
         os.environ[paddle_bootstrap.ENV_DEVICE] = str(args.paddle_device)
     if args.paddle_mkldnn:
         os.environ[paddle_bootstrap.ENV_MKLDNN] = "1"
+    if args.ram_limit > 0.0:
+        os.environ[memory_mod.ENV_RAM_LIMIT] = f"{float(args.ram_limit):.2f}"
+    if args.allow_low_ram:
+        os.environ[memory_mod.ENV_ALLOW_LOW_RAM] = "1"
     paddle_bootstrap.configure_runtime()
 
     app = NMSOcrApp(
@@ -2404,6 +2489,16 @@ def run_ui(args) -> int:
 
         def paddle_status(self):
             return paddle_bootstrap.status()
+
+        def ram_status(self):
+            info = memory_mod.ram_info()
+            info["usable_gb"] = round(memory_mod.usable_ram_gb(), 2)
+            return info
+
+        def reclaim_memory(self):
+            with app.job_slot("메모리 회수"):
+                after = memory_mod.reclaim(log=app._log, label="수동 회수")
+                return {"ok": True, "usable_gb": round(after, 2)}
 
         def install_paddle(self):
             with app.job_slot("PaddleOCR 백엔드 설치"):
@@ -2538,6 +2633,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--paddle-mkldnn",
         action="store_true",
         help="PaddleOCR oneDNN 가속 강제 활성화 (기본 비활성)",
+    )
+    p.add_argument(
+        "--ram-limit",
+        type=float,
+        default=0.0,
+        help="사용할 시스템 RAM 상한(GB). 0 이면 자동 감지",
+    )
+    p.add_argument(
+        "--allow-low-ram",
+        action="store_true",
+        help="RAM 부족 경고를 무시하고 강행 (프로세스 종료 위험)",
     )
     return p
 

@@ -5,6 +5,7 @@ import numpy as np
 import torch
 
 from .device import configure_backends, detect_accelerator, select_dtype
+from .memory import can_stage, model_disk_gb, reclaim, usable_ram_gb
 from .model_manager import (
     BOOTSTRAP_LANGUAGES,
     LLM_PATH,
@@ -83,12 +84,76 @@ NON_LATIN_SCRIPTS = frozenset({
 
 ROMANIZE_RATIO = 0.55
 
+PROMPT_ECHO_MARKERS = (
+    "script rule",
+    "scriptrule",
+    "do not romanize",
+    "do not translate",
+    "do not transliterate",
+    "correct output style",
+    "writing system",
+    "transcribe now",
+    "reproduce every character",
+    "omit it rather than",
+    "is a failure",
+    "separate distinct text blocks",
+    "context:",
+    "region:",
+    "schema:",
+    "hint:",
+)
+
+PROMPT_ECHO_MIN_HITS = 1
+
+
+VISION_ARCH_MARKERS = (
+    "imagetexttotext",
+    "vision2seq",
+    "conditionalgeneration",
+    "vlforconditional",
+    "visionencoderdecoder",
+)
+
 
 def _load_with_dtype(loader, path, dtype, **kwargs):
     try:
         return loader.from_pretrained(path, dtype=dtype, **kwargs)
     except TypeError:
         return loader.from_pretrained(path, torch_dtype=dtype, **kwargs)
+
+
+def _peek_config(model_path: str) -> dict:
+    import json
+    from pathlib import Path as _P
+
+    cfg = _P(model_path) / "config.json"
+    if not cfg.exists():
+        return {}
+    try:
+        return json.loads(cfg.read_text(encoding="utf-8", errors="ignore"))
+    except Exception:
+        return {}
+
+
+def _looks_vision_model(meta: dict) -> Tuple[bool, str]:
+    if not isinstance(meta, dict):
+        return False, ""
+
+    archs = meta.get("architectures")
+    if isinstance(archs, str):
+        archs = [archs]
+    if isinstance(archs, (list, tuple)):
+        for a in archs:
+            low = str(a).lower()
+            for marker in VISION_ARCH_MARKERS:
+                if marker in low:
+                    return True, str(a)
+
+    for key in ("vision_config", "image_token_id", "vision_start_token_id"):
+        if meta.get(key) is not None:
+            return True, f"config.{key}"
+
+    return False, ""
 
 
 class TextEmbedder:
@@ -111,11 +176,20 @@ class TextEmbedder:
         self.dtype = select_dtype(self.device)
         configure_backends(self.device)
 
+        self.weight_gb = model_disk_gb(self.model_path)
+        ok, why = can_stage(self.weight_gb, log=self._log, label=self.label)
+        if not ok:
+            raise MissingModelError(
+                f"[{self.label}] 시스템 메모리가 부족해 로드를 중단했습니다.\n"
+                f"  {why}"
+            )
+
         self.tokenizer = AutoTokenizer.from_pretrained(
             self.model_path, trust_remote_code=True
         )
         self.model = _load_with_dtype(
-            AutoModel, self.model_path, self.dtype, trust_remote_code=True
+            AutoModel, self.model_path, self.dtype,
+            trust_remote_code=True, low_cpu_mem_usage=True,
         )
         self.model.to(self.device)
         self.model.eval()
@@ -171,13 +245,9 @@ class TextEmbedder:
         return mat
 
     def unload(self):
-        try:
-            self.model.to("cpu")
-        except Exception:
-            pass
         self.model = None
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        self.tokenizer = None
+        reclaim(log=self._log, label=f"{self.label} 반납")
 
 
 class RefinerLLM:
@@ -208,11 +278,33 @@ class RefinerLLM:
         self.dtype = select_dtype(self.device)
         configure_backends(self.device)
 
+        self.weight_gb = model_disk_gb(self.model_path)
+        self.stage_gb = self.weight_gb
+
+        ok, why = can_stage(self.stage_gb, log=self._log, label=self.label)
+        if not ok:
+            raise MissingModelError(
+                f"[{self.label}] 시스템 메모리가 부족해 로드를 중단했습니다.\n"
+                f"  {why}\n"
+                f"  가중치 파일 {self.weight_gb:.1f} GB 는 GPU 로 올리기 전에\n"
+                f"  일단 시스템 RAM 에 펼쳐집니다. 4bit 양자화를 써도\n"
+                f"  이 단계는 피할 수 없습니다.\n"
+                f"  해결 방법:\n"
+                f"    · 다른 프로그램을 닫아 RAM 을 확보하세요.\n"
+                f"    · Windows 가상 메모리(페이지 파일)를 늘리세요.\n"
+                f"    · 더 작은 모델을 쓰세요.\n"
+                f"    · 강행하려면 set {'NMS_ALLOW_LOW_RAM'}=1"
+            )
+        self._log(
+            f"  📊 [{self.label}] 메모리 사전 점검 통과 — {why} "
+            f"| 가중치 {self.weight_gb:.1f} GB"
+        )
+
         self.tokenizer = AutoTokenizer.from_pretrained(
             self.model_path, trust_remote_code=True
         )
 
-        kwargs = {"trust_remote_code": True}
+        kwargs = {"trust_remote_code": True, "low_cpu_mem_usage": True}
 
         if self.device.type == "cuda":
             if self.low_vram:
@@ -223,39 +315,60 @@ class RefinerLLM:
                     self.load_mode = "4bit"
                 else:
                     kwargs["device_map"] = "auto"
-                    kwargs["low_cpu_mem_usage"] = True
-                    if self.budget_gb > 0:
-                        cap = max(1.0, self.budget_gb - 0.8)
-                        kwargs["max_memory"] = {0: f"{cap:.1f}GiB", "cpu": "16GiB"}
                     self.load_mode = "offload"
+
+                if self.budget_gb > 0:
+                    cap = max(1.0, self.budget_gb - 0.9)
+                    room = max(2.0, usable_ram_gb() - 1.5)
+                    kwargs["max_memory"] = {
+                        0: f"{cap:.1f}GiB",
+                        "cpu": f"{room:.1f}GiB",
+                    }
+                    self._log(
+                        f"  🧮 [{self.label}] 메모리 상한 — GPU {cap:.1f} GiB "
+                        f"/ CPU {room:.1f} GiB"
+                    )
             else:
                 kwargs["device_map"] = "auto"
 
+        meta = _peek_config(self.model_path)
+        want_vision, arch = _looks_vision_model(meta)
+
         self.model = None
-        for loader_name in (
-            "AutoModelForImageTextToText",
-            "AutoModelForVision2Seq",
-        ):
-            try:
-                import transformers as _tf
+
+        if want_vision:
+            import transformers as _tf
+            for loader_name in (
+                "AutoModelForImageTextToText",
+                "AutoModelForVision2Seq",
+            ):
                 loader = getattr(_tf, loader_name, None)
                 if loader is None:
                     continue
-                self.model = _load_with_dtype(
-                    loader, self.model_path, self.dtype, **kwargs
-                )
-                self.vision = True
-                self._log(
-                    f"  👁 [{self.label}] 비전-언어 모델로 로드했습니다 "
-                    f"({loader_name}) — 크롭 이미지를 직접 읽습니다."
-                )
-                break
-            except Exception as e:
-                self._log(
-                    f"  ⏭ [{self.label}] {loader_name} 로드 불가 "
-                    f"({type(e).__name__}: {str(e)[:90]})"
-                )
-                self.model = None
+                try:
+                    self.model = _load_with_dtype(
+                        loader, self.model_path, self.dtype, **kwargs
+                    )
+                    self.vision = True
+                    self._log(
+                        f"  👁 [{self.label}] 비전-언어 모델로 로드했습니다 "
+                        f"({loader_name} | config {arch}) — 크롭 이미지를 "
+                        f"직접 읽습니다."
+                    )
+                    break
+                except Exception as e:
+                    self._log(
+                        f"  ⏭ [{self.label}] {loader_name} 로드 불가 "
+                        f"({type(e).__name__}: {str(e)[:90]})"
+                    )
+                    self.model = None
+                    reclaim(log=self._log, label=f"{self.label} 로더 실패 후")
+        else:
+            self._log(
+                f"  📄 [{self.label}] config 에 비전 아키텍처 표시가 없어 "
+                f"텍스트 전용 경로로 바로 로드합니다 — 불필요한 중복 "
+                f"적재를 건너뜁니다."
+            )
 
         if self.model is None:
             self.model = _load_with_dtype(
@@ -266,6 +379,8 @@ class RefinerLLM:
                 f"  📄 [{self.label}] 텍스트 전용으로 로드했습니다 "
                 f"— OCR 원문만 정제합니다."
             )
+
+        reclaim(log=self._log, label=f"{self.label} 로드 후")
 
         if self.vision:
             try:
@@ -1348,6 +1463,19 @@ class RefinerLLM:
         return head
 
     @staticmethod
+    def looks_prompt_echo(text: str) -> Tuple[bool, str]:
+        s = str(text or "").strip().lower()
+        if not s:
+            return False, ""
+
+        flat = "".join(ch for ch in s if not ch.isspace())
+        for marker in PROMPT_ECHO_MARKERS:
+            probe = marker.replace(" ", "")
+            if probe and probe in flat:
+                return True, marker
+        return False, ""
+
+    @staticmethod
     def looks_romanized(text: str, lang_code: str = "", script: str = "") -> bool:
         s = str(text or "").strip()
         if not s:
@@ -1443,6 +1571,15 @@ class RefinerLLM:
 
         text = self._strip_reasoning(out)
         text = text.replace("```", "").strip()
+
+        echo, marker = self.looks_prompt_echo(text)
+        if echo:
+            self._log(
+                f"    🚯 [PROMPT ECHO] 지시문 '{marker}' 을 그대로 되뱉었습니다 "
+                f"— 판독 실패로 처리합니다: {text[:32]!r}"
+            )
+            return ""
+
         for junk in ("here is", "the text", "transcription:", "i see"):
             if text.lower().startswith(junk):
                 cut = text.find(":")
@@ -1484,6 +1621,15 @@ class RefinerLLM:
             except Exception:
                 again = ""
             again = self._strip_reasoning(again).replace("```", "").strip()
+
+            echo2, marker2 = self.looks_prompt_echo(again)
+            if echo2:
+                self._log(
+                    f"    🚯 [PROMPT ECHO] 재판독도 지시문 '{marker2}' 을 "
+                    f"되뱉어 버립니다."
+                )
+                return ""
+
             if again and not self.looks_romanized(again, lang_code, script):
                 return again[:max_chars].strip()
             self._log("    ⏭ [RAW READ] 재판독도 음차라 버립니다.")
@@ -1576,13 +1722,11 @@ class RefinerLLM:
         return {"value": value}
 
     def unload(self):
-        try:
-            self.model.to("cpu")
-        except Exception:
-            pass
         self.model = None
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        self.processor = None
+        self.tokenizer = None
+        self._kv_adapter = None
+        reclaim(log=self._log, label=f"{self.label} 반납")
 
 
 class EmbeddingRouter:

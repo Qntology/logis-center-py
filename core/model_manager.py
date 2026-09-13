@@ -250,9 +250,9 @@ LANG_REPO_TEMPLATES: Dict[str, dict] = {
         "min_size": 50_000_000,
     },
     "qwen35": {
-        "label": "Qwen3.5 2B (정제 추출 LLM)",
+        "label": "Qwen3.5 4B (정제 추출 LLM)",
         "owner": "alphaedge-ai",
-        "repo": "Qwen3.5-2B-{code}-16384",
+        "repo": "Qwen3.5-4B-{code}-16384",
         "files": (
             "chat_template.jinja",
             "config.json",
@@ -270,7 +270,7 @@ LANG_REPO_TEMPLATES: Dict[str, dict] = {
             "preprocessor_config.json",
             "video_preprocessor_config.json",
         ),
-        "min_size": 200_000_000,
+        "min_size": 400_000_000,
     },
 }
 
