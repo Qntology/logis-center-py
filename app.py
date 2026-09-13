@@ -57,6 +57,7 @@ from core.llm import (
 )
 from core import memory as memory_mod
 from core import paddle_bootstrap
+from core import pdf_render
 from core.phrase_cache import CachedEmbedder
 from core.model_manager import (
     BOOTSTRAP_LANGUAGES,
@@ -95,6 +96,8 @@ from vision_pipeline import VisionPipelineConfig, VisionPipeline
 DOCUMENT_EXT = (".pdf",)
 IMAGE_EXT = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp")
 TEXT_EXT = (".txt", ".md", ".csv", ".json")
+
+PDF_TEXT_MIN_CHARS = 60
 
 
 class NMSOcrApp:
@@ -164,6 +167,8 @@ class NMSOcrApp:
         self.current_image: Optional[Image.Image] = None
         self.current_path: str = ""
         self.current_text: str = ""
+        self.current_pdf: Optional[pdf_render.PdfDocument] = None
+        self.current_page: int = 0
 
         self.last_result: Optional[dict] = None
         self._download_lock = threading.Lock()
@@ -291,6 +296,8 @@ class NMSOcrApp:
 
     def _log_vram_profile(self):
         for line in memory_mod.report_lines():
+            self._log(line)
+        for line in pdf_render.report_lines():
             self._log(line)
 
         room = memory_mod.usable_ram_gb()
@@ -1116,7 +1123,11 @@ class NMSOcrApp:
                 webview.OPEN_DIALOG,
                 directory=str(BASE_DIR),
                 file_types=(
-                    "지원 파일 (*.png;*.jpg;*.jpeg;*.bmp;*.tiff;*.pdf;*.txt;*.md;*.csv)",
+                    "지원 파일 (*.png;*.jpg;*.jpeg;*.bmp;*.tif;*.tiff;*.webp;"
+                    "*.pdf;*.txt;*.md;*.csv;*.json)",
+                    "이미지 (*.png;*.jpg;*.jpeg;*.bmp;*.tif;*.tiff;*.webp)",
+                    "PDF (*.pdf)",
+                    "텍스트 (*.txt;*.md;*.csv;*.json)",
                     "모든 파일 (*.*)",
                 ),
             )
@@ -1139,11 +1150,12 @@ class NMSOcrApp:
         self.current_path = str(p)
         self.current_image = None
         self.current_text = ""
+        self.current_pdf = None
+        self.current_page = 0
         self.language_resolved = False
         self.language = None
         self._language_pending = True
         self._doc_script = ""
-        self._sync_registry_language()
         ext = p.suffix.lower()
 
         self._log(f"📂 입력 로드: {p.name}")
@@ -1155,10 +1167,9 @@ class NMSOcrApp:
                 return {"ok": True, "mode": "text", "chars": len(self.current_text)}
 
             if ext in DOCUMENT_EXT:
-                self.current_image = self._render_pdf(p)
-            else:
-                self.current_image = Image.open(p).convert("RGB")
+                return self._load_pdf(p)
 
+            self.current_image = Image.open(p).convert("RGB")
             self._log(
                 f"  ✅ 이미지 {self.current_image.width}x{self.current_image.height}"
             )
@@ -1172,18 +1183,106 @@ class NMSOcrApp:
             self._log(f"❌ 입력 로드 실패: {e}")
             return {"ok": False, "error": str(e)}
 
-    def _render_pdf(self, path: Path) -> Image.Image:
-        try:
-            import fitz
-            doc = fitz.open(str(path))
-            page = doc[0]
-            pix = page.get_pixmap(dpi=150)
-            img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
-            doc.close()
-            return img
-        except ImportError:
-            from pdf2image import convert_from_path
-            return convert_from_path(str(path), first_page=1, last_page=1, dpi=150)[0].convert("RGB")
+    def _load_pdf(self, path: Path) -> dict:
+        doc = pdf_render.render_pdf(path, log=self._log)
+
+        if not doc.ok:
+            self._log(f"❌ PDF 로드 실패: {doc.error}")
+            return {"ok": False, "error": doc.error}
+
+        self.current_pdf = doc
+        self.current_page = 0
+
+        page = doc.pages[0]
+        self.current_image = page.image
+
+        use_text = doc.has_text_layer and not pdf_render.force_vision()
+        body = doc.merged_text()
+
+        if use_text and len(body.strip()) >= PDF_TEXT_MIN_CHARS:
+            self.current_text = body
+            self._log(
+                f"  📝 [PDF] 내장 텍스트 {len(body)}자를 그대로 사용합니다. "
+                f"OCR·VLM 판독을 건너뛰므로 오독이 발생하지 않습니다."
+            )
+            self._log(
+                f"     비전 경로를 강제하려면 set "
+                f"{pdf_render.ENV_FORCE_VISION}=1"
+            )
+        elif doc.has_text_layer:
+            self._log(
+                "  ⏭ [PDF] 내장 텍스트가 있지만 비전 경로가 강제되어 "
+                "이미지로 처리합니다."
+            )
+
+        if self.current_image is None and not self.current_text:
+            err = (
+                "PDF 에서 이미지도 텍스트도 얻지 못했습니다.\n"
+                "  pip install pypdfium2 로 렌더 백엔드를 설치하세요."
+            )
+            self._log(f"❌ {err}")
+            return {"ok": False, "error": err}
+
+        w, h = page.size()
+        if self.current_image is not None:
+            self._log(f"  ✅ 1쪽 이미지 {w}x{h} @{page.dpi}dpi")
+
+        return {
+            "ok": True,
+            "mode": "text" if self.current_text else "image",
+            "pdf": doc.to_dict(),
+            "pages": len(doc.pages),
+            "total_pages": doc.total_pages,
+            "text_layer": doc.has_text_layer,
+            "chars": len(self.current_text),
+            "width": w,
+            "height": h,
+        }
+
+    def select_page(self, index: int = 0) -> dict:
+        if self.current_pdf is None:
+            return {"ok": False, "error": "PDF 가 로드되지 않았습니다."}
+
+        page = self.current_pdf.page(int(index))
+        if page is None:
+            return {
+                "ok": False,
+                "error": (
+                    f"{int(index) + 1}쪽이 없습니다 "
+                    f"(처리된 쪽 {len(self.current_pdf.pages)}개)."
+                ),
+            }
+
+        self.current_page = int(index)
+        self.current_image = page.image
+        self.current_text = page.text if page.has_text_layer else ""
+        self.language_resolved = False
+        self.language = None
+        self._language_pending = True
+        self._doc_script = ""
+        self.last_result = None
+
+        w, h = page.size()
+        self._log(
+            f"  📄 [PDF] {page.index + 1}쪽 선택 — {w}x{h} @{page.dpi}dpi "
+            f"| 텍스트 {page.char_count}자"
+        )
+        return {
+            "ok": True,
+            "index": page.index,
+            "width": w,
+            "height": h,
+            "chars": page.char_count,
+            "text_layer": page.has_text_layer,
+        }
+
+    def pdf_info(self) -> dict:
+        if self.current_pdf is None:
+            return {"ok": False, "error": "PDF 가 로드되지 않았습니다."}
+        out = self.current_pdf.to_dict()
+        out["ok"] = True
+        out["current_page"] = self.current_page
+        return out
 
     def list_schemas(self) -> dict:
         out = []
@@ -2229,6 +2328,15 @@ class NMSOcrApp:
             "paddle": paddle_bootstrap.status(),
             "ram": memory_mod.ram_info(),
             "ram_usable_gb": round(memory_mod.usable_ram_gb(), 2),
+            "pdf": {
+                "backends": pdf_render.available_backends(),
+                "active": pdf_render.preferred_backend(),
+                "dpi": pdf_render.target_dpi(),
+                "max_pages": pdf_render.page_budget(),
+                "loaded": (
+                    self.current_pdf.to_dict() if self.current_pdf else {}
+                ),
+            },
             "joint": {
                 "label": self.joint_label,
                 "dim": self.joint_dim,
@@ -2271,6 +2379,8 @@ class NMSOcrApp:
         self.cached_vision = None
         self._ocr_code = ""
         self._doc_script = ""
+        self.current_pdf = None
+        self.current_page = 0
         self.base_ready = False
         self.models_ready = False
 
@@ -2288,6 +2398,12 @@ def run_cli(args) -> int:
         os.environ[memory_mod.ENV_RAM_LIMIT] = f"{float(args.ram_limit):.2f}"
     if args.allow_low_ram:
         os.environ[memory_mod.ENV_ALLOW_LOW_RAM] = "1"
+    if args.pdf_dpi > 0:
+        os.environ[pdf_render.ENV_DPI] = str(int(args.pdf_dpi))
+    if args.pdf_pages > 0:
+        os.environ[pdf_render.ENV_MAX_PAGES] = str(int(args.pdf_pages))
+    if args.pdf_force_vision:
+        os.environ[pdf_render.ENV_FORCE_VISION] = "1"
     paddle_bootstrap.configure_runtime()
 
     app = NMSOcrApp(
@@ -2340,6 +2456,12 @@ def run_cli(args) -> int:
         if not res.get("ok"):
             print(f"\n❌ {res.get('error', '')}", file=sys.stderr)
             return 1
+
+        if app.current_pdf is not None and int(args.page) > 1:
+            picked = app.select_page(int(args.page) - 1)
+            if not picked.get("ok"):
+                print(f"\n❌ {picked.get('error', '')}", file=sys.stderr)
+                return 1
 
     if not args.lang:
         app.detect_language()
@@ -2415,6 +2537,12 @@ def run_ui(args) -> int:
         os.environ[memory_mod.ENV_RAM_LIMIT] = f"{float(args.ram_limit):.2f}"
     if args.allow_low_ram:
         os.environ[memory_mod.ENV_ALLOW_LOW_RAM] = "1"
+    if args.pdf_dpi > 0:
+        os.environ[pdf_render.ENV_DPI] = str(int(args.pdf_dpi))
+    if args.pdf_pages > 0:
+        os.environ[pdf_render.ENV_MAX_PAGES] = str(int(args.pdf_pages))
+    if args.pdf_force_vision:
+        os.environ[pdf_render.ENV_FORCE_VISION] = "1"
     paddle_bootstrap.configure_runtime()
 
     app = NMSOcrApp(
@@ -2449,6 +2577,13 @@ def run_ui(args) -> int:
         def load_input(self, path: str = ""):
             with app.job_slot("입력 로드"):
                 return app.load_input(path)
+
+        def select_page(self, index: int = 0):
+            with app.job_slot("PDF 쪽 선택"):
+                return app.select_page(int(index))
+
+        def pdf_info(self):
+            return app.pdf_info()
 
         def detect_language(self):
             with app.job_slot("언어 판별"):
@@ -2677,6 +2812,29 @@ def build_parser() -> argparse.ArgumentParser:
         "--allow-low-ram",
         action="store_true",
         help="RAM 부족 경고를 무시하고 강행 (프로세스 종료 위험)",
+    )
+    p.add_argument(
+        "--pdf-dpi",
+        type=int,
+        default=0,
+        help="PDF 렌더 해상도(DPI). 0 이면 기본 200",
+    )
+    p.add_argument(
+        "--pdf-pages",
+        type=int,
+        default=0,
+        help="PDF 최대 처리 쪽수. 0 이면 기본 32",
+    )
+    p.add_argument(
+        "--pdf-force-vision",
+        action="store_true",
+        help="PDF 내장 텍스트를 무시하고 비전 경로로 처리",
+    )
+    p.add_argument(
+        "--page",
+        type=int,
+        default=1,
+        help="처리할 PDF 쪽 번호 (1부터)",
     )
     return p
 
