@@ -6,6 +6,7 @@ import numpy as np
 from PIL import Image
 
 from .lang_codes import (
+    CJK_SCRIPTS,
     NOISE_ANCHORS,
     NOISE_QUALITY_FLOOR,
     PEER_DECISION_MARGIN,
@@ -14,7 +15,10 @@ from .lang_codes import (
     SCRIPT_ANCHORS,
     SCRIPT_CHROME_ANCHORS,
     STRONG_REFERENCE_MARGIN,
+    block_census,
     candidates_for_script,
+    decide_latin_language,
+    decide_script_language,
     dominant_script,
     exclusive_language_of,
     lang_anchor_phrases,
@@ -23,6 +27,7 @@ from .lang_codes import (
     priors_for_script,
     reference_language_of,
     script_histogram,
+    script_is_decisive,
 )
 from .nms import (
     bank_internal_cohesion,
@@ -49,6 +54,8 @@ UNRESOLVED_STAGES: Tuple[str, ...] = (
     "reference-fallback",
     "low-margin",
 )
+
+BLOCK_DECIDED_STAGE = "unicode-block"
 
 
 def _z_scores(values: List[float]) -> List[float]:
@@ -135,6 +142,9 @@ class TextEvidence:
     def __init__(self):
         self.script: Optional[str] = None
         self.script_ratio: float = 0.0
+        self.histogram: Dict[str, int] = {}
+        self.script_decisive: bool = False
+        self.script_reason: str = ""
         self.exclusive: Optional[str] = None
         self.reference: str = REFERENCE_LANGUAGE
         self.ref_cos: float = 0.0
@@ -313,21 +323,51 @@ class LanguageDetector:
             return [(0, 0, w, h)]
 
         ink = 255.0 - gray
+
+        gx = np.abs(np.diff(gray, axis=1)).mean(axis=1)
+        gy = np.abs(np.diff(gray, axis=0)).mean(axis=1)
+        edge = np.zeros((h,), dtype=np.float32)
+        edge[: gx.shape[0]] += gx
+        edge[: gy.shape[0]] += gy
+
         row_profile = ink.mean(axis=1)
-        thr = float(row_profile.mean() + row_profile.std() * 0.25)
+        rp = row_profile - float(row_profile.min())
+        rp = rp / max(float(rp.max()), 1e-6)
+        ep = edge - float(edge.min())
+        ep = ep / max(float(ep.max()), 1e-6)
+        mixed = (rp + ep * 2.0) / 3.0
 
         bands: List[Tuple[int, int]] = []
-        start = -1
-        for y in range(h):
-            hot = row_profile[y] > thr
-            if hot and start < 0:
-                start = y
-            elif not hot and start >= 0:
-                if y - start >= DEFAULT_MIN_BAND_PX:
-                    bands.append((start, y))
-                start = -1
-        if start >= 0 and h - start >= DEFAULT_MIN_BAND_PX:
-            bands.append((start, h))
+        for factor in (0.25, 0.0, -0.25):
+            thr = float(mixed.mean() + mixed.std() * factor)
+            found: List[Tuple[int, int]] = []
+            start = -1
+            for y in range(h):
+                hot = mixed[y] > thr
+                if hot and start < 0:
+                    start = y
+                elif not hot and start >= 0:
+                    if y - start >= DEFAULT_MIN_BAND_PX:
+                        found.append((start, y))
+                    start = -1
+            if start >= 0 and h - start >= DEFAULT_MIN_BAND_PX:
+                found.append((start, h))
+            if len(found) >= 3:
+                bands = found
+                break
+            if len(found) > len(bands):
+                bands = found
+
+        if len(bands) < 3:
+            step = max(DEFAULT_MIN_BAND_PX, h // 6)
+            bands = [
+                (y, min(h, y + step)) for y in range(0, h, step)
+                if min(h, y + step) - y >= DEFAULT_MIN_BAND_PX
+            ]
+            self._log(
+                f"  📐 잉크 밴드가 {len(bands)}개뿐이라 균등 분할로 "
+                f"대체합니다 (그림이 전면을 채우는 입력)."
+            )
 
         if not bands:
             return [(0, 0, w, h)]
@@ -391,6 +431,20 @@ class LanguageDetector:
         if merged:
             preview = merged.replace("\n", " / ")[:120]
             self._log(f"  📝 OCR 표본 {len(merged)}자: {preview}")
+
+            hist = script_histogram(merged)
+            if hist:
+                total = sum(hist.values())
+                brief = " | ".join(
+                    f"{k}:{v}({v / total:.0%})"
+                    for k, v in sorted(hist.items(), key=lambda kv: -kv[1])[:5]
+                )
+                self._log(f"  🔠 밴드 {len(chunks)}개 합산 문자 분포 — {brief}")
+                if total < 20:
+                    self._log(
+                        f"  ⚠ 문자 {total}자는 언어 판별에 부족합니다. "
+                        f"OCR 환각이 섞이면 스크립트가 뒤집힙니다."
+                    )
         else:
             self._log("  ⚠ OCR 표본을 얻지 못했습니다.")
         return merged
@@ -547,6 +601,7 @@ class LanguageDetector:
         script, ratio, hist = dominant_script(text)
         ev.script = script
         ev.script_ratio = float(ratio)
+        ev.histogram = dict(hist)
 
         if script is None:
             self._log("  ⚠ OCR 텍스트에서 식별 가능한 스크립트가 없습니다.")
@@ -557,9 +612,22 @@ class LanguageDetector:
         )
         self._log(f"  🔤 문자 스크립트: {script} ({ratio:.2%}) [{hist_brief}]")
 
+        decisive, reason = script_is_decisive(hist)
+        ev.script_decisive = bool(decisive)
+        ev.script_reason = reason
+        if not decisive:
+            self._log(
+                f"  ⚠ 스크립트 근거가 약합니다 — {reason}. "
+                f"배타 확정을 보류하고 코사인으로 판정합니다."
+            )
+
         ev.exclusive = exclusive_language_of(script)
-        if script == "Han" and hist.get("Kana", 0) > 0:
-            ev.exclusive = "jpn"
+        if ev.exclusive and not decisive:
+            self._log(
+                f"  🚧 배타 언어 '{ev.exclusive}' 후보를 근거 부족으로 "
+                f"해제합니다."
+            )
+            ev.exclusive = None
         if ev.exclusive:
             self._log(
                 f"  🎯 스크립트 배타 언어: {ev.exclusive}"
@@ -656,9 +724,35 @@ class LanguageDetector:
             return fallback, script, 0.0, 0.0, ranked, "fallback"
 
         if exclusive:
-            return (
-                exclusive, script, ev.absolute.get(exclusive, 0.0),
-                max(ev.quality, 0.0), ranked, "script-exclusive",
+            served_ok = (not self.served_codes) or (exclusive in self.served_codes)
+            cos_ok = True
+            if ev.neutral:
+                top = max(ev.neutral.items(), key=lambda kv: kv[1])[0]
+                cos_ok = (top == exclusive) or (
+                    float(ev.neutral.get(exclusive, 0.0))
+                    >= float(ev.neutral.get(top, 0.0)) * 0.5
+                )
+                if not cos_ok:
+                    self._log(
+                        f"  🚧 배타 언어 '{exclusive}' 가 코사인 1위 "
+                        f"'{top}' 에 크게 밀립니다 "
+                        f"({ev.neutral.get(exclusive, 0.0):+.4f} vs "
+                        f"{ev.neutral.get(top, 0.0):+.4f})."
+                    )
+            if not served_ok:
+                self._log(
+                    f"  🚧 배타 언어 '{exclusive}' 는 서비스 가능한 스코프 "
+                    f"({', '.join(sorted(self.served_codes))}) 밖입니다."
+                )
+
+            if served_ok and cos_ok:
+                return (
+                    exclusive, script, ev.absolute.get(exclusive, 0.0),
+                    max(ev.quality, 0.0), ranked, "script-exclusive",
+                )
+            self._log(
+                f"  ↩ 배타 확정을 취소하고 코사인·사전분포 경로로 "
+                f"넘어갑니다."
             )
 
         if ev.noise_dominant:
@@ -705,21 +799,80 @@ class LanguageDetector:
                 pool.append(ev.reference)
             if fallback and fallback not in pool:
                 pool.append(fallback)
-            pick = max(
-                pool,
-                key=lambda c: (
-                    1.0 if c in self.served_codes else 0.0,
+
+            char_weight: Dict[str, float] = {}
+            if script in CJK_SCRIPTS and ev.histogram:
+                total = max(1, sum(ev.histogram.values()))
+                script_lang = {
+                    "Hangul": "kor", "Kana": "jpn", "Han": "zho",
+                }
+                for s, code in script_lang.items():
+                    cnt = int(ev.histogram.get(s, 0))
+                    if cnt > 0:
+                        char_weight[code] = cnt / float(total)
+                        if code not in pool:
+                            pool.append(code)
+                if char_weight:
+                    brief = " | ".join(
+                        f"{k}={v:.0%}" for k, v in sorted(
+                            char_weight.items(), key=lambda kv: -kv[1]
+                        )
+                    )
+                    self._log(f"  🔠 문자 실측 비중: {brief}")
+
+            CHAR_DECISIVE_GAP = 0.20
+
+            ranked_chars = sorted(
+                char_weight.items(), key=lambda kv: kv[1], reverse=True
+            )
+            char_decisive = False
+            if len(ranked_chars) >= 2:
+                gap = ranked_chars[0][1] - ranked_chars[1][1]
+                char_decisive = gap >= CHAR_DECISIVE_GAP
+                if not char_decisive:
+                    self._log(
+                        f"  ⚠ 문자 실측 1·2위 격차 {gap:.0%} < "
+                        f"{CHAR_DECISIVE_GAP:.0%} — 실질 동률이라 "
+                        f"사전분포를 우선합니다."
+                    )
+            elif len(ranked_chars) == 1:
+                char_decisive = True
+
+            def _key(c: str):
+                served = 1.0 if (
+                    not self.served_codes or c in self.served_codes
+                ) else 0.0
+                cw = char_weight.get(c, 0.0) if char_decisive else 0.0
+                return (
+                    served,
                     priors.get(c, 0.0),
+                    cw,
                     float(ev.neutral.get(c, 0.0)),
-                ),
+                )
+
+            pick = max(pool, key=_key)
+            basis = (
+                "문자 실측" if (char_decisive and char_weight.get(pick, 0.0) > 0)
+                else "사전분포"
             )
             self._log(
                 f"  🚧 언어 앵커가 '언어임'과 '노이즈'조차 구분하지 못합니다 "
                 f"({axis_power:+.4f} ≤ {spread:.4f}) — '{best_code}' 우위는 "
                 f"이름 토큰 치환이 만든 잡음입니다. 문자체계 '{script}' "
-                f"사전분포로 '{pick}' (prior {priors.get(pick, 0.0):.2f}, "
-                f"서비스 {'가능' if pick in self.served_codes else '불가'}) 확정"
+                f"{basis}로 '{pick}' (prior {priors.get(pick, 0.0):.2f}, "
+                f"문자 {char_weight.get(pick, 0.0):.0%}, "
+                f"서비스 {'가능' if (not self.served_codes or pick in self.served_codes) else '불가'}) 확정"
             )
+            runner = sorted(
+                pool, key=_key, reverse=True
+            )[1] if len(pool) > 1 else pick
+            if runner != pick:
+                self._log(
+                    f"     차점 '{runner}' (prior "
+                    f"{priors.get(runner, 0.0):.2f}, 문자 "
+                    f"{char_weight.get(runner, 0.0):.0%}, 코사인 "
+                    f"{float(ev.neutral.get(runner, 0.0)):+.4f})"
+                )
             return (
                 pick, script, float(ev.neutral.get(pick, best_net)),
                 max(axis_power, 0.0), ranked, "script-prior",
@@ -736,6 +889,24 @@ class LanguageDetector:
             )
 
         if decisive:
+            if self.served_codes and best_code not in self.served_codes:
+                served_pool = [
+                    c for c, _v in ranked if c in self.served_codes
+                ]
+                if served_pool:
+                    alt = served_pool[0]
+                    gap = best_net - float(ev.neutral.get(alt, 0.0))
+                    if gap < noise_band * 2.0:
+                        self._log(
+                            f"  🚧 '{best_code}' 는 서비스 스코프 밖이고 "
+                            f"서비스 가능한 '{alt}' 와 격차가 {gap:+.4f} "
+                            f"(잡음대 {noise_band:.4f}의 2배 미만)입니다 "
+                            f"→ '{alt}' 로 확정합니다."
+                        )
+                        return (
+                            alt, script, float(ev.neutral.get(alt, best_net)),
+                            m12, ranked, "served-swap",
+                        )
             self._log(
                 f"  👑 '{best_code}' 확정 — 차상위 '{second_code}' 대비 "
                 f"{m12:+.4f} (잡음대 {noise_band:.4f})"
@@ -767,12 +938,72 @@ class LanguageDetector:
             m12, ranked, "script-prior",
         )
 
+    def decide_by_block(self, text: str) -> Optional[LanguageVerdict]:
+        code, script, why = decide_script_language(text)
+        census = block_census(text)
+
+        if census:
+            brief = " | ".join(
+                f"{k}:{v}" for k, v in sorted(census.items(), key=lambda kv: -kv[1])
+            )
+            self._log(f"  🧱 유니코드 블록 조사 — {brief}")
+
+        if not code and script == "Latin":
+            self._log(f"  🧱 {why}")
+            code, lat_why, scores = decide_latin_language(
+                text, served=sorted(self.served_codes) if self.served_codes else None
+            )
+            if scores:
+                brief = " | ".join(
+                    f"{k}={v}" for k, v in sorted(
+                        scores.items(), key=lambda kv: -kv[1]
+                    )[:6]
+                )
+                self._log(f"  🔤 라틴 기능어 적중 — {brief}")
+            self._log(f"  🔤 라틴 확정 — {lat_why}")
+
+        if not code:
+            if why:
+                self._log(f"  🧱 블록 확정 불가 — {why}")
+            return None
+
+        if script != "Latin":
+            self._log(f"  🧱 블록 확정 — {why}")
+
+        if self.served_codes and code not in self.served_codes:
+            self._log(
+                f"  ⚠ '{code}' 는 서비스 스코프 "
+                f"({', '.join(sorted(self.served_codes))}) 밖입니다. "
+                f"모델 취득이 필요합니다."
+            )
+
+        return LanguageVerdict(
+            code=code,
+            script=script,
+            confidence=1.0,
+            margin=1.0,
+            stage=BLOCK_DECIDED_STAGE,
+            candidates=[(code, 1.0)],
+            sample_text=text,
+            logs=list(self.logs),
+        )
+
     def detect(self, image: Image.Image) -> LanguageVerdict:
         self.logs = []
         self._log("═══ 언어 판별 시작 ═══")
 
-        visual = self.stage_a_visual(image)
         text = self.collect_text(image)
+
+        decided = self.decide_by_block(text)
+        if decided is not None:
+            self._log(
+                f"  ✅ 확정: {decided.code}({decided.name}) "
+                f"script={decided.script} stage={decided.stage} "
+                f"— 코사인 판별을 생략했습니다."
+            )
+            return decided
+
+        visual = self.stage_a_visual(image)
         ev = self.stage_b_text(text)
 
         code, final_script, score, margin, ranked, stage = self.fuse(visual, ev)
@@ -804,6 +1035,16 @@ class LanguageDetector:
     def detect_from_text(self, text: str) -> LanguageVerdict:
         self.logs = []
         self._log("═══ 언어 판별 시작 (텍스트 입력) ═══")
+
+        decided = self.decide_by_block(text)
+        if decided is not None:
+            self._log(
+                f"  ✅ 확정: {decided.code}({decided.name}) "
+                f"script={decided.script} stage={decided.stage} "
+                f"— 코사인 판별을 생략했습니다."
+            )
+            return decided
+
         ev = self.stage_b_text(text)
         code, final_script, score, margin, ranked, stage = self.fuse({}, ev)
         code = normalize_lang_code(code)

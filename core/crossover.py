@@ -158,6 +158,8 @@ class CrossoverSwitch:
     def loaded_estimate_gb(self) -> float:
         return sum(s.est_gb for s in self.slots.values() if s.loaded)
 
+    EVICT_LAST = (SLOT_JOINT, SLOT_OCR)
+
     def _make_room_for(self, name: str, protect: Sequence[str]) -> List[str]:
         slot = self.slots.get(name)
         if slot is None or slot.est_gb <= 0.0 or self.budget_gb <= 0.0:
@@ -173,7 +175,12 @@ class CrossoverSwitch:
             s for s in self.slots.values()
             if s.loaded and s.name not in protect_set and s.est_gb > 0.0
         ]
-        candidates.sort(key=lambda s: s.est_gb, reverse=True)
+        candidates.sort(
+            key=lambda s: (
+                1 if s.name in self.EVICT_LAST else 0,
+                -s.est_gb,
+            )
+        )
 
         evicted: List[str] = []
         for cand in candidates:

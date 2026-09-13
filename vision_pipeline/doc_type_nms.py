@@ -207,25 +207,44 @@ def load_doc_type_specs(
         _absorb_schema(data, f.stem, lang_code, groups, file_map, f.name)
 
     if not groups and dictionaries:
+        loaders = []
         try:
             from core.trade_schema import load_trade_schemas
+            loaders.append(("trade", load_trade_schemas))
         except Exception as e:
-            load_trade_schemas = None
             if log is not None:
                 log.append(f"    ⏭ 무역 사전 로더를 불러오지 못했습니다: {e}")
+        try:
+            from core.comics_schema import load_comics_schemas
+            loaders.append(("comics", load_comics_schemas))
+        except Exception as e:
+            if log is not None:
+                log.append(f"    ⏭ 만화 사전 로더를 불러오지 못했습니다: {e}")
 
-        if load_trade_schemas is not None:
-            for f in dictionaries:
-                schemas, diag = load_trade_schemas(f, lang_code)
+        for f in dictionaries:
+            hit = False
+            for _domain, loader in loaders:
+                try:
+                    schemas, diag = loader(f, lang_code)
+                except Exception as e:
+                    if log is not None:
+                        log.append(
+                            f"    ⏭ {_domain} 스키마 조립 실패 "
+                            f"({type(e).__name__}: {e})"
+                        )
+                    continue
                 if log is not None:
                     for line in diag:
                         log.append(line)
                 for code, sch in schemas.items():
                     _absorb_schema(
-                        sch, code, lang_code, groups, file_map, f"{f.name}#{code}"
+                        sch, code, lang_code, groups, file_map,
+                        f"{f.name}#{code}",
                     )
                 if schemas:
-                    break
+                    hit = True
+            if hit:
+                break
 
     specs = [
         GroupSpec(name, sorted(payload["anchors"]), payload["codes"])
@@ -478,6 +497,15 @@ def _text_axis_scores(
     return out, len(uniq), ""
 
 
+def all_phrases_probe(specs: Sequence[GroupSpec]) -> List[str]:
+    out: List[str] = list(CHROME_ANCHORS)
+    for spec in specs:
+        out.extend(spec.anchors)
+        for anchors in spec.codes.values():
+            out.extend(anchors)
+    return out
+
+
 def classify_doc_type(
     grid: VisionPatchGrid,
     specs: Sequence[GroupSpec],
@@ -501,6 +529,30 @@ def classify_doc_type(
         _say(
             "⚪ 문서 유형 스펙이 없습니다 — schema/ 폴더에 "
             "'domain' / 'doc_type' / 'fields' 를 가진 스키마 JSON 이 필요합니다."
+        )
+        return DocTypeVerdict(logs=logs)
+
+    probe_dim = 0
+    try:
+        probe = embed_fn(["__dim_probe__"])
+        if probe is not None:
+            arr = np.asarray(probe, dtype=np.float32)
+            if arr.ndim == 1:
+                arr = arr.reshape(1, -1)
+            probe_dim = int(arr.shape[-1]) if arr.size else 0
+    except Exception as e:
+        _say(f"  ⚠ 앵커 임베더 차원 프로브 실패: {e}")
+
+    if probe_dim and int(grid.dim) and probe_dim != int(grid.dim):
+        _say(
+            f"❌ 문서 유형 분류 중단 — 패치 격자 {int(grid.dim)}차원 vs "
+            f"텍스트 앵커 {probe_dim}차원. 격자 모델과 앵커 모델이 "
+            f"서로 다른 공간입니다."
+        )
+        _say(
+            f"   격자 출처 '{grid.source}' 와 앵커 제공자를 같은 모델로 "
+            f"맞춰야 합니다. 앵커 {len(set(p for p in all_phrases_probe(specs) if p))}구 "
+            f"임베딩을 생략했습니다."
         )
         return DocTypeVerdict(logs=logs)
 
@@ -581,6 +633,11 @@ def classify_doc_type(
         f"  👑 그룹 '{best_group}' — 마진 {gm12:+.4f} / 잡음대 {gband:.4f} "
         f"→ {'결정적' if gdecisive else '동률(하위 그룹도 후보 유지)'}"
     )
+    if len(group_scores) == 1:
+        _say(
+            f"  ⚠ 그룹이 '{best_group}' 하나뿐이라 도메인 경쟁이 "
+            f"없습니다. 다른 도메인 문서도 이 그룹으로 강제 분류됩니다."
+        )
 
     _say("═══ Doc Type NMS: Depth 2 (코드) ═══")
 

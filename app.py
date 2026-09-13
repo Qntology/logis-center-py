@@ -395,6 +395,24 @@ class NMSOcrApp:
         if SLOT_OCR not in self.crossover.slots:
             self.crossover.register(SLOT_OCR, _load_ocr, est_gb=0.7)
 
+    def job_queue(self):
+        q = getattr(self, "_job_queue", None)
+        if q is None:
+            from core.jobqueue import JobQueue
+
+            def _emit(info: dict):
+                self._push_ui(f"onJobState({json.dumps(info)})")
+
+            q = JobQueue(log=self._log, name="pipeline", event=_emit)
+            self._job_queue = q
+        return q
+
+    def job_slot(self, title: str):
+        return self.job_queue().slot(title)
+
+    def job_stats(self) -> dict:
+        return self.job_queue().stats()
+
     def _hayai_embed_fn(self):
         def _fn(texts):
             ocr = self.crossover.get(SLOT_OCR)
@@ -422,11 +440,29 @@ class NMSOcrApp:
                 return jnt.encode_text(texts)
 
             label = self.joint_label or "siglip2"
-            self.vision_router.unregister("hayai")
+
+            stale = [
+                n for n in self.vision_router.providers()
+                if n != label and (n.startswith("siglip2") or n == "hayai")
+            ]
+            for n in stale:
+                self.vision_router.unregister(n)
+            if stale:
+                self._log(
+                    f"  🧹 [joint-router] 구버전 제공자 {stale} 를 "
+                    f"제거하고 '{label}' 단독으로 재구성합니다."
+                )
+
             self.vision_router.register(label, _joint_embed, priority=200)
             self.vision_router.promote(label, priority=200)
 
             jnt = self.crossover.get(SLOT_JOINT)
+            if jnt is None:
+                try:
+                    jnt = self.crossover.acquire(SLOT_JOINT)
+                except Exception as e:
+                    self._log(f"  ⚠ 조인트 획득 실패({e})")
+                    jnt = None
             jdim = int(getattr(jnt, "dim", 0) or 0) if jnt is not None else 0
             if jdim > 0:
                 self.vision_router.lock_space(jdim, owner=label)
@@ -592,14 +628,23 @@ class NMSOcrApp:
                 "예약 토큰으로 나올 수 있습니다. 이 경우 언어 확정은 보류됩니다."
             )
 
+        installed = list(installed_language_codes())
+        complete = [c for c in installed if lang_models_ready(c)]
+        partial = [c for c in installed if c not in complete]
+
         served = list(dict.fromkeys(
             [c for c in judge_codes if c]
             + list(BOOTSTRAP_LANGUAGES)
-            + list(installed_language_codes())
+            + complete
         ))
         self._log(
             "  🎯 서비스 가능한 언어 스코프: " + ", ".join(served)
         )
+        if partial:
+            self._log(
+                f"  ⏭ 부분 설치 언어 {', '.join(partial)} 는 스코프에서 "
+                f"제외합니다 (중단된 다운로드 흔적일 수 있습니다)."
+            )
 
         detector = LanguageDetector(
             ocr=self.ocr,
@@ -626,6 +671,25 @@ class NMSOcrApp:
             verdict.stage not in self.UNRESOLVED_STAGES
             and bool(verdict.script)
         )
+
+        block_decided = verdict.stage == "unicode-block"
+
+        if block_decided:
+            self._log(
+                f"  🧱 유니코드 블록으로 확정된 언어입니다 — "
+                f"마진 검사를 면제합니다."
+            )
+        elif resolved and verdict.code not in served and verdict.margin < 0.05:
+            self._log(
+                f"  🚧 '{verdict.code}' 는 미설치 언어이고 마진이 "
+                f"{verdict.margin:+.4f} 로 약합니다. 수 GB 다운로드를 "
+                f"피하기 위해 기본 언어로 진행합니다."
+            )
+            self._log(
+                f"     이 언어를 쓰시려면 환경설정 → 모델 관리에서 "
+                f"'{verdict.code}' 를 직접 받아 주세요."
+            )
+            resolved = False
 
         if resolved:
             self.lang_code = verdict.code
@@ -770,13 +834,20 @@ class NMSOcrApp:
 
         jp, jl, jc = resolve_joint_path(self.lang_code, self.active_codes)
         if jp and jl != self.joint_label:
+            old = self.joint_label or "-"
             self.crossover.release(SLOT_JOINT)
             self.crossover.slots.pop(SLOT_JOINT, None)
             self._joint_registered = False
             self.joint_label = ""
+            self.vision_router.lock_space(0)
             self._register_slots()
             self._register_embed_provider()
-            self._log(f"  🪢 조인트 공간을 '{jl}' (언어 {jc}) 로 재바인딩했습니다.")
+            self._log(
+                f"  🪢 조인트 공간 재바인딩 '{old}' → '{jl}' (언어 {jc}) "
+                f"| 활성 '{self.vision_router.active}' "
+                f"| 고정 {self.vision_router.space_dim}차원 "
+                f"| prefer_grid={self.prefer_grid}"
+            )
 
         entries = self._register_text_embedders(self.active_codes, promote=True)
         if entries:
@@ -948,7 +1019,6 @@ class NMSOcrApp:
     def list_schemas(self) -> dict:
         out = []
         dictionaries = []
-
         for f in sorted(SCHEMA_DIR.glob("*.json")):
             try:
                 with open(f, "r", encoding="utf-8") as fh:
@@ -956,12 +1026,13 @@ class NMSOcrApp:
             except Exception:
                 dictionaries.append(f)
                 continue
-
-            fields = data.get("fields") if isinstance(data, dict) else None
+            if not isinstance(data, dict):
+                dictionaries.append(f)
+                continue
+            fields = data.get("fields")
             if not isinstance(fields, dict) or not fields:
                 dictionaries.append(f)
                 continue
-
             out.append({
                 "filename": f.name,
                 "domain": data.get("domain", "unknown"),
@@ -970,22 +1041,32 @@ class NMSOcrApp:
             })
 
         if not out:
+            scope = self.lang_code if self.language_resolved else ""
             for f in dictionaries:
-                try:
-                    from core.trade_schema import load_trade_schemas
-                    schemas, _diag = load_trade_schemas(
-                        f, self.lang_code if self.language_resolved else ""
-                    )
-                except Exception:
-                    continue
-                for code, sch in schemas.items():
-                    out.append({
-                        "filename": f"{f.name}#{code}",
-                        "domain": sch.get("domain", "trade"),
-                        "doc_type": code,
-                        "field_count": len(sch.get("fields", {}) or {}),
-                    })
-                if schemas:
+                hit = False
+                for mod, fn in (
+                    ("core.trade_schema", "load_trade_schemas"),
+                    ("core.comics_schema", "load_comics_schemas"),
+                ):
+                    try:
+                        loader = getattr(__import__(mod, fromlist=[fn]), fn)
+                        schemas, _diag = loader(f, scope)
+                    except Exception as e:
+                        self._log(
+                            f"  ⏭ {mod} 스키마 조립 실패 "
+                            f"({type(e).__name__}: {e})"
+                        )
+                        continue
+                    for code, sch in schemas.items():
+                        out.append({
+                            "filename": f"{f.name}#{code}",
+                            "domain": sch.get("domain", "trade"),
+                            "doc_type": code,
+                            "field_count": len(sch.get("fields", {}) or {}),
+                        })
+                    if schemas:
+                        hit = True
+                if hit:
                     break
 
         return {"ok": True, "schemas": out}
@@ -1002,13 +1083,25 @@ class NMSOcrApp:
 
         try:
             if ref_code:
-                from core.trade_schema import load_trade_schemas
-                schemas, diag = load_trade_schemas(
-                    p, self.lang_code if self.language_resolved else ""
-                )
-                for line in diag:
-                    self._log(line)
-                schema = schemas.get(ref_code)
+                scope = self.lang_code if self.language_resolved else ""
+                schema = None
+                for mod, fn in (
+                    ("core.trade_schema", "load_trade_schemas"),
+                    ("core.comics_schema", "load_comics_schemas"),
+                ):
+                    try:
+                        loader = getattr(__import__(mod, fromlist=[fn]), fn)
+                    except Exception:
+                        continue
+                    try:
+                        schemas, diag = loader(p, scope)
+                    except Exception:
+                        continue
+                    if ref_code in schemas:
+                        for line in diag:
+                            self._log(line)
+                        schema = schemas[ref_code]
+                        break
                 if schema is None:
                     return {
                         "ok": False,
@@ -1016,6 +1109,7 @@ class NMSOcrApp:
                     }
                 self._log(
                     f"  📋 '{ref_code}' 서식 스키마 로드 — "
+                    f"도메인 {schema.get('domain')} | "
                     f"필드 {len(schema.get('fields', {}) or {})}개"
                 )
             else:
@@ -1033,6 +1127,10 @@ class NMSOcrApp:
             return {"ok": False, "error": str(e)}
 
     def classify_document(self) -> dict:
+        with self.job_slot("문서 유형 분류"):
+            return self._classify_document_body()
+
+    def _classify_document_body(self) -> dict:
         if self.current_image is None:
             return {"ok": False, "error": "이미지가 로드되지 않았습니다."}
 
@@ -1051,14 +1149,35 @@ class NMSOcrApp:
             return {"ok": False, "error": "모델이 로드되지 않았습니다."}
 
         self._log("═══ 문서 유형 분류 (Doc Type NMS) ═══")
+
+        joint_obj = self.joint
+        if joint_obj is None and SLOT_JOINT in self.crossover.slots:
+            try:
+                joint_obj = self.crossover.acquire(
+                    SLOT_JOINT, protect=[SLOT_OCR]
+                )
+            except Exception as e:
+                self._log(f"  ⚠ 조인트 선획득 실패({e}) → Hayai 격자로 진행")
+                joint_obj = None
+
+        prefer = self.prefer_grid
+        if joint_obj is None and prefer == "joint":
+            self._log(
+                "  🚧 조인트 모델이 메모리에 없어 격자를 Hayai 로 되돌립니다. "
+                "앵커 공간도 함께 되돌려 반쪽 폴백을 막습니다."
+            )
+            self._demote_joint()
+            self._register_embed_provider()
+            prefer = self.prefer_grid
+
         pipeline = VisionPipeline(
             self.vision_embed_fn, ocr=self.ocr, embedder=self.embedder,
             config=VisionPipelineConfig(
                 lang_code=self.lang_code if self.language_resolved else "",
-                prefer_grid=self.prefer_grid,
+                prefer_grid=prefer,
             ),
             log=self._log, nlp=self.nlp,
-            crossover=self.crossover, joint=self.joint,
+            crossover=self.crossover, joint=joint_obj,
         )
         sample = ""
         if self.language is not None:
@@ -1148,7 +1267,9 @@ class NMSOcrApp:
         claimed: Dict[str, str] = {}
         rows_by_cat: Dict[str, List[dict]] = {}
 
-        def _fn(category: str, raw_text: str, crop_image) -> dict:
+        lang = self.lang_code if self.language_resolved else ""
+
+        def _fn(category: str, raw_text: str, crop_image, top_field: str = "") -> dict:
             obj = self.crossover.get(SLOT_REFINER)
             if obj is None:
                 obj = self.crossover.acquire(SLOT_REFINER)
@@ -1160,6 +1281,8 @@ class NMSOcrApp:
             if not spec:
                 return obj.refine_field(category, raw_text, hint=hint)
 
+            out: dict = {}
+
             if category in array_cats:
                 prev = rows_by_cat.setdefault(category, [])
                 if getattr(obj, "vision", False) and crop_image is not None:
@@ -1170,29 +1293,42 @@ class NMSOcrApp:
                 rows = obj.refine_array(
                     category, spec, raw_text,
                     existing=prev, label_bank=labels, hint=hint,
-                    image=crop_image,
+                    image=crop_image, primary_hint=top_field, lang_code=lang,
                 )
                 prev.extend(rows)
-                return {"__rows__": list(prev)}
+                out["__rows__"] = list(prev)
+                got_any = bool(rows)
+            else:
+                if claimed:
+                    self._log(
+                        f"    🔒 [ALREADY CLAIMED] 확정값 {len(claimed)}건을 "
+                        f"금지 목록으로 전달합니다."
+                    )
+                if getattr(obj, "vision", False) and crop_image is not None:
+                    self._log(
+                        f"    📤 [{category}] "
+                        f"{crop_image.width}x{crop_image.height} 크롭 이미지 전송"
+                    )
+                got = obj.refine_category(
+                    category, spec, raw_text,
+                    claimed=claimed, label_bank=labels, hint=hint,
+                    image=crop_image, lang_code=lang,
+                )
+                for k, v in got.items():
+                    claimed.setdefault(k, v)
+                out["__fields__"] = got
+                got_any = bool(got)
 
-            if claimed:
-                self._log(
-                    f"    🔒 [ALREADY CLAIMED] 확정값 {len(claimed)}건을 "
-                    f"금지 목록으로 전달합니다."
-                )
-            if getattr(obj, "vision", False) and crop_image is not None:
-                self._log(
-                    f"    📤 [{category}] "
-                    f"{crop_image.width}x{crop_image.height} 크롭 이미지 전송"
-                )
-            got = obj.refine_category(
-                category, spec, raw_text,
-                claimed=claimed, label_bank=labels, hint=hint,
-                image=crop_image,
-            )
-            for k, v in got.items():
-                claimed.setdefault(k, v)
-            return {"__fields__": got}
+            if not got_any and getattr(obj, "vision", False):
+                ok, why = obj.draft_matches_language(raw_text, lang)
+                if not ok or not str(raw_text or "").strip():
+                    raw = obj.read_raw(crop_image, hint=category)
+                    if raw:
+                        out["__raw__"] = raw
+                    elif not ok:
+                        self._log(f"    ⚠ [RAW READ] 판독 실패 — {why}")
+
+            return out
 
         return _fn
 
@@ -1204,10 +1340,28 @@ class NMSOcrApp:
         margin_threshold: float = 0.28,
         use_refiner: bool = True,
     ) -> dict:
-        self.log_lines = []
+        with self.job_slot("파이프라인 실행"):
+            self.log_lines = []
 
-        if self.current_image is None and not self.current_text:
-            return {"ok": False, "error": "입력이 로드되지 않았습니다."}
+            if self.current_image is None and not self.current_text:
+                return {"ok": False, "error": "입력이 로드되지 않았습니다."}
+
+            return self._run_pipeline_body(
+                schema_json=schema_json,
+                schema_file=schema_file,
+                iou_threshold=iou_threshold,
+                margin_threshold=margin_threshold,
+                use_refiner=use_refiner,
+            )
+
+    def _run_pipeline_body(
+        self,
+        schema_json: str = "",
+        schema_file: str = "",
+        iou_threshold: float = 0.80,
+        margin_threshold: float = 0.28,
+        use_refiner: bool = True,
+    ) -> dict:
 
         ready = self.ensure_models_ready()
         if not ready.get("ok"):
@@ -1321,18 +1475,37 @@ class NMSOcrApp:
         self._log("═══ 비전 파이프라인 ═══")
         self._progress(10, "비전 파이프라인 시작")
 
+        joint_obj = self.joint
+        if joint_obj is None and SLOT_JOINT in self.crossover.slots:
+            try:
+                joint_obj = self.crossover.acquire(
+                    SLOT_JOINT, protect=[SLOT_OCR]
+                )
+            except Exception as e:
+                self._log(f"  ⚠ 조인트 선획득 실패({e}) → Hayai 격자로 진행")
+                joint_obj = None
+
+        prefer = self.prefer_grid
+        if joint_obj is None and prefer == "joint":
+            self._log(
+                "  🚧 조인트 모델이 메모리에 없어 격자를 Hayai 로 되돌립니다."
+            )
+            self._demote_joint()
+            self._register_embed_provider()
+            prefer = self.prefer_grid
+
         cfg = VisionPipelineConfig(
             iou_threshold=iou_threshold,
             margin_threshold=margin_threshold,
             lang_code=self.lang_code if self.language_resolved else "",
-            prefer_grid=self.prefer_grid,
+            prefer_grid=prefer,
             doc_code=str(schema.get("code") or schema.get("doc_type") or ""),
             source_path=self.current_path,
         )
         pipeline = VisionPipeline(
             self.vision_embed_fn, ocr=self.ocr, embedder=self.embedder,
             config=cfg, log=self._log, nlp=self.nlp,
-            crossover=self.crossover, joint=self.joint,
+            crossover=self.crossover, joint=joint_obj,
         )
 
         hint = f"document language: {language_name(self.lang_code)}"
@@ -1844,20 +2017,25 @@ def run_ui(args) -> int:
             return app.get_gpu_info()
 
         def load_models(self):
-            return app.load_models(fetch=not args.no_fetch)
+            with app.job_slot("모델 로드"):
+                return app.load_models(fetch=not args.no_fetch)
 
         def load_image(self, path: str = ""):
-            return app.load_input(path)
+            with app.job_slot("입력 로드"):
+                return app.load_input(path)
 
         def load_input(self, path: str = ""):
-            return app.load_input(path)
+            with app.job_slot("입력 로드"):
+                return app.load_input(path)
 
         def detect_language(self):
-            v = app.detect_language()
-            return {"ok": True, "language": v.to_dict()}
+            with app.job_slot("언어 판별"):
+                v = app.detect_language()
+                return {"ok": True, "language": v.to_dict()}
 
         def classify_document(self):
-            return app.classify_document()
+            with app.job_slot("문서 유형 분류"):
+                return app.classify_document()
 
         def list_schemas(self):
             return app.list_schemas()
@@ -1871,15 +2049,20 @@ def run_ui(args) -> int:
             iou_threshold: float = 0.80,
             margin_threshold: float = 0.28,
             text_embed_mode: str = "",
+            schema_file: str = "",
+            use_refiner: bool = True,
         ):
             return app.run_pipeline(
                 schema_json=schema_json,
+                schema_file=schema_file,
                 iou_threshold=float(iou_threshold),
                 margin_threshold=float(margin_threshold),
+                use_refiner=bool(use_refiner),
             )
 
         def save_results(self, results_json: str = ""):
-            return app.save_results(results_json)
+            with app.job_slot("결과 저장"):
+                return app.save_results(results_json)
 
         def get_result_json(self, pretty: bool = True):
             return app.get_result_json(bool(pretty))
@@ -1887,14 +2070,19 @@ def run_ui(args) -> int:
         def print_result_json(self):
             return app.print_result_json()
 
+        def job_stats(self):
+            return app.job_stats()
+
         def zvec_search(self, query: str = "", top_k: int = 10, namespace: str = "fields"):
-            return app.zvec_search(query, int(top_k), namespace)
+            with app.job_slot("벡터 검색"):
+                return app.zvec_search(query, int(top_k), namespace)
 
         def zvec_stats(self):
             return app.zvec_stats()
 
         def zvec_purge(self):
-            return app.zvec_purge()
+            with app.job_slot("벡터 저장소 비우기"):
+                return app.zvec_purge()
 
         def toggle_devtools(self):
             return app.toggle_devtools()
@@ -1903,8 +2091,9 @@ def run_ui(args) -> int:
             return app.get_crossover()
 
         def unload_models(self):
-            app.unload()
-            return {"ok": True, "crossover": app.get_crossover()}
+            with app.job_slot("모델 반납"):
+                app.unload()
+                return {"ok": True, "crossover": app.get_crossover()}
 
         def devtools_status(self):
             return app.devtools_status()

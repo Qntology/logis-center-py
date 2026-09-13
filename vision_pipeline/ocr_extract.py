@@ -233,10 +233,27 @@ def extract_from_crops(
             except Exception:
                 pass
             try:
-                refined = refine_fn(plan.category, cleaned, vlm_crop) or {}
+                refined = refine_fn(
+                    plan.category, cleaned, vlm_crop, plan.top_field
+                ) or {}
+            except TypeError:
+                try:
+                    refined = refine_fn(plan.category, cleaned, vlm_crop) or {}
+                except Exception as e:
+                    if log is not None:
+                        log.append(f"    ⚠ 정제 추출 실패: {e}")
             except Exception as e:
                 if log is not None:
                     log.append(f"    ⚠ 정제 추출 실패: {e}")
+
+            raw_alt = refined.get("__raw__") if isinstance(refined, dict) else ""
+            if isinstance(raw_alt, str) and raw_alt.strip():
+                if log is not None:
+                    log.append(
+                        f"    👁 [RAW READ] '{plan.category}' OCR 원문을 VLM "
+                        f"판독으로 교체합니다: {raw_alt[:48]!r}"
+                    )
+                cleaned = raw_alt.strip()
             if isinstance(refined, dict):
                 inner = refined.get("__fields__")
                 if isinstance(inner, dict):

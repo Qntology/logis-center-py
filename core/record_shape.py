@@ -21,6 +21,14 @@ MODE_BY_DOMAIN = {
     "comics": "comics",
 }
 
+ROOT_PROMOTE_BY_DOMAIN = {
+    "comics": (
+        "title", "episode_number", "page_number", "credits",
+        "publisher", "character_name", "dialogue", "narration",
+        "sound_effect", "sign_text",
+    ),
+}
+
 CRC32_POLY = 0xEDB88320
 
 WS_RE = re.compile(r"\s+")
@@ -269,7 +277,7 @@ def build_record(
             cat = str(definition.get("category") or "misc")
         grouped.setdefault(cat, {})[key] = val
 
-        if key in _promote_set():
+        if key in _promote_set(domain):
             roots[key] = val
 
     for cat in list(arrays.keys()):
@@ -340,7 +348,10 @@ def build_record(
     return record
 
 
-def _promote_set() -> set:
+def _promote_set(domain: str = "") -> set:
+    override = ROOT_PROMOTE_BY_DOMAIN.get(str(domain or "").strip().lower())
+    if override:
+        return set(override)
     from .trade_schema import ROOT_PROMOTE_FIELDS
     return set(ROOT_PROMOTE_FIELDS)
 

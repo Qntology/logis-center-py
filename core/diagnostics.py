@@ -94,6 +94,26 @@ def describe_module(model, title: str, emit=None, top: int = 6, level: int = 1) 
         _emit(emit, f"  🔍 [{title}] 파라미터 조회 실패: {e}")
         return info
 
+    seen_ptr = set()
+    for _n, _p in params:
+        try:
+            seen_ptr.add(_p.data_ptr())
+        except Exception:
+            pass
+    try:
+        for _n, _b in model.named_buffers():
+            if _b is None:
+                continue
+            try:
+                if _b.data_ptr() in seen_ptr:
+                    continue
+                seen_ptr.add(_b.data_ptr())
+            except Exception:
+                pass
+            params.append((_n, _b))
+    except Exception:
+        pass
+
     for name, p in params:
         info["tensors"] += 1
         try:
@@ -108,6 +128,8 @@ def describe_module(model, title: str, emit=None, top: int = 6, level: int = 1) 
     if torch is not None:
         for name, p in params[:32]:
             try:
+                if "float8" in str(getattr(p, "dtype", "")):
+                    continue
                 if not bool(torch.isfinite(p.detach()).all().item()):
                     info["bad"].append(name)
             except Exception:

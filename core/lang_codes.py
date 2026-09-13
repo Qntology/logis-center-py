@@ -1,4 +1,4 @@
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 ISO1_TO_ISO3: Dict[str, str] = {
     "af": "afr", "am": "amh", "ar": "ara", "az": "aze", "be": "bel",
@@ -276,13 +276,270 @@ HAN_PRIORS: Dict[str, float] = {
     "zho": 1.00, "jpn": 0.40,
 }
 
+HANGUL_PRIORS: Dict[str, float] = {
+    "kor": 1.00, "jpn": 0.10, "zho": 0.05,
+}
+
+KANA_PRIORS: Dict[str, float] = {
+    "jpn": 1.00, "kor": 0.15, "zho": 0.05,
+}
+
 SCRIPT_PRIORS: Dict[str, Dict[str, float]] = {
     "Latin": LATIN_PRIORS,
     "Cyrillic": CYRILLIC_PRIORS,
     "Arabic": ARABIC_PRIORS,
     "Devanagari": DEVANAGARI_PRIORS,
     "Han": HAN_PRIORS,
+    "Hangul": HANGUL_PRIORS,
+    "Kana": KANA_PRIORS,
 }
+
+DECISIVE_BLOCKS: Tuple[Tuple[str, str, Tuple[Tuple[int, int], ...]], ...] = (
+    ("Hangul", "kor", (
+        (0xAC00, 0xD7A3), (0x1100, 0x11FF), (0x3130, 0x318F), (0xA960, 0xA97F),
+    )),
+    ("Kana", "jpn", (
+        (0x3040, 0x309F), (0x30A0, 0x30FF), (0x31F0, 0x31FF),
+    )),
+    ("Thai", "tha", ((0x0E00, 0x0E7F),)),
+    ("Cyrillic", "rus", ((0x0400, 0x04FF), (0x0500, 0x052F))),
+    ("Arabic", "ara", (
+        (0x0600, 0x06FF), (0x0750, 0x077F), (0x08A0, 0x08FF),
+        (0xFB50, 0xFDFF), (0xFE70, 0xFEFF),
+    )),
+    ("Devanagari", "hin", ((0x0900, 0x097F), (0xA8E0, 0xA8FF))),
+    ("Bengali", "ben", ((0x0980, 0x09FF),)),
+    ("Greek", "ell", ((0x0370, 0x03FF), (0x1F00, 0x1FFF))),
+    ("Hebrew", "heb", ((0x0590, 0x05FF), (0xFB1D, 0xFB4F))),
+    ("Armenian", "hye", ((0x0530, 0x058F),)),
+    ("Georgian", "kat", ((0x10A0, 0x10FF), (0x2D00, 0x2D2F))),
+    ("Tamil", "tam", ((0x0B80, 0x0BFF),)),
+    ("Telugu", "tel", ((0x0C00, 0x0C7F),)),
+    ("Kannada", "kan", ((0x0C80, 0x0CFF),)),
+    ("Malayalam", "mal", ((0x0D00, 0x0D7F),)),
+    ("Sinhala", "sin", ((0x0D80, 0x0DFF),)),
+    ("Gurmukhi", "pan", ((0x0A00, 0x0A7F),)),
+    ("Gujarati", "guj", ((0x0A80, 0x0AFF),)),
+    ("Lao", "lao", ((0x0E80, 0x0EFF),)),
+    ("Khmer", "khm", ((0x1780, 0x17FF),)),
+    ("Myanmar", "mya", ((0x1000, 0x109F),)),
+    ("Ethiopic", "amh", ((0x1200, 0x137F),)),
+    ("Tibetan", "bod", ((0x0F00, 0x0FFF),)),
+    ("Vietnamese", "vie", ((0x1EA0, 0x1EF9), (0x01A0, 0x01B0))),
+)
+
+LATE_BLOCKS: Tuple[Tuple[str, str, Tuple[Tuple[int, int], ...]], ...] = (
+    ("Han", "zho", (
+        (0x4E00, 0x9FFF), (0x3400, 0x4DBF), (0xF900, 0xFAFF),
+    )),
+)
+
+LATIN_BLOCKS: Tuple[Tuple[int, int], ...] = (
+    (0x0041, 0x005A), (0x0061, 0x007A), (0x00C0, 0x024F), (0x1E00, 0x1EFF),
+)
+
+DECISIVE_MIN_CHARS = 1
+
+
+def _in_blocks(cp: int, blocks: Tuple[Tuple[int, int], ...]) -> bool:
+    for lo, hi in blocks:
+        if lo <= cp <= hi:
+            return True
+    return False
+
+
+def block_census(text: str) -> Dict[str, int]:
+    out: Dict[str, int] = {}
+    for ch in str(text or ""):
+        if ch.isspace() or ch.isdigit():
+            continue
+        cp = ord(ch)
+        hit = ""
+        for name, _code, blocks in DECISIVE_BLOCKS:
+            if _in_blocks(cp, blocks):
+                hit = name
+                break
+        if not hit:
+            for name, _code, blocks in LATE_BLOCKS:
+                if _in_blocks(cp, blocks):
+                    hit = name
+                    break
+        if not hit and _in_blocks(cp, LATIN_BLOCKS):
+            hit = "Latin"
+        if hit:
+            out[hit] = out.get(hit, 0) + 1
+    return out
+
+
+def decide_script_language(
+    text: str,
+    min_chars: int = DECISIVE_MIN_CHARS,
+) -> Tuple[str, str, str]:
+    census = block_census(text)
+    if not census:
+        return "", "", "식별 가능한 문자가 없습니다."
+
+    for name, code, _blocks in DECISIVE_BLOCKS:
+        cnt = census.get(name, 0)
+        if cnt >= int(min_chars):
+            return code, name, (
+                f"'{name}' 블록 {cnt}자 검출 — 해당 문자를 쓰는 언어는 "
+                f"'{code}' 뿐이므로 즉시 확정"
+            )
+
+    for name, code, _blocks in LATE_BLOCKS:
+        cnt = census.get(name, 0)
+        if cnt >= int(min_chars):
+            return code, name, (
+                f"'{name}' 블록 {cnt}자 검출 — 한중일 공용 문자이나 "
+                f"다른 결정적 블록이 없어 '{code}' 로 확정"
+            )
+
+    if census.get("Latin", 0) >= int(min_chars):
+        return "", "Latin", (
+            f"라틴 알파벳 {census['Latin']}자 — 기능어 프로파일로 "
+            f"세부 언어를 가립니다."
+        )
+
+    return "", "", f"결정적 블록이 없습니다 ({census})."
+
+
+LATIN_DEFAULT = "eng"
+
+LATIN_ALLOWED: Tuple[str, ...] = (
+    "eng", "fra", "deu", "spa", "ita", "por", "nld",
+)
+
+LATIN_PROFILES: Dict[str, Tuple[str, ...]] = {
+    "eng": (
+        "the", "of", "and", "to", "in", "is", "for", "on", "with", "as",
+        "by", "at", "from", "this", "that", "are", "be", "or", "not",
+        "was", "have", "has", "it", "an", "all", "which", "shall",
+        "invoice", "number", "date", "total", "amount", "country",
+        "shipment", "goods", "value", "quantity", "price", "weight",
+        "description", "address", "name", "port", "terms", "payment",
+    ),
+    "fra": (
+        "le", "la", "les", "de", "des", "du", "et", "un", "une", "est",
+        "que", "qui", "dans", "pour", "sur", "par", "avec", "au", "aux",
+        "ne", "pas", "ce", "cette", "sont", "plus", "facture", "numero",
+        "date", "montant", "pays", "marchandises", "poids", "adresse",
+        "quantite", "prix", "total", "expedition", "paiement",
+    ),
+    "deu": (
+        "der", "die", "das", "und", "ist", "von", "zu", "den", "dem",
+        "mit", "auf", "fur", "als", "nicht", "ein", "eine", "einer",
+        "sich", "auch", "sind", "wird", "werden", "rechnung", "nummer",
+        "datum", "betrag", "land", "waren", "gewicht", "anschrift",
+        "menge", "preis", "gesamt", "versand", "zahlung",
+    ),
+    "spa": (
+        "el", "la", "los", "las", "de", "del", "y", "en", "que", "un",
+        "una", "por", "con", "para", "es", "son", "no", "se", "su",
+        "como", "mas", "factura", "numero", "fecha", "importe", "pais",
+        "mercancias", "peso", "direccion", "cantidad", "precio",
+        "total", "envio", "pago",
+    ),
+    "ita": (
+        "il", "lo", "la", "i", "gli", "le", "di", "del", "della", "e",
+        "in", "che", "un", "una", "per", "con", "non", "si", "sono",
+        "come", "piu", "da", "fattura", "numero", "data", "importo",
+        "paese", "merci", "peso", "indirizzo", "quantita", "prezzo",
+        "totale", "spedizione", "pagamento",
+    ),
+    "por": (
+        "o", "a", "os", "as", "de", "do", "da", "dos", "das", "e",
+        "em", "que", "um", "uma", "por", "com", "para", "nao", "se",
+        "sao", "mais", "fatura", "numero", "data", "valor", "pais",
+        "mercadorias", "peso", "endereco", "quantidade", "preco",
+        "total", "remessa", "pagamento",
+    ),
+    "nld": (
+        "de", "het", "een", "van", "en", "is", "in", "op", "te", "dat",
+        "die", "voor", "met", "aan", "niet", "zijn", "worden", "als",
+        "door", "factuur", "nummer", "datum", "bedrag", "land",
+        "goederen", "gewicht", "adres", "aantal", "prijs", "totaal",
+        "zending", "betaling",
+    ),
+}
+
+LATIN_MIN_TOKENS = 6
+LATIN_MIN_HITS = 2
+LATIN_MIN_MARGIN = 2
+
+
+def _latin_tokens(text: str) -> List[str]:
+    out: List[str] = []
+    buf: List[str] = []
+    for ch in str(text or ""):
+        cp = ord(ch)
+        if _in_blocks(cp, LATIN_BLOCKS):
+            buf.append(ch.lower())
+            continue
+        if buf:
+            out.append("".join(buf))
+            buf = []
+    if buf:
+        out.append("".join(buf))
+    return [t for t in out if len(t) >= 1]
+
+
+def _fold(token: str) -> str:
+    table = {
+        "á": "a", "à": "a", "â": "a", "ä": "a", "ã": "a", "å": "a",
+        "é": "e", "è": "e", "ê": "e", "ë": "e",
+        "í": "i", "ì": "i", "î": "i", "ï": "i",
+        "ó": "o", "ò": "o", "ô": "o", "ö": "o", "õ": "o",
+        "ú": "u", "ù": "u", "û": "u", "ü": "u",
+        "ç": "c", "ñ": "n", "ß": "s",
+    }
+    return "".join(table.get(c, c) for c in token)
+
+
+def decide_latin_language(
+    text: str,
+    served: Optional[Sequence[str]] = None,
+) -> Tuple[str, str, Dict[str, int]]:
+    tokens = [_fold(t) for t in _latin_tokens(text)]
+    scores: Dict[str, int] = {}
+
+    allowed = list(LATIN_ALLOWED)
+    if served:
+        extra = [c for c in served if c in LATIN_PROFILES and c not in allowed]
+        allowed.extend(extra)
+
+    for code in allowed:
+        bank = set(LATIN_PROFILES.get(code, ()))
+        if not bank:
+            continue
+        scores[code] = sum(1 for t in tokens if t in bank)
+
+    if len(tokens) < LATIN_MIN_TOKENS:
+        return LATIN_DEFAULT, (
+            f"라틴 토큰 {len(tokens)}개는 프로파일 판별에 부족합니다 "
+            f"→ 기본 '{LATIN_DEFAULT}'"
+        ), scores
+
+    ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
+    if not ranked or ranked[0][1] < LATIN_MIN_HITS:
+        return LATIN_DEFAULT, (
+            f"어떤 언어 기능어도 {LATIN_MIN_HITS}회 이상 맞지 않습니다 "
+            f"→ 기본 '{LATIN_DEFAULT}'"
+        ), scores
+
+    top_code, top_hits = ranked[0]
+    second = ranked[1][1] if len(ranked) > 1 else 0
+
+    if top_hits - second < LATIN_MIN_MARGIN:
+        return LATIN_DEFAULT, (
+            f"1위 '{top_code}'({top_hits}) 와 2위({second}) 격차가 "
+            f"{LATIN_MIN_MARGIN} 미만 → 기본 '{LATIN_DEFAULT}'"
+        ), scores
+
+    return top_code, (
+        f"기능어 적중 '{top_code}' {top_hits}회 vs 차점 {second}회 "
+        f"(토큰 {len(tokens)}개) → '{top_code}' 확정"
+    ), scores
 
 
 def normalize_lang_code(code: Optional[str]) -> str:
@@ -336,23 +593,62 @@ def script_histogram(text: str) -> Dict[str, int]:
     return hist
 
 
+CJK_SCRIPTS = ("Hangul", "Kana", "Han")
+
+SCRIPT_TIE_RATIO = 0.25
+
+
 def dominant_script(text: str) -> Tuple[Optional[str], float, Dict[str, int]]:
     hist = script_histogram(text)
     if not hist:
         return None, 0.0, hist
     total = sum(hist.values())
-    if "Kana" in hist and hist["Kana"] >= max(2, int(total * 0.02)):
-        return "Kana", hist["Kana"] / total, hist
-    if "Hangul" in hist and hist["Hangul"] >= max(2, int(total * 0.05)):
-        return "Hangul", hist["Hangul"] / total, hist
-    best = max(hist.items(), key=lambda kv: kv[1])
-    return best[0], best[1] / total, hist
+    if total <= 0:
+        return None, 0.0, hist
+
+    _code, script, _why = decide_script_language(text)
+    if script and script in hist:
+        return script, hist[script] / total, hist
+
+    ranked = sorted(hist.items(), key=lambda kv: kv[1], reverse=True)
+    best_name, best_cnt = ranked[0]
+    return best_name, best_cnt / total, hist
+
+
+def script_is_decisive(hist: Dict[str, int]) -> Tuple[bool, str]:
+    if not hist:
+        return False, "문자 표본이 없습니다."
+    total = sum(hist.values())
+    if total < 8:
+        return False, f"문자 표본이 {total}자뿐입니다."
+
+    ranked = sorted(hist.items(), key=lambda kv: kv[1], reverse=True)
+    top_name, top_cnt = ranked[0]
+    second = ranked[1][1] if len(ranked) > 1 else 0
+
+    if top_cnt < total * 0.60:
+        return False, (
+            f"최다 스크립트 '{top_name}' 비중 {top_cnt / total:.0%} < 60%"
+        )
+    if second and second >= top_cnt * (1.0 - SCRIPT_TIE_RATIO):
+        return False, (
+            f"'{top_name}'({top_cnt}) vs '{ranked[1][0]}'({second}) 실질 동률"
+        )
+    return True, ""
+
+
+CJK_CROSS_CANDIDATES: Tuple[str, ...] = ("kor", "jpn", "zho")
 
 
 def candidates_for_script(script: Optional[str]) -> List[str]:
     if not script:
         return ["eng"]
-    return list(SCRIPT_CANDIDATES.get(script, ("eng",)))
+    base = list(SCRIPT_CANDIDATES.get(script, ("eng",)))
+    if script in CJK_SCRIPTS:
+        for c in CJK_CROSS_CANDIDATES:
+            if c not in base:
+                base.append(c)
+    return base
 
 
 def priors_for_script(script: Optional[str]) -> Dict[str, float]:
@@ -366,10 +662,15 @@ def priors_for_script(script: Optional[str]) -> Dict[str, float]:
     return {"eng": 1.0}
 
 
+NON_EXCLUSIVE_SCRIPTS = (
+    "Han", "Latin", "Cyrillic", "Arabic", "Devanagari", "Hangul", "Kana",
+)
+
+
 def exclusive_language_of(script: Optional[str]) -> Optional[str]:
     if not script:
         return None
-    if script in ("Han", "Latin", "Cyrillic", "Arabic", "Devanagari"):
+    if script in NON_EXCLUSIVE_SCRIPTS:
         return None
     return SCRIPT_EXCLUSIVE_LANG.get(script)
 

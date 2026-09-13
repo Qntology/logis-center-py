@@ -96,6 +96,116 @@
       ]
     }
   },
+  "comics_schema": {
+    "base": {
+      "page": {
+        "title": "Series or work title printed on the page {String}",
+        "episode_number": "Episode or chapter number printed on the page {String}",
+        "page_number": "Page number printed in a corner or margin {String}",
+        "credits": "Author, artist, studio or publisher credit line {String}",
+        "publisher": "Publisher or platform name printed on the page {String}",
+        "release_label": "Release, update or serialization label printed on the page {String}"
+      },
+      "panel": {
+        "panel_index": "Reading order index of this panel within the page {Number}",
+        "panel_caption": "Caption box text attached to this panel {String}",
+        "scene_location": "Where this panel takes place as drawn or captioned {String}",
+        "scene_time": "Time of day or elapsed time indicated in this panel {String}"
+      },
+      "speech": {
+        "dialogue": "a speech balloon, an oval white bubble with a pointed tail aimed at a character mouth, containing conversational text {String}",
+        "character_name": "a small name label lettered next to a speech balloon identifying who is talking {String}",
+        "speaker_role": "an interjection or exclamation, a short emotive outburst lettered larger than surrounding dialogue {String}",
+        "balloon_shape": "the drawn outline of a text bubble, smooth oval for talking, jagged spikes for shouting, dashed for whispering {String}",
+        "emphasis": "words inside a balloon drawn bolder, larger or in a different colour than the rest of the line {String}"
+      },
+      "thought": {
+        "thought_balloon": "a thought bubble, a fluffy cloud shaped outline trailing small round bubbles toward a character head, holding unspoken inner monologue {String}",
+        "thinker_name": "the character whose head the trailing bubbles of a thought cloud point back to {String}"
+      },
+      "narration": {
+        "narration": "a rectangular caption box with straight corners and no tail, placed at a panel edge, carrying narrator prose about time or place {String}",
+        "aside": "tiny handwritten author commentary squeezed into the gutter outside the panel border {String}"
+      },
+      "effect": {
+        "sound_effect": "onomatopoeia, a sound word lettered directly onto the artwork without any balloon, drawn in a distorted display typeface that imitates the noise it names {String}",
+        "effect_intensity": "how forcefully the onomatopoeia is lettered, tiny thin strokes for quiet sounds, huge jagged strokes for loud impacts {String}",
+        "motion_cue": "speed lines, impact starbursts, sweat drops, blush marks and other non textual emotion or motion symbols drawn around a character {String}"
+      },
+      "signage": {
+        "sign_text": "environmental lettering painted on a hanging shop sign, wall poster, chalkboard or banner that belongs to the drawn scenery rather than to any character {String}",
+        "screen_text": "lettering rendered on a device display drawn inside the scene, a phone screen, monitor or tablet held by a character {String}",
+        "book_text": "lettering printed on a book cover, magazine spine or paper sheet drawn as a prop within the scene {String}",
+        "brand_text": "a shop logo or storefront wordmark drawn as part of the background architecture {String}"
+      },
+      "cast": {
+        "character_appearance": "How a character is drawn, hair colour clothing and build {String}",
+        "character_expression": "Facial expression drawn on a character {String}",
+        "character_count": "How many distinct characters are drawn in this panel {Number}"
+      }
+    },
+    "overlay": {
+      "WEBTOON": {
+        "page": {
+          "title": "The WEBTOON series title printed on this episode page {String}",
+          "episode_number": "The WEBTOON episode number printed on this page {String}"
+        },
+        "panel": {
+          "panel_index": "Vertical scroll order index of this cut {Number}"
+        },
+        "signage": {
+          "screen_text": "Chat bubbles or phone screen text drawn in this webtoon cut {String}"
+        }
+      },
+      "MANGA": {
+        "page": {
+          "title": "The manga series title printed on this page {String}",
+          "page_number": "Page number printed in the outer margin of this manga page {String}"
+        },
+        "panel": {
+          "panel_index": "Right to left reading order index of this manga panel {Number}"
+        },
+        "effect": {
+          "sound_effect": "Japanese onomatopoeia lettering drawn over this manga panel {String}"
+        }
+      },
+      "COMIC_STRIP": {
+        "page": {
+          "title": "The comic strip title printed above the panels {String}"
+        },
+        "panel": {
+          "panel_index": "Left to right strip panel order index {Number}"
+        },
+        "narration": {
+          "aside": "Punchline caption printed under the final strip panel {String}"
+        }
+      },
+      "GRAPHIC_NOVEL": {
+        "page": {
+          "title": "The graphic novel title printed on this page {String}",
+          "credits": "Writer, penciller, inker, colourist and letterer credit line {String}"
+        },
+        "narration": {
+          "narration": "Prose narration caption box in this graphic novel page {String}"
+        }
+      },
+      "STORYBOARD": {
+        "page": {
+          "title": "Production or scene title printed on this storyboard sheet {String}"
+        },
+        "panel": {
+          "panel_caption": "Shot description written beside this storyboard frame {String}",
+          "scene_time": "Shot duration or timing note written on this storyboard frame {String}"
+        }
+      },
+      "ILLUSTRATION": {
+        "page": {
+          "title": "Artwork title printed on this illustration {String}",
+          "credits": "Artist signature or handle drawn on this illustration {String}"
+        }
+      }
+    }
+  },
   "trade_schema": {
     "base": {
       "header": {
@@ -941,6 +1051,42 @@
       "review": ["goods", "order"]
     },
     "multilingual_value_anchor": {
+      "comics.sound_effect": {
+        "semantic": "onomatopoeia, a sound imitating word lettered straight onto the artwork with no balloon around it",
+        "bias": "의성어, 의태어, 효과음, 소리 표현, 울림 글자, 흉내말, onomatopoeia, sound effect lettering, sound word, noise word, impact lettering, 擬音語, 擬態語, 効果音, 象声词, 拟声词, 音效文字"
+      },
+      "comics.dialogue": {
+        "semantic": "a spoken conversational line inside an oval balloon whose tail points at a talking mouth",
+        "bias": "대사, 말풍선 대사, 구어체 문장, 대화문, 회화체, 말하는 문장, spoken dialogue, conversational line, quoted speech, utterance, 台詞, 会話文, 吹き出しの台詞, 对白, 对话, 台词"
+      },
+      "comics.speaker_role": {
+        "semantic": "an interjection or exclamation, a short emotive outburst lettered larger than the surrounding dialogue",
+        "bias": "감탄사, 외침, 탄성, 감탄 표현, 놀람 표현, 부르는 말, 호격, interjection, exclamation, outburst, shout, gasp, 感動詞, 感嘆詞, 叫び声, 感叹词, 语气词, 呼喊"
+      },
+      "comics.thought_balloon": {
+        "semantic": "unspoken inner monologue inside a fluffy cloud outline trailing small round bubbles",
+        "bias": "속마음, 내적 독백, 생각 풍선, 혼잣말, 마음의 소리, 독백, inner monologue, unspoken thought, inner voice, soliloquy, 心の声, モノローグ, 独白, 内心独白, 心理活动, 自言自语"
+      },
+      "comics.narration": {
+        "semantic": "narrator prose in a rectangular caption box with straight corners and no tail",
+        "bias": "내레이션, 지문, 해설, 서술문, 장면 설명, 상황 설명, narration, caption prose, narrator voice, scene description, ナレーション, 地の文, 場面説明, 旁白, 叙述, 场景说明"
+      },
+      "comics.character_name": {
+        "semantic": "a small name label lettered beside a balloon identifying the speaker",
+        "bias": "인물명, 등장인물 이름, 화자 표시, 캐릭터 이름표, 호명, character name label, speaker tag, name plate, 人物名, 話者名, キャラ名, 角色名, 说话人标签, 人名"
+      },
+      "comics.sign_text": {
+        "semantic": "environmental lettering on scenery signage that belongs to the background, not to any character",
+        "bias": "간판 문구, 게시물, 벽보, 안내문, 표지판, 배경 글자, 소품 글씨, shop signage, poster lettering, notice board text, environmental text, background lettering, 看板文字, 掲示物, 貼り紙, 招牌文字, 告示, 背景文字"
+      },
+      "comics.motion_cue": {
+        "semantic": "non textual emotion and motion symbols drawn around a character",
+        "bias": "만화적 기호, 집중선, 속도선, 땀방울, 홍조, 핏대, 별표, 하트 표시, emotion symbol, speed lines, impact burst, sweat drop, blush mark, 漫符, 集中線, 効果線, 汗マーク, 漫画符号, 速度线, 汗滴"
+      },
+      "comics.emphasis": {
+        "semantic": "words lettered bolder or larger than the rest of the line for stress",
+        "bias": "강조 표현, 굵은 글씨, 확대 글자, 어조 강조, 힘준 말, emphasis lettering, bold word, enlarged word, stressed syllable, 強調文字, 太字, 強調表現, 强调, 加粗, 重音"
+      },
       "goods.title": {
         "semantic": "the concrete name of a physical product a shopper searches for",
         "bias": "product name, item name, goods name, clothing, apparel, garment, knitwear, knit, cardigan, sweater, coat, jacket, shirt, pants, dress, shoes, bag, accessory, electronics, gadget, appliance, furniture, cosmetics, food, 상품명, 제품명, 품목명, 의류, 옷, 니트, 가디건, 스웨터, 코트, 자켓, 셔츠, 바지, 원피스, 신발, 가방, 액세서리, 가전, 가구, 화장품, 식품, 商品名, 製品名, 衣類, ニット, カーディガン, セーター, コート, 商品名称, 服装, 针织, 开衫, 毛衣, 外套, nombre del producto, ropa, prenda, punto, cárdigan, suéter, abrigo, nom du produit, vêtement, tricot, cardigan, pull, manteau, produktname, kleidung, strick, strickjacke, pullover, mantel, nome do produto, roupa, malha, casaco, nome del prodotto, abbigliamento, maglia, maglione, cappotto, название товара, одежда, трикотаж, кардиган, свитер, пальто, اسم المنتج, ملابس, تريكو, كارديجان, سترة, معطف, उत्पाद का नाम, कपड़े, बुना हुआ, कार्डिगन, स्वेटर, कोट, ชื่อสินค้า, เสื้อผ้า, ถักนิตติ้ง, คาร์ดิแกน, เสื้อกันหนาว, เสื้อโค้ท, tên sản phẩm, quần áo, áo len, áo cardigan, áo khoác, nama produk, pakaian, rajut, kardigan, sweter, mantel",

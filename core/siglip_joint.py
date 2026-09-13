@@ -49,7 +49,7 @@ class Siglip2Joint:
         label: str = "siglip2",
         log=None,
         max_patches: int = DEFAULT_MAX_PATCHES,
-        fp8_weights: bool = False,
+        fp8_weights: bool = True,
     ):
         from transformers import AutoConfig, AutoModel, AutoTokenizer
 
@@ -107,6 +107,8 @@ class Siglip2Joint:
         )
 
         self._param_dtype = next(self.model.parameters()).dtype
+        self.discriminative = True
+        self.probe_margin = 0.0
 
         if fp8_weights and self.device.type == "cuda":
             from . import fp8 as _fp8
@@ -325,10 +327,21 @@ class Siglip2Joint:
         if dev.type == "cpu":
             return
         try:
-            nbytes = sum(
-                p.numel() * p.element_size()
-                for p in self.vision_model.parameters()
-            )
+            seen = set()
+            nbytes = 0
+            for t in list(self.vision_model.parameters()) + list(
+                self.vision_model.buffers()
+            ):
+                if t is None:
+                    continue
+                try:
+                    key = t.data_ptr()
+                except Exception:
+                    key = id(t)
+                if key in seen:
+                    continue
+                seen.add(key)
+                nbytes += int(t.numel()) * int(t.element_size())
         except Exception:
             nbytes = 0
         self.vision_model.to("cpu")
@@ -462,12 +475,29 @@ class Siglip2Joint:
         probe = diagnostics.probe_space(self.label, self.encode_text, emit)
         report["probe"] = probe
         report["patches"] = n_patch
-        report["ok"] = True
 
+        verdict = str(probe.get("verdict") or "")
+        self.discriminative = verdict != "붕괴"
+        self.probe_margin = float(probe.get("margin") or 0.0)
+
+        if verdict == "붕괴":
+            raise RuntimeError(
+                f"[{self.label}] 공간 변별폭 {self.probe_margin:+.4f} — "
+                f"이 인코더로는 앵커를 구분할 수 없습니다."
+            )
+
+        report["ok"] = True
+        mark = "통과" if verdict == "양호" else f"통과(변별력 {verdict})"
         emit(
-            f"  🧭 [{self.label}] 자가검진 통과 — 텍스트/패치 모두 "
-            f"{int(self.dim)}차원 단일 공간, 패치 {n_patch}개"
+            f"  🧭 [{self.label}] 자가검진 {mark} — 텍스트/패치 모두 "
+            f"{int(self.dim)}차원 단일 공간, 패치 {n_patch}개 "
+            f"| 변별폭 {self.probe_margin:+.4f}"
         )
+        if verdict == "빈약":
+            emit(
+                f"  ⚠ [{self.label}] 변별폭이 낮습니다. 영어 앵커를 쓰는 "
+                f"스키마에서는 분류 마진이 좁아집니다."
+            )
         return report
 
     def unload(self):

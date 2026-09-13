@@ -99,6 +99,27 @@ def convert_linear_to_fp8(
             )
         return stats
 
+    def _footprint(mod) -> int:
+        total = 0
+        seen = set()
+        try:
+            for _n, t in list(mod.named_parameters()) + list(mod.named_buffers()):
+                if t is None:
+                    continue
+                try:
+                    key = t.data_ptr()
+                except Exception:
+                    key = id(t)
+                if key in seen:
+                    continue
+                seen.add(key)
+                total += int(t.numel()) * int(t.element_size())
+        except Exception:
+            return 0
+        return total
+
+    before_bytes = _footprint(root)
+
     skip = tuple(skip_names or ())
     targets: List[Tuple[nn.Module, str, nn.Linear]] = []
 
@@ -127,11 +148,19 @@ def convert_linear_to_fp8(
         except Exception:
             stats["skipped"] += 1
 
+    after_bytes = _footprint(root)
+    actual = max(0, before_bytes - after_bytes) / 1e6
+    stats["before_mb"] = before_bytes / 1e6
+    stats["after_mb"] = after_bytes / 1e6
+    stats["actual_mb"] = actual
+
     if log is not None:
         log(
             f"  🧊 [FP8] Linear {stats['converted']}개 fp8(E4M3) 저장 전환 "
             f"| 건너뜀 {stats['skipped']}개 "
-            f"| 절감 {stats['saved_bytes'] / 1e6:.0f} MB"
+            f"| 예상 절감 {stats['saved_bytes'] / 1e6:.0f} MB "
+            f"| 실측 {before_bytes / 1e6:.0f} → {after_bytes / 1e6:.0f} MB "
+            f"({actual:.0f} MB 절감)"
         )
         log(f"  🧊 [FP8] {capability_report()}")
     return stats

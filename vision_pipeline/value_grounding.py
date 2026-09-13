@@ -5,6 +5,14 @@ import numpy as np
 from .doc_type_nms import gumbel_expected_z
 from .patch_grid import VisionPatchGrid
 
+MIN_VERIFY_CHARS = 4
+CROSS_CROP_MARGIN = 0.50
+WEAK_SPACE_STD = 0.010
+
+
+def _alnum_len(text: str) -> int:
+    return sum(1 for ch in str(text or "") if ch.isalnum())
+
 
 class GroundingClaim:
     def __init__(
@@ -13,11 +21,15 @@ class GroundingClaim:
         field: str,
         value: str,
         bbox: Tuple[int, int, int, int],
+        trusted: bool = False,
+        is_array: bool = False,
     ):
         self.category = category
         self.field = field
         self.value = value
         self.bbox = tuple(int(v) for v in bbox)
+        self.trusted = bool(trusted)
+        self.is_array = bool(is_array)
 
 
 class GroundingVerdict:
@@ -141,9 +153,54 @@ def verify_claims(
             vec_map[i] = _unit(mat[k])
 
     dropped = 0
+    skipped = 0
+
+    global_std = float(np.std(grid.embeddings)) if grid.embeddings.size else 0.0
+    weak_space = global_std < WEAK_SPACE_STD
+    if weak_space and log is not None:
+        log.append(
+            f"  ⏭ [GROUNDING] 패치 공간 표준편차 {global_std:.4f} 가 너무 낮아 "
+            f"접지 판정을 보류합니다."
+        )
 
     for i, claim in enumerate(claims):
         if not claim.value.strip():
+            continue
+
+        if claim.trusted:
+            skipped += 1
+            if log is not None:
+                log.append(
+                    f"  🤝 [TRUSTED] '{claim.field}' = \"{claim.value[:30]}\" "
+                    f"— 같은 크롭 이미지에서 직접 판독한 값이라 검증을 "
+                    f"건너뜁니다."
+                )
+            out.append(
+                GroundingVerdict(
+                    claim.category, claim.field, claim.value, 0.0, 0.0,
+                    accepted=True, reason="크롭 직접 판독 — 검증 면제",
+                )
+            )
+            continue
+
+        if _alnum_len(claim.value) < MIN_VERIFY_CHARS:
+            skipped += 1
+            out.append(
+                GroundingVerdict(
+                    claim.category, claim.field, claim.value, 0.0, 0.0,
+                    accepted=True, reason="문자 수 부족 — 검증 보류",
+                )
+            )
+            continue
+
+        if weak_space:
+            skipped += 1
+            out.append(
+                GroundingVerdict(
+                    claim.category, claim.field, claim.value, 0.0, 0.0,
+                    accepted=True, reason="공간 변별력 부족 — 검증 보류",
+                )
+            )
             continue
 
         vec = vec_map.get(i)
@@ -186,41 +243,50 @@ def verify_claims(
         else:
             s_out = -np.inf
 
-        if s_in <= 0.0:
-            dropped += 1
-            if log is not None:
-                log.append(
-                    f"  🚫 UNGROUNDED '{claim.field}' = \"{claim.value[:30]}\" "
-                    f"(in {s_in:+.4f} ≤ 0) → 폐기"
-                )
+        if not np.isfinite(s_out) or s_in >= s_out:
             out.append(
                 GroundingVerdict(
                     claim.category, claim.field, claim.value, s_in, s_out,
-                    accepted=False, reason="크롭 내부 접지 실패", top_patch=top_patch,
+                    accepted=True, reason="접지 확인", top_patch=top_patch,
                 )
             )
             continue
 
-        reason = "접지 확인"
-        if s_out > s_in:
-            reason = "다른 영역 소유 가능"
+        gap = float(s_out - s_in)
+        if gap < CROSS_CROP_MARGIN:
             if log is not None:
                 log.append(
                     f"  ⚠️ CROSS-CROP '{claim.field}' = \"{claim.value[:30]}\" "
-                    f"(in {s_in:+.4f} < out {s_out:+.4f})"
+                    f"(in {s_in:+.4f} < out {s_out:+.4f}, 격차 {gap:.2f} < "
+                    f"{CROSS_CROP_MARGIN:.2f}) → 유지"
                 )
+            out.append(
+                GroundingVerdict(
+                    claim.category, claim.field, claim.value, s_in, s_out,
+                    accepted=True, reason="다른 영역 소유 가능", top_patch=top_patch,
+                )
+            )
+            continue
 
+        dropped += 1
+        if log is not None:
+            log.append(
+                f"  🚫 UNGROUNDED '{claim.field}' = \"{claim.value[:30]}\" "
+                f"— 이 크롭(in {s_in:+.4f})보다 다른 영역(out {s_out:+.4f})이 "
+                f"{gap:.2f} 더 잘 맞습니다 → 폐기"
+            )
         out.append(
             GroundingVerdict(
                 claim.category, claim.field, claim.value, s_in, s_out,
-                accepted=True, reason=reason, top_patch=top_patch,
+                accepted=False, reason="다른 영역이 더 잘 맞음", top_patch=top_patch,
             )
         )
 
     if log is not None:
         log.append(
             f"  ✅ VALUE GROUNDING 검증 {len(out)}건 / "
-            f"유지 {len(out) - dropped} / 폐기 {dropped}"
+            f"유지 {len(out) - dropped} / 폐기 {dropped} "
+            f"/ 보류 {skipped}"
         )
 
     return out
@@ -231,8 +297,16 @@ def apply_verdicts(
     verdicts: Sequence[GroundingVerdict],
 ) -> Dict[str, object]:
     drop = {v.field for v in verdicts if not v.accepted}
+    keep = {v.field for v in verdicts if v.accepted}
     out = dict(record)
     for f in drop:
+        if f in keep:
+            continue
+        if f.startswith("__"):
+            continue
+        cur = out.get(f)
+        if isinstance(cur, (list, tuple)):
+            continue
         if f in out:
             out[f] = None
     return out

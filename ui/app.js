@@ -11,6 +11,23 @@ function waitForApi(callback) {
   }
 }
 
+function onJobState(info) {
+  const btn = document.querySelector('#btn-run');
+  if (!btn) return;
+  if (info.phase === 'wait') {
+    btn.disabled = true;
+    btn.dataset.label = btn.dataset.label || btn.textContent;
+    btn.textContent = '대기 중… (' + info.waiting + '건)';
+  } else if (info.phase === 'start') {
+    btn.disabled = true;
+    btn.dataset.label = btn.dataset.label || btn.textContent;
+    btn.textContent = info.title + ' 진행 중…';
+  } else {
+    btn.disabled = false;
+    if (btn.dataset.label) btn.textContent = btn.dataset.label;
+  }
+}
+
 let modelBusy = false;
 let lastStatus = null;
 
