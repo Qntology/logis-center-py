@@ -55,6 +55,8 @@ from core.llm import (
     resolve_joint_path,
     resolve_refiner_path,
 )
+from core import memory as memory_mod
+from core import paddle_bootstrap
 from core.phrase_cache import CachedEmbedder
 from core.model_manager import (
     BOOTSTRAP_LANGUAGES,
@@ -78,6 +80,11 @@ from core.model_manager import (
     missing_core_models,
     missing_lang_models,
     missing_models,
+    paddle_ocr_note,
+    paddle_ocr_script_hint,
+    paddle_ocr_slug,
+    ppocr_det_ready,
+    ppocr_ready,
     save_active_language,
     stanza_ready,
 )
@@ -100,9 +107,14 @@ class NMSOcrApp:
         auto_fetch: bool = True,
         vram_budget: float = 0.0,
         force_low_vram: bool = False,
+        paddle_autoinstall: bool = True,
     ):
         self._external_log = log
         self.log_lines: List[str] = []
+        self.paddle_autoinstall = bool(paddle_autoinstall)
+        if not self.paddle_autoinstall:
+            os.environ[paddle_bootstrap.ENV_AUTO] = "0"
+        paddle_bootstrap.configure_runtime()
 
         self.vram_budget = float(vram_budget or 0.0)
         if self.vram_budget <= 0.0:
@@ -142,11 +154,12 @@ class NMSOcrApp:
         self.active_codes: List[str] = list(BOOTSTRAP_LANGUAGES)
         self._embedder_slots: Dict[str, str] = {}
         self._primary_embedder_slot: str = ""
-        self._hayai_provider_registered: bool = False
+        self._ocr_code: str = ""
+        self._doc_script: str = ""
         self._joint_registered: bool = False
         self.joint_label: str = ""
         self.joint_dim: int = 0
-        self.prefer_grid: str = "ocr"
+        self.prefer_grid: str = "joint"
 
         self.current_image: Optional[Image.Image] = None
         self.current_path: str = ""
@@ -277,6 +290,21 @@ class NMSOcrApp:
         }
 
     def _log_vram_profile(self):
+        for line in memory_mod.report_lines():
+            self._log(line)
+
+        room = memory_mod.usable_ram_gb()
+        if 0.0 < room < 6.0:
+            self._log(
+                f"  ⚠️ 가용 시스템 RAM 이 {room:.1f} GB 뿐입니다. "
+                f"4B 정제 LLM 은 가중치를 RAM 에 먼저 펼치므로 "
+                f"로드가 중단될 수 있습니다."
+            )
+            self._log(
+                "     다른 프로그램을 닫거나, Windows 가상 메모리를 "
+                "늘리거나, 더 작은 모델을 쓰세요."
+            )
+
         if self.vram_budget <= 0.0:
             self._log("  💻 CPU 모드 — VRAM 프로파일을 적용하지 않습니다.")
             return
@@ -287,8 +315,12 @@ class NMSOcrApp:
                 "  ⚠️ 저VRAM 모드: 정제 LLM 은 지연 로드 + 양자화/오프로드로 실행합니다."
             )
             self._log(
-                "     Qwen3.5-2B(fp16 ≈ 4.0GB)가 예산을 초과하면 "
-                "OCR 원문으로 자동 폴백합니다."
+                "     Qwen3.5-4B(fp16 ≈ 8.6GB / 4bit ≈ 3.1GB)가 예산을 "
+                "초과하면 OCR 원문으로 자동 폴백합니다."
+            )
+            self._log(
+                "     4B 는 2B 보다 유사 글자 변별이 좋지만 4GB 카드에서는 "
+                "4bit 양자화가 필수입니다: pip install bitsandbytes"
             )
 
     def check_models(self) -> dict:
@@ -345,10 +377,6 @@ class NMSOcrApp:
             from core.embedding import AXVEEmbedder
             return AXVEEmbedder(str(ensure_model_dir("ax-ve")))
 
-        def _load_ocr():
-            from core.ocr import HayaiOCR
-            return HayaiOCR(str(ensure_model_dir("hayai")))
-
         joint_path, joint_label, joint_code = resolve_joint_path(
             self.lang_code, self.active_codes
         )
@@ -384,16 +412,126 @@ class NMSOcrApp:
                 self.crossover.slots.pop(SLOT_VISION, None)
                 self._log("  ⏭ A.X-VE 는 SigLIP2 조인트로 대체되어 등록하지 않습니다.")
         else:
-            self.prefer_grid = "ocr"
+            self.prefer_grid = "vision"
             if SLOT_VISION not in self.crossover.slots:
                 self.crossover.register(SLOT_VISION, _load_vision, est_gb=0.9)
             self._log(
-                "  ⚠ SigLIP2 언어 텍스트 타워를 찾지 못해 Hayai 토큰 임베딩으로 "
-                "조인트 공간을 대체합니다. 필드 친화도 변별력이 크게 떨어집니다."
+                "  ⚠ SigLIP2 언어 텍스트 타워를 찾지 못해 A.X-VE 격자로 "
+                "내려갑니다. PP-OCRv5 rec 는 인식 전용이라 패치 격자를 "
+                "제공하지 않습니다."
             )
 
-        if SLOT_OCR not in self.crossover.slots:
-            self.crossover.register(SLOT_OCR, _load_ocr, est_gb=0.7)
+        self._register_ocr_slot()
+
+    def _pick_ocr_code(self) -> str:
+        pool: List[str] = []
+        if self.language_resolved and self.lang_code:
+            pool.append(self.lang_code)
+        pool.extend(self.active_codes)
+        pool.extend(BOOTSTRAP_LANGUAGES)
+
+        for c in pool:
+            if c and ppocr_ready(c):
+                return normalize_lang_code(c)
+        return normalize_lang_code(pool[0] if pool else DEFAULT_LANGUAGE)
+
+    def _register_ocr_slot(self):
+        if SLOT_OCR in self.crossover.slots:
+            return
+
+        code = self._ocr_code or self._pick_ocr_code()
+        self._ocr_code = code
+
+        def _load_ocr(c=code):
+            from core.ppocr import PaddleOCRRec
+            rec = PaddleOCRRec(c, log=self._log)
+            try:
+                rec.attach_detector()
+            except Exception as e:
+                self._log(f"  ⏭ 검출기 결합 생략 ({e})")
+            return rec
+
+        slug = paddle_ocr_slug(code)
+        self.crossover.register(
+            SLOT_OCR,
+            _load_ocr,
+            label=f"PP-OCRv5 rec [{slug or 'ch'}]",
+            est_gb=0.25,
+        )
+
+        note = paddle_ocr_note(code)
+        if note:
+            self._log(f"  ℹ OCR 언어 대체: {note}")
+        if not ppocr_det_ready():
+            self._log(
+                "  ℹ PP-OCRv5 검출 모델(base:ppocr-det)이 없어 크롭 경계 "
+                "스냅은 영상처리 폴백으로 동작합니다. 환경설정에서 받으면 "
+                "글자 잘림이 더 줄어듭니다."
+            )
+
+    def _rebind_ocr(self, code: str) -> bool:
+        code = normalize_lang_code(code or DEFAULT_LANGUAGE)
+        if code == self._ocr_code and self.crossover.get(SLOT_OCR) is not None:
+            return True
+
+        self.crossover.release(SLOT_OCR)
+        self.crossover.slots.pop(SLOT_OCR, None)
+        self._ocr_code = code
+        self._register_ocr_slot()
+
+        try:
+            self.crossover.acquire(SLOT_OCR)
+            return True
+        except Exception as e:
+            self._log(f"  ⚠ PP-OCRv5 rec '{code}' 로드 실패: {e}")
+            return False
+
+    def _pick_detection_ocr(self, image) -> str:
+        codes = [
+            c for c in dict.fromkeys(
+                list(self.active_codes) + list(BOOTSTRAP_LANGUAGES)
+            ) if c and ppocr_ready(c)
+        ]
+
+        if not codes:
+            self._log(
+                "  ⏭ 설치된 PP-OCRv5 rec 가 없어 OCR 표본을 만들 수 없습니다."
+            )
+            return ""
+
+        if len(codes) == 1 or image is None:
+            self._rebind_ocr(codes[0])
+            return codes[0]
+
+        self._log(
+            f"  🔤 OCR 후보 {len(codes)}종({', '.join(codes)})을 "
+            f"CTC 인식 확신도로 비교합니다."
+        )
+
+        best = ""
+        best_score = -1.0
+        for c in codes:
+            if not self._rebind_ocr(c):
+                continue
+            ocr = self.crossover.get(SLOT_OCR)
+            if ocr is None or not getattr(ocr, "available", False):
+                continue
+            try:
+                score = float(ocr.probe_confidence(image))
+            except Exception as e:
+                self._log(f"     · {c}: 확신도 측정 실패 ({e})")
+                continue
+            self._log(f"     · {c}({paddle_ocr_slug(c)}): 평균 확신도 {score:.4f}")
+            if score > best_score:
+                best = c
+                best_score = score
+
+        if best:
+            self._rebind_ocr(best)
+            self._log(
+                f"  🥇 OCR 언어 '{best}' 선택 (확신도 {best_score:.4f})"
+            )
+        return best
 
     def job_queue(self):
         q = getattr(self, "_job_queue", None)
@@ -413,21 +551,7 @@ class NMSOcrApp:
     def job_stats(self) -> dict:
         return self.job_queue().stats()
 
-    def _hayai_embed_fn(self):
-        def _fn(texts):
-            ocr = self.crossover.get(SLOT_OCR)
-            if ocr is None:
-                ocr = self.crossover.acquire(SLOT_OCR)
-            if ocr is None:
-                return None
-            return ocr.embed_text_batch(texts)
-        return _fn
-
     def _register_embed_provider(self):
-        if not self._hayai_provider_registered:
-            self.router.register("hayai", self._hayai_embed_fn(), priority=10)
-            self._hayai_provider_registered = True
-
         joint_on = SLOT_JOINT in self.crossover.slots
 
         if joint_on and not self._joint_registered:
@@ -443,7 +567,7 @@ class NMSOcrApp:
 
             stale = [
                 n for n in self.vision_router.providers()
-                if n != label and (n.startswith("siglip2") or n == "hayai")
+                if n != label and (n.startswith("siglip2") or n == "text-router")
             ]
             for n in stale:
                 self.vision_router.unregister(n)
@@ -470,14 +594,19 @@ class NMSOcrApp:
 
         if not joint_on:
             self.vision_router.lock_space(0)
-            if "hayai" not in self.vision_router.providers():
+            if "text-router" not in self.vision_router.providers():
                 self.vision_router.register(
-                    "hayai", self._hayai_embed_fn(), priority=100
+                    "text-router", lambda texts: self.router(texts), priority=100
+                )
+                self._log(
+                    "  ⚠ SigLIP2 조인트가 없어 비전 앵커를 텍스트 임베딩으로 "
+                    "대체합니다. 패치 격자와 차원이 다르면 문서 유형 분류가 "
+                    "중단됩니다."
                 )
 
         recipe = (
             f"{self.joint_label or 'siglip2'}-joint"
-            if self._joint_registered else "hayai-joint"
+            if self._joint_registered else "text-router-joint"
         )
 
         probe = self.vision_router(["__dim_probe__"])
@@ -487,7 +616,7 @@ class NMSOcrApp:
         if self._joint_registered and dim <= 1:
             self._log(
                 "  ❌ 조인트 텍스트 인코더가 동작하지 않습니다. "
-                "Hayai 공간으로 되돌립니다."
+                "텍스트 임베딩 공간으로 되돌립니다."
             )
             self._demote_joint()
             return self._register_embed_provider()
@@ -515,18 +644,19 @@ class NMSOcrApp:
         self._joint_registered = False
         self.joint_label = ""
         self.joint_dim = 0
-        self.prefer_grid = "ocr"
+        self.prefer_grid = "vision"
         if SLOT_VISION not in self.crossover.slots:
             def _load_vision():
                 from core.embedding import AXVEEmbedder
                 return AXVEEmbedder(str(ensure_model_dir("ax-ve")))
             self.crossover.register(SLOT_VISION, _load_vision, est_gb=0.9)
-        if "hayai" not in self.vision_router.providers():
+        if "text-router" not in self.vision_router.providers():
             self.vision_router.register(
-                "hayai", self._hayai_embed_fn(), priority=100
+                "text-router", lambda texts: self.router(texts), priority=100
             )
         self._log(
-            "  ↩ 조인트 슬롯을 내리고 Hayai 격자/앵커 단일 공간으로 복귀했습니다."
+            "  ↩ 조인트 슬롯을 내리고 A.X-VE 격자 + 텍스트 앵커로 "
+            "복귀했습니다."
         )
 
     def load_base_models(self) -> dict:
@@ -556,6 +686,14 @@ class NMSOcrApp:
 
         self._register_slots()
 
+        if not paddle_bootstrap.ready():
+            self._log("═══ PP-OCRv5 실행 백엔드 확인 ═══")
+            paddle_bootstrap.ensure_paddle(
+                log=self._log, auto=self.paddle_autoinstall
+            )
+        for line in paddle_bootstrap.report_lines():
+            self._log(line)
+
         if SLOT_JOINT in self.crossover.slots:
             try:
                 self._log("🔄 SigLIP2 조인트(비전-텍스트) 로드 중...")
@@ -581,13 +719,19 @@ class NMSOcrApp:
                 return {"ok": False, "error": str(e)}
 
         try:
-            self._log("🔄 Hayai OCR 로드 중...")
-            self._progress(45, "Hayai OCR 로드 중")
+            self._log(
+                f"🔄 PP-OCRv5 rec 로드 중... "
+                f"(언어 {self._ocr_code or '-'} / "
+                f"{paddle_ocr_slug(self._ocr_code or DEFAULT_LANGUAGE)})"
+            )
+            self._progress(45, "PP-OCRv5 rec 로드 중")
             self.crossover.acquire(SLOT_OCR)
-            self._progress(60, "Hayai OCR 완료")
+            self._progress(60, "PP-OCRv5 rec 완료")
         except Exception as e:
-            self._log(f"❌ Hayai OCR 로드 실패: {e}")
-            return {"ok": False, "error": str(e)}
+            self._log(
+                f"⚠ PP-OCRv5 rec 로드 실패({e}) → OCR 초안 없이 "
+                f"VLM 직접 판독으로 진행합니다."
+            )
 
         self._register_embed_provider()
         self.crossover.phase = PHASE_EMBEDDING
@@ -619,13 +763,12 @@ class NMSOcrApp:
         else:
             self._log("  ⏭ 다국어 임베딩이 없어 Hayai 임베딩으로 판별합니다.")
 
-        if self.crossover.get(SLOT_OCR) is None:
-            self.crossover.acquire(SLOT_OCR)
+        self._pick_detection_ocr(img)
 
-        if self.ocr is not None and not getattr(self.ocr, "vocab_aligned", True):
+        if self.ocr is None or not getattr(self.ocr, "available", False):
             self._log(
-                "  ⚠️ Hayai OCR 토크나이저 어휘가 모델과 어긋나 OCR 표본이 "
-                "예약 토큰으로 나올 수 있습니다. 이 경우 언어 확정은 보류됩니다."
+                "  ⚠️ PP-OCRv5 rec 가 준비되지 않아 OCR 표본 없이 판별합니다. "
+                "유니코드 블록 확정이 불가능하면 기본 언어로 진행합니다."
             )
 
         installed = list(installed_language_codes())
@@ -695,12 +838,18 @@ class NMSOcrApp:
             self.lang_code = verdict.code
             self.language_resolved = True
             self.active_codes = [verdict.code]
+            if verdict.script:
+                self._doc_script = str(verdict.script)
             save_active_language(
                 verdict.code, {"source": "detector", "stage": verdict.stage}
             )
             self._log(
                 f"  🌐 확정 언어: {verdict.code} ({verdict.name}) "
                 f"| script={verdict.script} | margin={verdict.margin:+.4f}"
+            )
+            self._log(
+                f"  🔤 문서 스크립트 래치 '{self._doc_script}' — 행 판독 "
+                f"프롬프트에 이 문자체계를 강제합니다."
             )
         else:
             self.language_resolved = False
@@ -832,6 +981,14 @@ class NMSOcrApp:
             )
         self._sync_registry_language()
 
+        want_ocr = self._pick_ocr_code()
+        if want_ocr and want_ocr != self._ocr_code:
+            self._log(
+                f"  🔤 OCR 언어 재바인딩 '{self._ocr_code or '-'}' → "
+                f"'{want_ocr}' ({paddle_ocr_slug(want_ocr)})"
+            )
+            self._rebind_ocr(want_ocr)
+
         jp, jl, jc = resolve_joint_path(self.lang_code, self.active_codes)
         if jp and jl != self.joint_label:
             old = self.joint_label or "-"
@@ -924,10 +1081,21 @@ class NMSOcrApp:
     def ensure_models_ready(self, fetch: bool = True) -> dict:
         with self._models_lock:
             has_input = self.current_image is not None or bool(self.current_text)
-            need_base = (not self.base_ready) or self.crossover.get(SLOT_OCR) is None
+
+            need_base = not self.base_ready
+            if not need_base:
+                if SLOT_OCR not in self.crossover.slots:
+                    need_base = True
+                elif SLOT_JOINT not in self.crossover.slots and \
+                        SLOT_VISION not in self.crossover.slots:
+                    need_base = True
 
             if need_base or not self.models_ready:
-                self._log("🧩 모델이 준비되지 않아 실행과 함께 자동 로드합니다.")
+                self._log(
+                    f"🧩 모델이 준비되지 않아 실행과 함께 자동 로드합니다. "
+                    f"(base_ready={self.base_ready} / "
+                    f"models_ready={self.models_ready})"
+                )
                 res = dict(self.load_models(fetch=fetch) or {})
                 res["auto_loaded"] = True
                 return res
@@ -974,6 +1142,7 @@ class NMSOcrApp:
         self.language_resolved = False
         self.language = None
         self._language_pending = True
+        self._doc_script = ""
         self._sync_registry_language()
         ext = p.suffix.lower()
 
@@ -1126,27 +1295,37 @@ class NMSOcrApp:
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
-    def classify_document(self) -> dict:
+    def classify_document(self, skip_ready: bool = False) -> dict:
         with self.job_slot("문서 유형 분류"):
-            return self._classify_document_body()
+            return self._classify_document_body(skip_ready=skip_ready)
 
-    def _classify_document_body(self) -> dict:
+    def _classify_document_body(self, skip_ready: bool = False) -> dict:
         if self.current_image is None:
             return {"ok": False, "error": "이미지가 로드되지 않았습니다."}
 
-        ready = self.ensure_models_ready()
-        if not ready.get("ok"):
-            return {
-                "ok": False,
-                "error": ready.get("error", "모델 자동 로드에 실패했습니다."),
-            }
+        if not skip_ready:
+            ready = self.ensure_models_ready()
+            if not ready.get("ok"):
+                return {
+                    "ok": False,
+                    "error": ready.get("error", "모델 자동 로드에 실패했습니다."),
+                }
 
         if not self.ensure_step("doc_type", required=True):
             return {"ok": False, "error": "문서 유형 분류에 필요한 모델이 없습니다."}
 
         self.crossover.enter_embedding_phase()
-        if self.ocr is None:
-            return {"ok": False, "error": "모델이 로드되지 않았습니다."}
+        if self.joint is None and self.embedder is None:
+            if SLOT_JOINT not in self.crossover.slots and \
+                    SLOT_VISION not in self.crossover.slots:
+                return {
+                    "ok": False,
+                    "error": (
+                        "패치 격자 모델이 없습니다. "
+                        "SigLIP2 조인트(lang:siglip2) 또는 A.X-VE(base:ax-ve)를 "
+                        "준비하세요."
+                    ),
+                }
 
         self._log("═══ 문서 유형 분류 (Doc Type NMS) ═══")
 
@@ -1163,7 +1342,7 @@ class NMSOcrApp:
         prefer = self.prefer_grid
         if joint_obj is None and prefer == "joint":
             self._log(
-                "  🚧 조인트 모델이 메모리에 없어 격자를 Hayai 로 되돌립니다. "
+                "  🚧 조인트 모델이 메모리에 없어 격자를 A.X-VE 로 되돌립니다. "
                 "앵커 공간도 함께 되돌려 반쪽 폴백을 막습니다."
             )
             self._demote_joint()
@@ -1214,6 +1393,9 @@ class NMSOcrApp:
             "low_confidence": bool(verdict.needs_llm),
         }
 
+    REFINER_EST_GB_4BIT = 3.1
+    REFINER_EST_GB_FP16 = 8.6
+
     def _ensure_refiner_slot(self) -> bool:
         if SLOT_REFINER in self.crossover.slots:
             return True
@@ -1228,6 +1410,7 @@ class NMSOcrApp:
         budget = self.vram_budget
 
         def _load_refiner():
+            memory_mod.reclaim(log=self._log, label="정제 LLM 적재 전")
             return RefinerLLM(
                 ref_path,
                 label=ref_label,
@@ -1236,11 +1419,26 @@ class NMSOcrApp:
                 budget_gb=budget,
             )
 
+        est = self.REFINER_EST_GB_4BIT if low else self.REFINER_EST_GB_FP16
+        disk = memory_mod.model_disk_gb(ref_path)
+
         self.crossover.register(
-            SLOT_REFINER, _load_refiner, label=ref_label, est_gb=4.2
+            SLOT_REFINER, _load_refiner, label=ref_label, est_gb=est
         )
         mode = "저VRAM(양자화/오프로드)" if low else "표준"
-        self._log(f"  ⏳ [{ref_label}] 정제 LLM 지연 로드 예약 — {mode}")
+        self._log(
+            f"  ⏳ [{ref_label}] 정제 LLM 지연 로드 예약 — {mode} "
+            f"| 예상 VRAM {est:.1f} GB | 가중치 {disk:.1f} GB"
+        )
+
+        stage = disk * 1.2 + memory_mod.RAM_SAFETY_GB
+        room = memory_mod.usable_ram_gb()
+        if room > 0.0 and room < stage:
+            self._log(
+                f"  ⚠️ [RAM] 현재 가용 {room:.1f} GB < 적재에 필요한 "
+                f"{stage:.1f} GB — 정제 LLM 로드 시점에 다른 모델을 "
+                f"먼저 반납합니다."
+            )
         return True
 
     def _refine_fn(self, hint: str = "", schema: Optional[dict] = None):
@@ -1268,6 +1466,58 @@ class NMSOcrApp:
         rows_by_cat: Dict[str, List[dict]] = {}
 
         lang = self.lang_code if self.language_resolved else ""
+        probe_src = self.current_image
+        state = {"script": self._doc_script, "probed": bool(self._doc_script)}
+
+        def _probe_script(obj) -> str:
+            if state["probed"]:
+                return state["script"]
+            state["probed"] = True
+
+            if not getattr(obj, "vision", False) or probe_src is None:
+                return ""
+
+            try:
+                from vision_pipeline.text_upscale import fit_for_vlm
+                small = fit_for_vlm(probe_src.convert("RGB"))
+            except Exception:
+                small = probe_src
+
+            self._log(
+                "    🔤 [SCRIPT PROBE] 문서 전체를 1회 판독해 표기 문자체계를 "
+                "확정합니다. (언어 판별이 실패해 프롬프트에 넣을 스크립트가 "
+                "없습니다)"
+            )
+            try:
+                raw = obj.read_raw(small, hint="writing system probe", max_chars=160)
+            except Exception as e:
+                self._log(f"    ⚠ [SCRIPT PROBE] 실패 ({e})")
+                return ""
+
+            if not raw:
+                self._log("    ⏭ [SCRIPT PROBE] 표본을 얻지 못했습니다.")
+                return ""
+
+            try:
+                from core.lang_codes import block_census
+                census = block_census(raw)
+            except Exception:
+                census = {}
+
+            if not census:
+                return ""
+
+            top = max(census.items(), key=lambda kv: kv[1])[0]
+            state["script"] = top
+            self._doc_script = top
+            brief = " | ".join(
+                f"{k}:{v}" for k, v in sorted(census.items(), key=lambda kv: -kv[1])[:4]
+            )
+            self._log(
+                f"    🔤 [SCRIPT PROBE] 확정 '{top}' — 이후 모든 크롭 "
+                f"프롬프트에 이 문자체계를 강제합니다. ({brief})"
+            )
+            return top
 
         def _fn(category: str, raw_text: str, crop_image, top_field: str = "") -> dict:
             obj = self.crossover.get(SLOT_REFINER)
@@ -1277,9 +1527,17 @@ class NMSOcrApp:
                 return {}
             self.refiner = obj
 
+            script = _probe_script(obj)
+            local_hint = hint
+            if script:
+                local_hint = (
+                    f"{hint} | detected script: {script}" if hint
+                    else f"detected script: {script}"
+                )
+
             spec = specs.get(category)
             if not spec:
-                return obj.refine_field(category, raw_text, hint=hint)
+                return obj.refine_field(category, raw_text, hint=local_hint)
 
             out: dict = {}
 
@@ -1292,8 +1550,9 @@ class NMSOcrApp:
                     )
                 rows = obj.refine_array(
                     category, spec, raw_text,
-                    existing=prev, label_bank=labels, hint=hint,
+                    existing=prev, label_bank=labels, hint=local_hint,
                     image=crop_image, primary_hint=top_field, lang_code=lang,
+                    script=script,
                 )
                 prev.extend(rows)
                 out["__rows__"] = list(prev)
@@ -1311,8 +1570,8 @@ class NMSOcrApp:
                     )
                 got = obj.refine_category(
                     category, spec, raw_text,
-                    claimed=claimed, label_bank=labels, hint=hint,
-                    image=crop_image, lang_code=lang,
+                    claimed=claimed, label_bank=labels, hint=local_hint,
+                    image=crop_image, lang_code=lang, script=script,
                 )
                 for k, v in got.items():
                     claimed.setdefault(k, v)
@@ -1322,13 +1581,48 @@ class NMSOcrApp:
             if not got_any and getattr(obj, "vision", False):
                 ok, why = obj.draft_matches_language(raw_text, lang)
                 if not ok or not str(raw_text or "").strip():
-                    raw = obj.read_raw(crop_image, hint=category)
+                    raw = obj.read_raw(
+                        crop_image, hint=category,
+                        lang_code=lang, script=script,
+                    )
                     if raw:
                         out["__raw__"] = raw
                     elif not ok:
                         self._log(f"    ⚠ [RAW READ] 판독 실패 — {why}")
 
             return out
+
+        return _fn
+
+    def _line_read_fn(self):
+        from vision_pipeline.ocr_extract import read_by_lines
+
+        lang = self.lang_code if self.language_resolved else ""
+        span = int(os.environ.get("NMS_LINE_SPAN", "1") or 1)
+        stride = int(os.environ.get("NMS_LINE_STRIDE", "1") or 1)
+        overlap = int(os.environ.get("NMS_LINE_OVERLAP", "1") or 1)
+
+        def _fn(image, bbox, category, text_boxes, ocr, log):
+            obj = self.crossover.get(SLOT_REFINER)
+            if obj is None:
+                obj = self.crossover.acquire(SLOT_REFINER)
+            if obj is None:
+                return "", [], 0
+            self.refiner = obj
+
+            rec = ocr if ocr is not None else self.ocr
+            if rec is None:
+                rec = self.crossover.get(SLOT_OCR)
+
+            return read_by_lines(
+                image, bbox, obj, category,
+                lang_code=lang,
+                script=self._doc_script,
+                text_boxes=text_boxes,
+                span=span, stride=stride, overlap=overlap,
+                ocr=rec,
+                log=log,
+            )
 
         return _fn
 
@@ -1384,7 +1678,7 @@ class NMSOcrApp:
                 return loaded
             schema = loaded["schema"]
         else:
-            cls = self.classify_document()
+            cls = self._classify_document_body(skip_ready=True)
             if not cls.get("ok"):
                 return cls
             loaded = self.load_schema(cls["schema"])
@@ -1467,10 +1761,34 @@ class NMSOcrApp:
             elif not self._ensure_refiner_slot():
                 self._log("  ⏭ 정제 LLM 슬롯을 등록하지 못해 OCR 원문으로 진행합니다.")
                 use_refiner = False
+            else:
+                try:
+                    self.crossover.acquire(SLOT_REFINER, protect=[SLOT_OCR])
+                except MissingModelError as e:
+                    self._log(f"  ⏭ 정제 LLM 적재 불가 — OCR 원문으로 진행합니다.")
+                    for ln in str(e).splitlines():
+                        self._log(f"     {ln}")
+                    self.crossover.slots.pop(SLOT_REFINER, None)
+                    use_refiner = False
+                except Exception as e:
+                    self._log(
+                        f"  ⏭ 정제 LLM 적재 실패({type(e).__name__}: {e}) "
+                        f"→ OCR 원문으로 진행합니다."
+                    )
+                    self.crossover.slots.pop(SLOT_REFINER, None)
+                    use_refiner = False
 
         self.crossover.enter_embedding_phase()
-        if self.ocr is None:
-            return {"ok": False, "error": "모델이 로드되지 않았습니다."}
+        if self.joint is None and self.embedder is None:
+            if SLOT_JOINT not in self.crossover.slots and \
+                    SLOT_VISION not in self.crossover.slots:
+                return {"ok": False, "error": "패치 격자 모델이 로드되지 않았습니다."}
+
+        if self.ocr is None or not getattr(self.ocr, "available", False):
+            self._log(
+                "  ⚠ PP-OCRv5 rec 를 쓸 수 없어 OCR 초안 없이 "
+                "VLM 직접 판독에 의존합니다."
+            )
 
         self._log("═══ 비전 파이프라인 ═══")
         self._progress(10, "비전 파이프라인 시작")
@@ -1482,17 +1800,56 @@ class NMSOcrApp:
                     SLOT_JOINT, protect=[SLOT_OCR]
                 )
             except Exception as e:
-                self._log(f"  ⚠ 조인트 선획득 실패({e}) → Hayai 격자로 진행")
+                self._log(f"  ⚠ 조인트 선획득 실패({e}) → A.X-VE 격자로 진행")
                 joint_obj = None
 
         prefer = self.prefer_grid
         if joint_obj is None and prefer == "joint":
             self._log(
-                "  🚧 조인트 모델이 메모리에 없어 격자를 Hayai 로 되돌립니다."
+                "  🚧 조인트 모델이 메모리에 없어 격자를 A.X-VE 로 되돌립니다."
             )
             self._demote_joint()
             self._register_embed_provider()
             prefer = self.prefer_grid
+
+        for line in memory_mod.report_lines():
+            self._log(line)
+
+        if SLOT_OCR in self.crossover.slots:
+            rec = self.ocr
+            if rec is None:
+                try:
+                    rec = self.crossover.acquire(SLOT_OCR)
+                except Exception as e:
+                    self._log(f"  ⚠ 전용 인식기 획득 실패({e})")
+                    rec = None
+
+            if rec is not None and getattr(rec, "available", False):
+                self._log(
+                    f"  🔤 행 판독에 전용 인식기를 함께 씁니다 — "
+                    f"{getattr(rec, 'label', 'PP-OCRv5 rec')} "
+                    f"(백엔드 {getattr(rec, 'backend', '-')})"
+                )
+            else:
+                self._log(
+                    "  ⚠ 전용 인식기가 동작하지 않아 행 판독이 VLM 단독으로 "
+                    "진행됩니다."
+                )
+        else:
+            self._log(
+                "  ⚠ 전용 인식기 슬롯이 없어 행 판독이 VLM 단독으로 "
+                "진행됩니다."
+            )
+
+        if not use_refiner:
+            self._log(
+                "  🛟 정제 LLM 이 없으므로 PP-OCRv5 인식 결과를 그대로 "
+                "필드 값으로 씁니다. 구조화 품질은 낮아지지만 판독 "
+                "정확도는 유지됩니다."
+            )
+
+        line_on = str(os.environ.get("NMS_LINE_READ", "1")).strip().lower() \
+            not in ("0", "false", "no", "off")
 
         cfg = VisionPipelineConfig(
             iou_threshold=iou_threshold,
@@ -1501,14 +1858,28 @@ class NMSOcrApp:
             prefer_grid=prefer,
             doc_code=str(schema.get("code") or schema.get("doc_type") or ""),
             source_path=self.current_path,
+            line_read=line_on,
+            line_span=int(os.environ.get("NMS_LINE_SPAN", "1") or 1),
+            line_stride=int(os.environ.get("NMS_LINE_STRIDE", "1") or 1),
+            line_overlap=int(os.environ.get("NMS_LINE_OVERLAP", "1") or 1),
         )
         pipeline = VisionPipeline(
             self.vision_embed_fn, ocr=self.ocr, embedder=self.embedder,
             config=cfg, log=self._log, nlp=self.nlp,
             crossover=self.crossover, joint=joint_obj,
+            line_read_fn=self._line_read_fn() if use_refiner else None,
         )
 
-        hint = f"document language: {language_name(self.lang_code)}"
+        if self.language_resolved:
+            hint = f"document language: {language_name(self.lang_code)}"
+        else:
+            hint = ""
+            self._log(
+                "  🚧 언어가 확정되지 않아 'document language' 힌트를 "
+                "비웁니다. 잘못된 언어를 넣으면 VLM 이 원문을 로마자로 "
+                "음차합니다."
+            )
+
         res = pipeline.run(
             self.current_image, schema,
             refine_fn=self._refine_fn(hint, schema) if use_refiner else None,
@@ -1839,6 +2210,25 @@ class NMSOcrApp:
             "providers": self.router.providers(),
             "vision_providers": self.vision_router.providers(),
             "vision_cache": self.cached_vision.stats() if self.cached_vision else {},
+            "ocr": {
+                "code": self._ocr_code,
+                "slug": paddle_ocr_slug(self._ocr_code or DEFAULT_LANGUAGE),
+                "script_hint": paddle_ocr_script_hint(
+                    self._ocr_code or DEFAULT_LANGUAGE
+                ),
+                "backend": getattr(self.ocr, "backend", ""),
+                "available": bool(getattr(self.ocr, "available", False)),
+                "charset": int(getattr(self.ocr, "charset_size", 0) or 0),
+                "mean_score": float(getattr(self.ocr, "mean_score", 0.0) or 0.0),
+                "det_ready": ppocr_det_ready(),
+                "det_backend": getattr(
+                    getattr(self.ocr, "detector", None), "backend", ""
+                ),
+            },
+            "doc_script": self._doc_script,
+            "paddle": paddle_bootstrap.status(),
+            "ram": memory_mod.ram_info(),
+            "ram_usable_gb": round(memory_mod.usable_ram_gb(), 2),
             "joint": {
                 "label": self.joint_label,
                 "dim": self.joint_dim,
@@ -1879,16 +2269,33 @@ class NMSOcrApp:
         self.nlp = None
         self.cached_router = None
         self.cached_vision = None
+        self._ocr_code = ""
+        self._doc_script = ""
         self.base_ready = False
         self.models_ready = False
 
 
 def run_cli(args) -> int:
+    os.environ["NMS_LINE_SPAN"] = str(max(1, int(args.line_span)))
+    os.environ["NMS_LINE_OVERLAP"] = str(max(0, int(args.line_overlap)))
+    if args.no_line_read:
+        os.environ["NMS_LINE_READ"] = "0"
+    if args.paddle_device:
+        os.environ[paddle_bootstrap.ENV_DEVICE] = str(args.paddle_device)
+    if args.paddle_mkldnn:
+        os.environ[paddle_bootstrap.ENV_MKLDNN] = "1"
+    if args.ram_limit > 0.0:
+        os.environ[memory_mod.ENV_RAM_LIMIT] = f"{float(args.ram_limit):.2f}"
+    if args.allow_low_ram:
+        os.environ[memory_mod.ENV_ALLOW_LOW_RAM] = "1"
+    paddle_bootstrap.configure_runtime()
+
     app = NMSOcrApp(
         crossover_enabled=not args.no_crossover,
         auto_fetch=not args.no_fetch,
         vram_budget=args.vram_budget,
         force_low_vram=args.low_vram,
+        paddle_autoinstall=not args.no_paddle_install,
     )
     app.print_model_report()
     app._log_vram_profile()
@@ -1996,11 +2403,26 @@ def run_ui(args) -> int:
         print("  ℹ 내장 DevTools 가 없습니다. 원격 디버깅 또는 인앱 패널(F12)을 사용하세요.")
         print('     내장 DevTools 사용: pip install -U "pywebview>=5.0"')
 
+    os.environ["NMS_LINE_SPAN"] = str(max(1, int(args.line_span)))
+    os.environ["NMS_LINE_OVERLAP"] = str(max(0, int(args.line_overlap)))
+    if args.no_line_read:
+        os.environ["NMS_LINE_READ"] = "0"
+    if args.paddle_device:
+        os.environ[paddle_bootstrap.ENV_DEVICE] = str(args.paddle_device)
+    if args.paddle_mkldnn:
+        os.environ[paddle_bootstrap.ENV_MKLDNN] = "1"
+    if args.ram_limit > 0.0:
+        os.environ[memory_mod.ENV_RAM_LIMIT] = f"{float(args.ram_limit):.2f}"
+    if args.allow_low_ram:
+        os.environ[memory_mod.ENV_ALLOW_LOW_RAM] = "1"
+    paddle_bootstrap.configure_runtime()
+
     app = NMSOcrApp(
         crossover_enabled=not args.no_crossover,
         auto_fetch=not args.no_fetch,
         vram_budget=args.vram_budget,
         force_low_vram=args.low_vram,
+        paddle_autoinstall=not args.no_paddle_install,
     )
     if dev_info:
         app._log(f"🛠 원격 DevTools: {dev_info['url']} ({dev_info['platform']})")
@@ -2098,6 +2520,25 @@ def run_ui(args) -> int:
         def devtools_status(self):
             return app.devtools_status()
 
+        def paddle_status(self):
+            return paddle_bootstrap.status()
+
+        def ram_status(self):
+            info = memory_mod.ram_info()
+            info["usable_gb"] = round(memory_mod.usable_ram_gb(), 2)
+            return info
+
+        def reclaim_memory(self):
+            with app.job_slot("메모리 회수"):
+                after = memory_mod.reclaim(log=app._log, label="수동 회수")
+                return {"ok": True, "usable_gb": round(after, 2)}
+
+        def install_paddle(self):
+            with app.job_slot("PaddleOCR 백엔드 설치"):
+                return paddle_bootstrap.ensure_paddle(
+                    log=app._log, auto=True, force=True
+                )
+
         def debug_snapshot(self):
             return app.debug_snapshot()
 
@@ -2193,6 +2634,49 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-crossover",
         action="store_true",
         help="페이즈 전환(모델 스위칭) 비활성화 — 전부 상주",
+    )
+    p.add_argument(
+        "--no-paddle-install",
+        action="store_true",
+        help="PaddleOCR 백엔드 자동 설치 비활성화",
+    )
+    p.add_argument(
+        "--line-span",
+        type=int,
+        default=1,
+        help="행 판독 창 하나에 담을 행 수 (기본 1)",
+    )
+    p.add_argument(
+        "--line-overlap",
+        type=int,
+        default=1,
+        help="창 사이 겹칠 행 수 (기본 1, 0 이면 겹침 없음)",
+    )
+    p.add_argument(
+        "--no-line-read",
+        action="store_true",
+        help="행 단위 판독 비활성화 — 크롭 전체를 한 번에 읽습니다",
+    )
+    p.add_argument(
+        "--paddle-device",
+        default="",
+        help="PaddleOCR 실행 장치 (cpu / gpu:0). 기본 cpu",
+    )
+    p.add_argument(
+        "--paddle-mkldnn",
+        action="store_true",
+        help="PaddleOCR oneDNN 가속 강제 활성화 (기본 비활성)",
+    )
+    p.add_argument(
+        "--ram-limit",
+        type=float,
+        default=0.0,
+        help="사용할 시스템 RAM 상한(GB). 0 이면 자동 감지",
+    )
+    p.add_argument(
+        "--allow-low-ram",
+        action="store_true",
+        help="RAM 부족 경고를 무시하고 강행 (프로세스 종료 위험)",
     )
     return p
 

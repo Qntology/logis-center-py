@@ -32,6 +32,11 @@ from .vision_nms import (
     plan_crops,
     build_content_mask,
 )
+from .text_boxes import (
+    box_union,
+    detect_text_boxes,
+    median_text_height,
+)
 from .text_upscale import (
     estimate_text_height,
     text_aware_upscale,
@@ -40,6 +45,7 @@ from .text_upscale import (
 from .ocr_extract import (
     ExtractedField,
     extract_from_crops,
+    read_by_lines,
 )
 from .value_grounding import (
     GroundingClaim,
@@ -78,11 +84,15 @@ __all__ = [
     "extract_components",
     "plan_crops",
     "build_content_mask",
+    "box_union",
+    "detect_text_boxes",
+    "median_text_height",
     "estimate_text_height",
     "text_aware_upscale",
     "crop_region",
     "ExtractedField",
     "extract_from_crops",
+    "read_by_lines",
     "GroundingClaim",
     "GroundingVerdict",
     "verify_claims",

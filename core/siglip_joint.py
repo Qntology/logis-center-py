@@ -308,7 +308,14 @@ class Siglip2Joint:
 
     def attach_vision(self):
         if self.vision_model is None:
-            return
+            if self.model is not None:
+                self.vision_model = getattr(self.model, "vision_model", None)
+            if self.vision_model is None:
+                raise RuntimeError(
+                    f"[{self.label}] 비전 타워가 해제되어 패치 격자를 만들 수 "
+                    f"없습니다. 조인트를 다시 로드해야 합니다."
+                )
+            self._log(f"  🔌 [{self.label}] 비전 타워 복구")
         try:
             dev = next(self.vision_model.parameters()).device
         except StopIteration:
@@ -344,15 +351,32 @@ class Siglip2Joint:
                 nbytes += int(t.numel()) * int(t.element_size())
         except Exception:
             nbytes = 0
-        self.vision_model.to("cpu")
+        try:
+            from .memory import usable_ram_gb
+            room = usable_ram_gb()
+        except Exception:
+            room = 0.0
+
+        need = (nbytes / 1e9) + 0.5
+        if room > 0.0 and room < need:
+            self.vision_model = None
+            self._log(
+                f"  ♻️ [VISION RELEASE] {self.label} 비전 가중치를 완전 "
+                f"해제했습니다 (약 {nbytes / 1e6:.0f} MB) — 가용 RAM "
+                f"{room:.1f} GB 로는 CPU 사본을 둘 수 없습니다."
+                f"{' — ' + reason if reason else ''}"
+            )
+        else:
+            self.vision_model.to("cpu")
+            self._log(
+                f"  ♻️ [VISION RELEASE] {self.label} 비전 가중치를 반납했습니다 "
+                f"(약 {nbytes / 1e6:.0f} MB){' — ' + reason if reason else ''}"
+            )
+
         try:
             torch.cuda.empty_cache()
         except Exception:
             pass
-        self._log(
-            f"  ♻️ [VISION RELEASE] {self.label} 비전 가중치를 반납했습니다 "
-            f"(약 {nbytes / 1e6:.0f} MB){' — ' + reason if reason else ''}"
-        )
 
     @torch.no_grad()
     def embed_image_patches(self, image: Image.Image) -> dict:
@@ -501,12 +525,13 @@ class Siglip2Joint:
         return report
 
     def unload(self):
-        try:
-            self.model.to("cpu")
-        except Exception:
-            pass
         self.model = None
         self.vision_model = None
         self.text_model = None
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        self.tokenizer = None
+        try:
+            from .memory import reclaim
+            reclaim(log=self._log, label=f"{self.label} 반납")
+        except Exception:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()

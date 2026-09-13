@@ -227,14 +227,15 @@ class AXVEEmbedder:
         )
 
     def unload(self):
-        try:
-            self.model.to("cpu")
-        except Exception:
-            pass
         self.model = None
+        self.image_processor = None
         self._loaded = False
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        try:
+            from .memory import reclaim
+            reclaim()
+        except Exception:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
 
 class PatchGrid:

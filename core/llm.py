@@ -5,6 +5,7 @@ import numpy as np
 import torch
 
 from .device import configure_backends, detect_accelerator, select_dtype
+from .memory import can_stage, model_disk_gb, reclaim, usable_ram_gb
 from .model_manager import (
     BOOTSTRAP_LANGUAGES,
     LLM_PATH,
@@ -45,12 +46,114 @@ VISION_PLACEHOLDERS = (
     ("<image>", "", ""),
 )
 
+SCRIPT_OF_LANG: Dict[str, tuple] = {
+    "kor": ("Hangul", "Korean", "한국어 예시: 안녕하세요"),
+    "jpn": ("Kana and Kanji", "Japanese", "日本語の例: こんにちは"),
+    "zho": ("Han", "Chinese", "中文示例: 你好"),
+    "rus": ("Cyrillic", "Russian", "Пример: Привет"),
+    "ukr": ("Cyrillic", "Ukrainian", "Приклад: Привіт"),
+    "ara": ("Arabic", "Arabic", "مثال: مرحبا"),
+    "tha": ("Thai", "Thai", "ตัวอย่าง: สวัสดี"),
+    "hin": ("Devanagari", "Hindi", "उदाहरण: नमस्ते"),
+    "ell": ("Greek", "Greek", "Παράδειγμα: Γειά"),
+    "heb": ("Hebrew", "Hebrew", "דוגמה: שלום"),
+    "tam": ("Tamil", "Tamil", "எடுத்துக்காட்டு: வணக்கம்"),
+    "tel": ("Telugu", "Telugu", "ఉదాహరణ: నమస్కారం"),
+    "eng": ("Latin", "English", ""),
+}
+
+SCRIPT_BY_BLOCK: Dict[str, tuple] = {
+    "Hangul": ("Hangul", "Korean", "한국어 예시: 안녕하세요"),
+    "Kana": ("Kana and Kanji", "Japanese", "日本語の例: こんにちは"),
+    "Han": ("Han", "Chinese", "中文示例: 你好"),
+    "Cyrillic": ("Cyrillic", "Russian", "Пример: Привет"),
+    "Arabic": ("Arabic", "Arabic", "مثال: مرحبا"),
+    "Thai": ("Thai", "Thai", "ตัวอย่าง: สวัสดี"),
+    "Devanagari": ("Devanagari", "Hindi", "उदाहरण: नमस्ते"),
+    "Greek": ("Greek", "Greek", "Παράδειγμα: Γειά"),
+    "Hebrew": ("Hebrew", "Hebrew", "דוגמה: שלום"),
+    "Tamil": ("Tamil", "Tamil", "எடுத்துக்காட்டு: வணக்கம்"),
+    "Telugu": ("Telugu", "Telugu", "ఉదాహరణ: నమస్కారం"),
+    "Latin": ("Latin", "English", ""),
+}
+
+NON_LATIN_SCRIPTS = frozenset({
+    "Hangul", "Kana", "Han", "Cyrillic", "Arabic", "Thai",
+    "Devanagari", "Greek", "Hebrew", "Tamil", "Telugu",
+})
+
+ROMANIZE_RATIO = 0.55
+
+PROMPT_ECHO_MARKERS = (
+    "script rule",
+    "scriptrule",
+    "do not romanize",
+    "do not translate",
+    "do not transliterate",
+    "correct output style",
+    "writing system",
+    "transcribe now",
+    "reproduce every character",
+    "omit it rather than",
+    "is a failure",
+    "separate distinct text blocks",
+    "context:",
+    "region:",
+    "schema:",
+    "hint:",
+)
+
+PROMPT_ECHO_MIN_HITS = 1
+
+
+VISION_ARCH_MARKERS = (
+    "imagetexttotext",
+    "vision2seq",
+    "conditionalgeneration",
+    "vlforconditional",
+    "visionencoderdecoder",
+)
+
 
 def _load_with_dtype(loader, path, dtype, **kwargs):
     try:
         return loader.from_pretrained(path, dtype=dtype, **kwargs)
     except TypeError:
         return loader.from_pretrained(path, torch_dtype=dtype, **kwargs)
+
+
+def _peek_config(model_path: str) -> dict:
+    import json
+    from pathlib import Path as _P
+
+    cfg = _P(model_path) / "config.json"
+    if not cfg.exists():
+        return {}
+    try:
+        return json.loads(cfg.read_text(encoding="utf-8", errors="ignore"))
+    except Exception:
+        return {}
+
+
+def _looks_vision_model(meta: dict) -> Tuple[bool, str]:
+    if not isinstance(meta, dict):
+        return False, ""
+
+    archs = meta.get("architectures")
+    if isinstance(archs, str):
+        archs = [archs]
+    if isinstance(archs, (list, tuple)):
+        for a in archs:
+            low = str(a).lower()
+            for marker in VISION_ARCH_MARKERS:
+                if marker in low:
+                    return True, str(a)
+
+    for key in ("vision_config", "image_token_id", "vision_start_token_id"):
+        if meta.get(key) is not None:
+            return True, f"config.{key}"
+
+    return False, ""
 
 
 class TextEmbedder:
@@ -73,11 +176,20 @@ class TextEmbedder:
         self.dtype = select_dtype(self.device)
         configure_backends(self.device)
 
+        self.weight_gb = model_disk_gb(self.model_path)
+        ok, why = can_stage(self.weight_gb, log=self._log, label=self.label)
+        if not ok:
+            raise MissingModelError(
+                f"[{self.label}] 시스템 메모리가 부족해 로드를 중단했습니다.\n"
+                f"  {why}"
+            )
+
         self.tokenizer = AutoTokenizer.from_pretrained(
             self.model_path, trust_remote_code=True
         )
         self.model = _load_with_dtype(
-            AutoModel, self.model_path, self.dtype, trust_remote_code=True
+            AutoModel, self.model_path, self.dtype,
+            trust_remote_code=True, low_cpu_mem_usage=True,
         )
         self.model.to(self.device)
         self.model.eval()
@@ -133,13 +245,9 @@ class TextEmbedder:
         return mat
 
     def unload(self):
-        try:
-            self.model.to("cpu")
-        except Exception:
-            pass
         self.model = None
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        self.tokenizer = None
+        reclaim(log=self._log, label=f"{self.label} 반납")
 
 
 class RefinerLLM:
@@ -170,11 +278,56 @@ class RefinerLLM:
         self.dtype = select_dtype(self.device)
         configure_backends(self.device)
 
+        self.weight_gb = model_disk_gb(self.model_path)
+
+        quant_ready = False
+        if self.low_vram and self.device.type == "cuda":
+            try:
+                import bitsandbytes  # noqa: F401
+                quant_ready = True
+            except Exception:
+                quant_ready = False
+
+        if quant_ready:
+            self.stage_gb = max(1.5, self.weight_gb * 0.35)
+            self._log(
+                f"  🧮 [{self.label}] 4bit 양자화는 샤드 단위로 스트리밍되어 "
+                f"전량이 동시에 RAM 에 있지 않습니다. 스테이징 추정 "
+                f"{self.stage_gb:.1f} GB (가중치 {self.weight_gb:.1f} GB)"
+            )
+        else:
+            self.stage_gb = self.weight_gb
+
+        ok, why = can_stage(self.stage_gb, log=self._log, label=self.label)
+        if not ok:
+            tip = (
+                "    · pip install bitsandbytes 로 4bit 양자화를 켜면\n"
+                "      스테이징 용량이 크게 줄어듭니다.\n"
+                if not quant_ready else ""
+            )
+            raise MissingModelError(
+                f"[{self.label}] 시스템 메모리가 부족해 로드를 중단했습니다.\n"
+                f"  {why}\n"
+                f"  가중치 {self.weight_gb:.1f} GB 를 GPU 로 올리려면\n"
+                f"  시스템 RAM 에 약 {self.stage_gb:.1f} GB 의 작업 공간이\n"
+                f"  필요합니다.\n"
+                f"  해결 방법:\n"
+                f"{tip}"
+                f"    · 다른 프로그램을 닫아 RAM 을 확보하세요.\n"
+                f"    · Windows 가상 메모리(페이지 파일)를 늘리세요.\n"
+                f"    · 더 작은 모델을 쓰세요.\n"
+                f"    · 강행하려면 set NMS_ALLOW_LOW_RAM=1"
+            )
+        self._log(
+            f"  📊 [{self.label}] 메모리 사전 점검 통과 — {why} "
+            f"| 가중치 {self.weight_gb:.1f} GB / 스테이징 {self.stage_gb:.1f} GB"
+        )
+
         self.tokenizer = AutoTokenizer.from_pretrained(
             self.model_path, trust_remote_code=True
         )
 
-        kwargs = {"trust_remote_code": True}
+        kwargs = {"trust_remote_code": True, "low_cpu_mem_usage": True}
 
         if self.device.type == "cuda":
             if self.low_vram:
@@ -185,39 +338,60 @@ class RefinerLLM:
                     self.load_mode = "4bit"
                 else:
                     kwargs["device_map"] = "auto"
-                    kwargs["low_cpu_mem_usage"] = True
-                    if self.budget_gb > 0:
-                        cap = max(1.0, self.budget_gb - 0.8)
-                        kwargs["max_memory"] = {0: f"{cap:.1f}GiB", "cpu": "16GiB"}
                     self.load_mode = "offload"
+
+                if self.budget_gb > 0:
+                    cap = max(1.0, self.budget_gb - 0.9)
+                    room = max(2.0, usable_ram_gb() - 1.5)
+                    kwargs["max_memory"] = {
+                        0: f"{cap:.1f}GiB",
+                        "cpu": f"{room:.1f}GiB",
+                    }
+                    self._log(
+                        f"  🧮 [{self.label}] 메모리 상한 — GPU {cap:.1f} GiB "
+                        f"/ CPU {room:.1f} GiB"
+                    )
             else:
                 kwargs["device_map"] = "auto"
 
+        meta = _peek_config(self.model_path)
+        want_vision, arch = _looks_vision_model(meta)
+
         self.model = None
-        for loader_name in (
-            "AutoModelForImageTextToText",
-            "AutoModelForVision2Seq",
-        ):
-            try:
-                import transformers as _tf
+
+        if want_vision:
+            import transformers as _tf
+            for loader_name in (
+                "AutoModelForImageTextToText",
+                "AutoModelForVision2Seq",
+            ):
                 loader = getattr(_tf, loader_name, None)
                 if loader is None:
                     continue
-                self.model = _load_with_dtype(
-                    loader, self.model_path, self.dtype, **kwargs
-                )
-                self.vision = True
-                self._log(
-                    f"  👁 [{self.label}] 비전-언어 모델로 로드했습니다 "
-                    f"({loader_name}) — 크롭 이미지를 직접 읽습니다."
-                )
-                break
-            except Exception as e:
-                self._log(
-                    f"  ⏭ [{self.label}] {loader_name} 로드 불가 "
-                    f"({type(e).__name__}: {str(e)[:90]})"
-                )
-                self.model = None
+                try:
+                    self.model = _load_with_dtype(
+                        loader, self.model_path, self.dtype, **kwargs
+                    )
+                    self.vision = True
+                    self._log(
+                        f"  👁 [{self.label}] 비전-언어 모델로 로드했습니다 "
+                        f"({loader_name} | config {arch}) — 크롭 이미지를 "
+                        f"직접 읽습니다."
+                    )
+                    break
+                except Exception as e:
+                    self._log(
+                        f"  ⏭ [{self.label}] {loader_name} 로드 불가 "
+                        f"({type(e).__name__}: {str(e)[:90]})"
+                    )
+                    self.model = None
+                    reclaim(log=self._log, label=f"{self.label} 로더 실패 후")
+        else:
+            self._log(
+                f"  📄 [{self.label}] config 에 비전 아키텍처 표시가 없어 "
+                f"텍스트 전용 경로로 바로 로드합니다 — 불필요한 중복 "
+                f"적재를 건너뜁니다."
+            )
 
         if self.model is None:
             self.model = _load_with_dtype(
@@ -228,6 +402,8 @@ class RefinerLLM:
                 f"  📄 [{self.label}] 텍스트 전용으로 로드했습니다 "
                 f"— OCR 원문만 정제합니다."
             )
+
+        reclaim(log=self._log, label=f"{self.label} 로드 후")
 
         if self.vision:
             try:
@@ -797,6 +973,7 @@ class RefinerLLM:
         image=None,
         primary_hint: str = "",
         lang_code: str = "",
+        script: str = "",
     ) -> List[dict]:
         import json
 
@@ -818,13 +995,15 @@ class RefinerLLM:
 
         lines = [f'    "{k}": <{v or "value"} or null>' for k, v in field_specs.items()]
 
+        directive = self.script_directive(lang_code, script)
+
         if use_vision:
             prompt = (
                 "You read one cropped region of a document or comic image and "
                 "extract every separate occurrence as its own row.\n"
-                "Copy values exactly as printed, in the original script. "
-                "Never translate. Never invent a value.\n"
-                "Printed column headers are NOT values.\n"
+                "Copy values exactly as printed. Never invent a value.\n"
+                + directive
+                + "Printed column headers are NOT values.\n"
                 "If the same field appears several times, emit one object per "
                 "occurrence. Do NOT number the keys.\n"
                 "Every row MUST be wrapped in braces. "
@@ -841,7 +1020,8 @@ class RefinerLLM:
                 "You extract repeated table rows from noisy OCR text of one region "
                 "of a business document.\n"
                 "Copy values verbatim from the OCR TEXT. Never invent a value.\n"
-                "Printed column headers are NOT values. Return one object per row.\n"
+                + directive
+                + "Printed column headers are NOT values. Return one object per row.\n"
                 "Return ONLY a JSON array, no markdown, no reasoning.\n\n"
                 f"REGION: {category}\n"
                 + (f"HINT: {hint}\n" if hint else "")
@@ -951,13 +1131,19 @@ class RefinerLLM:
         split_rows = 0
         bare_rows = 0
 
+        romanized = 0
+
         def _accept(v) -> str:
+            nonlocal romanized
             if isinstance(v, (int, float)) and not isinstance(v, bool):
                 v = str(v)
             if not isinstance(v, str):
                 return ""
             s = v.strip()
             if not s:
+                return ""
+            if self.looks_romanized(s, lang_code, script):
+                romanized += 1
                 return ""
             cs = self._compact(s)
             if not cs or cs in labels:
@@ -1028,6 +1214,13 @@ class RefinerLLM:
             extra.append(f"인덱스 분리 {split_rows}행")
         if bare_rows:
             extra.append(f"값 나열 승격 {bare_rows}건")
+        if romanized:
+            extra.append(f"음차 폐기 {romanized}건")
+            name, _lang, _s = self.script_profile(lang_code, script)
+            self._log(
+                f"    🔤 [ROMANIZE BLOCK] [{category}] {name or '원문'} 스크립트 "
+                f"대신 로마자로 답한 값 {romanized}건을 폐기했습니다."
+            )
         tail = (" | " + " | ".join(extra)) if extra else ""
 
         self._log(
@@ -1047,6 +1240,7 @@ class RefinerLLM:
         hint: str = "",
         image=None,
         lang_code: str = "",
+        script: str = "",
     ) -> Dict[str, str]:
         import json
 
@@ -1079,12 +1273,15 @@ class RefinerLLM:
                 + "\n\n"
             )
 
+        directive = self.script_directive(lang_code, script)
+
         if use_vision:
             prompt = (
                 "You read one cropped region of a business document image and "
                 "extract structured fields.\n"
                 "Copy values exactly as printed. Never invent a value.\n"
-                "Printed form labels are NOT values. If a field is absent, "
+                + directive
+                + "Printed form labels are NOT values. If a field is absent, "
                 "use null.\n"
                 "Return ONLY a JSON object, no markdown, no reasoning.\n\n"
                 f"REGION: {category}\n"
@@ -1098,7 +1295,8 @@ class RefinerLLM:
                 "You extract structured fields from noisy OCR text of one region "
                 "of a business document.\n"
                 "Copy values verbatim from the OCR TEXT. Never invent a value.\n"
-                "Printed form labels are NOT values. If a field is absent, use null.\n"
+                + directive
+                + "Printed form labels are NOT values. If a field is absent, use null.\n"
                 "Return ONLY a JSON object, no markdown, no reasoning.\n\n"
                 f"REGION: {category}\n"
                 + (f"HINT: {hint}\n" if hint else "")
@@ -1174,6 +1372,7 @@ class RefinerLLM:
         label_echo = 0
         halluc = 0
         dup = 0
+        romanized = 0
 
         for key, val in parsed.items():
             if key not in field_specs:
@@ -1187,6 +1386,13 @@ class RefinerLLM:
                 continue
             if self.is_schema_echo(v, key):
                 echo += 1
+                continue
+            if self.looks_romanized(v, lang_code, script):
+                romanized += 1
+                self._log(
+                    f"    🔤 [ROMANIZE BLOCK] [{category}] '{key}' = "
+                    f"\"{v[:36]}\" 는 로마자 음차입니다 — 폐기합니다."
+                )
                 continue
             cv = self._compact(v)
             if not cv:
@@ -1229,7 +1435,7 @@ class RefinerLLM:
             f"    ✅ [{category}] 신규 {len(kept)}건 | 스키마 에코 폐기 "
             f"{echo}건 | 설명문 에코 {spec_echo}건 | 라벨 에코 "
             f"{label_echo}건 | 환각 {halluc}건 | 선점 중복 {dup}건 "
-            f"| 자체 중복 {inner_dup}건"
+            f"| 자체 중복 {inner_dup}건 | 음차 폐기 {romanized}건"
         )
         if not kept and echoed_dup:
             self._log(
@@ -1237,6 +1443,91 @@ class RefinerLLM:
                 f"\"{echoed_dup[:30]}\" 만 남깁니다."
             )
         return kept
+
+    @staticmethod
+    def script_profile(
+        lang_code: str = "",
+        script: str = "",
+    ) -> Tuple[str, str, str]:
+        if script and script in SCRIPT_BY_BLOCK:
+            return SCRIPT_BY_BLOCK[script]
+        code = str(lang_code or "").strip().lower()
+        if code in SCRIPT_OF_LANG:
+            return SCRIPT_OF_LANG[code]
+        return "", "", ""
+
+    @classmethod
+    def script_directive(
+        cls,
+        lang_code: str = "",
+        script: str = "",
+    ) -> str:
+        name, lang, sample = cls.script_profile(lang_code, script)
+        if not name:
+            return (
+                "SCRIPT RULE: Reproduce every character exactly as drawn, "
+                "in the writing system shown in the image. "
+                "Do NOT romanize. Do NOT transliterate. Do NOT translate. "
+                "Do NOT append a translation in parentheses.\n"
+            )
+
+        head = (
+            f"SCRIPT RULE: The text in this image is written in the {name} "
+            f"script ({lang}). Every value you return MUST be written in "
+            f"{name} characters, byte for byte as printed.\n"
+            "  - Do NOT romanize. 'annyeonghaseyo' style output is WRONG.\n"
+            "  - Do NOT translate into English.\n"
+            "  - Do NOT append a translation in parentheses.\n"
+            "  - If you cannot read a character, omit it rather than "
+            "guessing a Latin substitute.\n"
+        )
+        if sample:
+            head += f"  - Correct output style — {sample}\n"
+        return head
+
+    @staticmethod
+    def looks_prompt_echo(text: str) -> Tuple[bool, str]:
+        s = str(text or "").strip().lower()
+        if not s:
+            return False, ""
+
+        flat = "".join(ch for ch in s if not ch.isspace())
+        for marker in PROMPT_ECHO_MARKERS:
+            probe = marker.replace(" ", "")
+            if probe and probe in flat:
+                return True, marker
+        return False, ""
+
+    @staticmethod
+    def looks_romanized(text: str, lang_code: str = "", script: str = "") -> bool:
+        s = str(text or "").strip()
+        if not s:
+            return False
+
+        expect = script
+        if not expect:
+            expect = {
+                "kor": "Hangul", "jpn": "Kana", "zho": "Han",
+                "rus": "Cyrillic", "ukr": "Cyrillic", "ara": "Arabic",
+                "tha": "Thai", "hin": "Devanagari", "ell": "Greek",
+                "heb": "Hebrew", "tam": "Tamil", "tel": "Telugu",
+            }.get(str(lang_code or "").strip().lower(), "")
+
+        if expect not in NON_LATIN_SCRIPTS:
+            return False
+
+        try:
+            from .lang_codes import block_census
+        except Exception:
+            return False
+
+        census = block_census(s)
+        total = sum(census.values())
+        if total < 4:
+            return False
+
+        latin = int(census.get("Latin", 0))
+        return (latin / float(total)) >= ROMANIZE_RATIO
 
     @staticmethod
     def draft_matches_language(draft: str, lang_code: str) -> Tuple[bool, str]:
@@ -1275,15 +1566,22 @@ class RefinerLLM:
             f"({expect} {ratio:.0%})"
         )
 
-    def read_raw(self, image, hint: str = "", max_chars: int = 400) -> str:
+    def read_raw(
+        self,
+        image,
+        hint: str = "",
+        max_chars: int = 400,
+        lang_code: str = "",
+        script: str = "",
+    ) -> str:
         if not self.vision or image is None:
             return ""
 
         prompt = (
             "Transcribe every piece of text visible in this image.\n"
-            "Write the characters exactly as drawn, in their original script. "
-            "Do NOT translate. Do NOT romanize. Do NOT explain.\n"
-            "Separate distinct text blocks with ' / '.\n"
+            "Write the characters exactly as drawn. Do NOT explain.\n"
+            + self.script_directive(lang_code, script)
+            + "Separate distinct text blocks with ' / '.\n"
             "If there is no text, reply with an empty line."
             + (f"\nCONTEXT: {hint}" if hint else "")
         )
@@ -1296,6 +1594,15 @@ class RefinerLLM:
 
         text = self._strip_reasoning(out)
         text = text.replace("```", "").strip()
+
+        echo, marker = self.looks_prompt_echo(text)
+        if echo:
+            self._log(
+                f"    🚯 [PROMPT ECHO] 지시문 '{marker}' 을 그대로 되뱉었습니다 "
+                f"— 판독 실패로 처리합니다: {text[:32]!r}"
+            )
+            return ""
+
         for junk in ("here is", "the text", "transcription:", "i see"):
             if text.lower().startswith(junk):
                 cut = text.find(":")
@@ -1317,6 +1624,38 @@ class RefinerLLM:
         low = text.lower().strip(" .!/")
         if low in ("", "no text", "none", "empty", "n/a", "nothing"):
             self._log("    ⏭ [RAW READ] 글자 없음 응답 — 버립니다.")
+            return ""
+
+        if self.looks_romanized(text, lang_code, script):
+            name, _lang, _s = self.script_profile(lang_code, script)
+            self._log(
+                f"    🔤 [RAW READ] 로마자 음차 응답이라 {name or '원문'} "
+                f"스크립트로 재판독합니다: {text[:32]!r}"
+            )
+            retry = (
+                f"The image contains {name or 'non-Latin'} characters.\n"
+                "Output ONLY those characters. A romanized answer is a "
+                "failure. Do not write any Latin letters unless they are "
+                "literally printed in the image.\n"
+                "Transcribe now:"
+            )
+            try:
+                again = self.generate_with_image(retry, image, max_new_tokens=256)
+            except Exception:
+                again = ""
+            again = self._strip_reasoning(again).replace("```", "").strip()
+
+            echo2, marker2 = self.looks_prompt_echo(again)
+            if echo2:
+                self._log(
+                    f"    🚯 [PROMPT ECHO] 재판독도 지시문 '{marker2}' 을 "
+                    f"되뱉어 버립니다."
+                )
+                return ""
+
+            if again and not self.looks_romanized(again, lang_code, script):
+                return again[:max_chars].strip()
+            self._log("    ⏭ [RAW READ] 재판독도 음차라 버립니다.")
             return ""
 
         return text
@@ -1406,13 +1745,11 @@ class RefinerLLM:
         return {"value": value}
 
     def unload(self):
-        try:
-            self.model.to("cpu")
-        except Exception:
-            pass
         self.model = None
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        self.processor = None
+        self.tokenizer = None
+        self._kv_adapter = None
+        reclaim(log=self._log, label=f"{self.label} 반납")
 
 
 class EmbeddingRouter:
@@ -1619,6 +1956,24 @@ def resolve_refiner_path(
     if _alphaedge_available():
         return str(LLM_PATH), "alphaedge-ai"
     return "", ""
+
+
+def script_of_ocr_lang(lang_code: str) -> str:
+    from .model_manager import paddle_ocr_slug
+    return {
+        "korean": "Hangul",
+        "": "Han",
+        "en": "Latin",
+        "latin": "Latin",
+        "eslav": "Cyrillic",
+        "cyrillic": "Cyrillic",
+        "arabic": "Arabic",
+        "devanagari": "Devanagari",
+        "ta": "Tamil",
+        "te": "Telugu",
+        "el": "Greek",
+        "th": "Thai",
+    }.get(paddle_ocr_slug(lang_code), "")
 
 
 def resolve_joint_path(

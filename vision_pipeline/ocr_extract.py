@@ -4,6 +4,8 @@ from PIL import Image
 
 from .text_upscale import crop_region
 
+LINE_READ_MIN_LINES = 2
+
 from .text_upscale import (
     decide_tile_count,
     fit_for_vlm,
@@ -42,6 +44,8 @@ class ExtractedField:
         self.nlp_meta: dict = {}
         self.field_values: Dict[str, str] = {}
         self.rows: List[dict] = []
+        self.line_texts: List[str] = []
+        self.line_windows: int = 0
 
     @property
     def value(self) -> str:
@@ -68,6 +72,8 @@ class ExtractedField:
             "upscale": round(self.upscale, 3),
             "upscale_mode": self.upscale_mode,
             "tiles": self.tiles,
+            "lines": list(self.line_texts),
+            "windows": self.line_windows,
         }
         if include_image and self.crop_image is not None:
             import base64
@@ -96,10 +102,12 @@ def _ocr_tiles(
     table_rows: int = 0,
     legible: int = 0,
     patches: int = 0,
+    text_boxes: Optional[List[Tuple[int, int, int, int]]] = None,
 ) -> Tuple[str, float, str, int, Optional[Image.Image]]:
     tiles, reason = decide_tile_count(
         image, bbox, max_tiles=max_tiles,
         table_rows=table_rows, legible=legible, patches=patches,
+        text_boxes=text_boxes,
     )
 
     if log is not None:
@@ -109,14 +117,24 @@ def _ocr_tiles(
             f"| 판독가능 {legible}/{patches}"
         )
 
+    usable = ocr is not None and getattr(ocr, "available", False)
+
     if tiles <= 1:
-        crop, factor, mode = prepare_crop(image, bbox, target_px=target_px, log=log)
-        try:
-            text = ocr.ocr_image(crop)
-        except Exception as e:
-            if log is not None:
-                log.append(f"    ⚠ OCR 실패: {e}")
-            text = ""
+        crop, factor, mode = prepare_crop(
+            image, bbox, target_px=target_px, log=log, text_boxes=text_boxes
+        )
+        text = ""
+        if usable:
+            try:
+                text = ocr.ocr_image(crop)
+            except Exception as e:
+                if log is not None:
+                    log.append(f"    ⚠ OCR 실패: {e}")
+        elif log is not None:
+            log.append(
+                f"    ⏭ [{category}] PP-OCRv5 rec 미가동 — OCR 초안 없이 "
+                f"VLM 판독에 맡깁니다."
+            )
         return text, factor, mode, 1, crop
 
     boxes = plan_overlap_tiles(bbox, tiles, overlap_ratio=0.25)
@@ -126,10 +144,14 @@ def _ocr_tiles(
     first_crop: Optional[Image.Image] = None
 
     for i, tb in enumerate(boxes):
-        crop, f, m = prepare_crop(image, tb, target_px=target_px, log=None)
+        crop, f, m = prepare_crop(
+            image, tb, target_px=target_px, log=None, text_boxes=text_boxes
+        )
         if i == 0:
             first_crop = crop
             factor, mode = f, m
+        if not usable:
+            continue
         try:
             txt = ocr.ocr_image(crop)
         except Exception:
@@ -139,6 +161,84 @@ def _ocr_tiles(
             chunks.append(txt)
 
     return "\n".join(chunks), factor, mode, len(boxes), first_crop
+
+
+def read_by_lines(
+    image: Image.Image,
+    bbox: Tuple[int, int, int, int],
+    refiner,
+    category: str,
+    lang_code: str = "",
+    script: str = "",
+    text_boxes: Optional[Sequence[Tuple[int, int, int, int]]] = None,
+    span: int = 1,
+    stride: int = 1,
+    overlap: int = 1,
+    ocr=None,
+    log: Optional[List[str]] = None,
+) -> Tuple[str, List[str], int]:
+    if refiner is None or not getattr(refiner, "vision", False):
+        return "", [], 0
+
+    try:
+        from core.line_reader import read_lines
+    except Exception as e:
+        if log is not None:
+            log.append(f"    ⏭ 행 판독 모듈 로드 실패 ({e})")
+        return "", [], 0
+
+    cropped = crop_region(image, bbox)
+    if cropped.width < 8 or cropped.height < 8:
+        return "", [], 0
+
+    bx0, by0, bx1, by1 = (int(v) for v in bbox)
+    local: List[Tuple[int, int, int, int]] = []
+    for b in (text_boxes or []):
+        if b[0] >= bx1 or b[2] <= bx0 or b[1] >= by1 or b[3] <= by0:
+            continue
+        local.append((
+            max(0, b[0] - bx0), max(0, b[1] - by0),
+            min(cropped.width, b[2] - bx0), min(cropped.height, b[3] - by0),
+        ))
+
+    calls = {"n": 0}
+
+    def _reader(win_img: Image.Image, start: int, end: int) -> str:
+        calls["n"] += 1
+        span_n = max(1, end - start)
+        hint = (
+            f"{category} — line {start + 1}"
+            if span_n == 1
+            else f"{category} — lines {start + 1}~{end}"
+        )
+        try:
+            return refiner.read_raw(
+                win_img, hint=hint, max_chars=160,
+                lang_code=lang_code, script=script,
+            )
+        except Exception:
+            return ""
+
+    ocr_fn = None
+    if ocr is not None and getattr(ocr, "available", False):
+        if hasattr(ocr, "recognize_lines"):
+            def ocr_fn(crops):
+                return ocr.recognize_lines(crops)
+
+    merged, lines, windows = read_lines(
+        cropped, _reader, boxes=local,
+        span=span, stride=stride, overlap=overlap,
+        ocr_fn=ocr_fn, log=log,
+    )
+
+    if log is not None:
+        src = "VLM + 전용 인식기" if ocr_fn is not None else "VLM 단독"
+        log.append(
+            f"    🔁 [LINE READ] '{category}' VLM 호출 {calls['n']}회 "
+            f"({src}) — 한 번에 긴 문장을 읽지 않고 행 단위로 끊었습니다."
+        )
+
+    return merged, [l.text for l in lines if l.text], len(windows)
 
 
 def nlp_clean_ocr(
@@ -199,9 +299,12 @@ def extract_from_crops(
     nlp=None,
     log: Optional[List[str]] = None,
     array_categories: Optional[set] = None,
+    text_boxes: Optional[Sequence[Tuple[int, int, int, int]]] = None,
+    line_read_fn: Optional[Callable] = None,
 ) -> List[ExtractedField]:
     out: List[ExtractedField] = []
     arrays = set(array_categories or ())
+    tboxes = list(text_boxes or [])
 
     for plan in plans:
         if log is not None:
@@ -213,6 +316,7 @@ def extract_from_crops(
             table_rows=int(getattr(plan, "table_rows", 0)),
             legible=int(getattr(plan, "legible", 0)),
             patches=int(getattr(plan, "patches_total", 0)),
+            text_boxes=tboxes,
         )
 
         cleaned, nlp_meta = nlp_clean_ocr(text, nlp=nlp, log=log)
@@ -222,8 +326,38 @@ def extract_from_crops(
                 f"{nlp_meta['lines_out']}줄 ({nlp_meta['dropped']}줄 제거)"
             )
 
-        refined = {}
+        line_texts: List[str] = []
+        windows_n = 0
+        if line_read_fn is not None:
+            try:
+                merged, line_texts, windows_n = line_read_fn(
+                    image, plan.bbox, plan.category, tboxes, ocr, log
+                )
+            except Exception as e:
+                if log is not None:
+                    log.append(f"    ⚠ 행 판독 실패 ({e})")
+                merged = ""
+            if merged and len(line_texts) >= LINE_READ_MIN_LINES:
+                if log is not None:
+                    log.append(
+                        f"    🔀 [DRAFT SWAP] '{plan.category}' 초안을 행 "
+                        f"단위 판독 결과로 교체합니다 "
+                        f"({len(cleaned)}자 → {len(merged)}자 / "
+                        f"{len(line_texts)}행)"
+                    )
+                cleaned = merged
+            elif merged and not cleaned.strip():
+                cleaned = merged
+
+        if not line_texts and cleaned.strip():
+            line_texts = [
+                ln.strip() for ln in cleaned.splitlines() if ln.strip()
+            ]
+
+        refined: Dict[str, object] = {}
         values: Dict[str, str] = {}
+        rows_out: List[dict] = []
+
         if refine_fn is not None:
             vlm_crop = crop
             if vlm_crop is None:
@@ -264,10 +398,36 @@ def extract_from_crops(
                 rowset = refined.get("__rows__")
                 if isinstance(rowset, list):
                     rows_out = [r for r in rowset if isinstance(r, dict) and r]
-                else:
-                    rows_out = []
-            else:
-                rows_out = []
+
+        if refine_fn is None and plan.category in arrays and not rows_out:
+            field_name = str(plan.top_field or plan.category)
+            seen_rows: set = set()
+            for row_text in (line_texts or cleaned.splitlines()):
+                t = str(row_text or "").strip()
+                if len(t) < 2:
+                    continue
+                key = "".join(ch for ch in t.lower() if ch.isalnum())
+                if not key or key in seen_rows:
+                    continue
+                seen_rows.add(key)
+                rows_out.append({field_name: t})
+            if rows_out and log is not None:
+                log.append(
+                    f"    🛟 [OCR ONLY] 정제 LLM 없이 '{plan.category}' 의 "
+                    f"OCR 행 {len(rows_out)}건을 '{field_name}' 값으로 "
+                    f"직접 승격했습니다."
+                )
+
+        if refine_fn is None and plan.category not in arrays and not values:
+            field_name = str(plan.top_field or plan.category)
+            body = cleaned.strip()
+            if len(body) >= 2:
+                values[field_name] = body
+                if log is not None:
+                    log.append(
+                        f"    🛟 [OCR ONLY] 정제 LLM 없이 '{plan.category}' 의 "
+                        f"OCR 원문을 '{field_name}' 값으로 직접 씁니다."
+                    )
 
         field = ExtractedField(
             category=plan.category,
@@ -286,6 +446,8 @@ def extract_from_crops(
         field.nlp_meta = nlp_meta
         field.field_values = values
         field.rows = rows_out if plan.category in arrays else []
+        field.line_texts = list(line_texts)
+        field.line_windows = int(windows_n)
         out.append(field)
 
         if log is not None:

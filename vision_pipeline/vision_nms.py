@@ -396,6 +396,7 @@ def plan_crops(
     table_categories: Optional[set] = None,
     identity_category: str = "",
     title_rows: int = 2,
+    text_boxes: Optional[Sequence[Tuple[int, int, int, int]]] = None,
 ) -> List[CropPlan]:
     if not heatmaps or grid.num_patches == 0:
         return []
@@ -700,8 +701,10 @@ def plan_crops(
     for category, boxes, _peaks, _counts in per_cat:
         by_cat_regions[category] = list(boxes)
 
+    COVERAGE_FLOOR = 0.70
+
     for w in winners:
-        if w.coverage >= 0.5:
+        if w.coverage >= COVERAGE_FLOOR:
             continue
         regions = by_cat_regions.get(w.category) or []
         if len(regions) < 2:
@@ -709,8 +712,8 @@ def plan_crops(
 
         r0, r1, c0, c1 = w.grid_box
         merged_any = False
-        max_r = max(3, int(round(rows * 0.45)))
-        max_c = max(4, int(round(cols * 0.75)))
+        max_r = max(4, int(round(rows * 0.80)))
+        max_c = max(6, int(round(cols * 0.95)))
 
         for gb in sorted(
             regions,
@@ -723,8 +726,6 @@ def plan_crops(
             span_r = nr1 - nr0 + 1
             span_c = nc1 - nc0 + 1
             if span_r > max_r or span_c > max_c:
-                continue
-            if span_r * span_c > area_cap * 3:
                 continue
             r0, r1, c0, c1 = nr0, nr1, nc0, nc1
             merged_any = True
@@ -742,10 +743,40 @@ def plan_crops(
         if log is not None:
             log.append(
                 f"    🧲 [COVERAGE MERGE] '{w.category}' 커버리지 "
-                f"{int(w.coverage * 100)}% → 같은 카테고리 영역 "
-                f"{len(regions)}개를 grid({r0}, {r1}, {c0}, {c1}) 로 합칩니다."
+                f"{int(w.coverage * 100)}% < {int(COVERAGE_FLOOR * 100)}% → "
+                f"같은 카테고리 영역 {len(regions)}개를 "
+                f"grid({r0}, {r1}, {c0}, {c1}) 로 합칩니다."
             )
         _emit(w, tag="CROP REPLAN")
+
+    if text_boxes:
+        from .text_boxes import box_union
+        snapped = 0
+        for w in winners:
+            grown = box_union(text_boxes, w.bbox, overlap_ratio=0.20)
+            if grown is None:
+                continue
+            gx0, gy0, gx1, gy1 = grown
+            bx0, by0, bx1, by1 = w.bbox
+            nx0 = max(0, min(bx0, gx0 - 4))
+            ny0 = max(0, min(by0, gy0 - 4))
+            nx1 = min(grid.orig_width, max(bx1, gx1 + 4))
+            ny1 = min(grid.orig_height, max(by1, gy1 + 4))
+            if (nx0, ny0, nx1, ny1) == w.bbox:
+                continue
+            if log is not None:
+                log.append(
+                    f"    📐 [TEXT SNAP] '{w.category}' 크롭 경계를 검출 "
+                    f"박스에 맞춰 확장합니다. px{w.bbox} → "
+                    f"px({nx0}, {ny0}, {nx1}, {ny1}) — 글자 잘림 방지"
+                )
+            w.bbox = (nx0, ny0, nx1, ny1)
+            snapped += 1
+        if log is not None and snapped:
+            log.append(
+                f"    📐 [TEXT SNAP] {snapped}건의 크롭이 글자 경계 밖으로 "
+                f"확장되었습니다."
+            )
 
     for h in heatmaps:
         if h.category not in present or h.category in taken_categories:

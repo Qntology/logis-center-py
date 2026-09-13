@@ -71,6 +71,10 @@ class VisionPipelineConfig:
         patch_margin: float = 0.12,
         min_territory: int = 2,
         arena_rounds: int = 3,
+        line_read: bool = True,
+        line_span: int = 1,
+        line_stride: int = 1,
+        line_overlap: int = 1,
     ):
         self.iou_threshold = float(iou_threshold)
         self.margin_threshold = float(margin_threshold)
@@ -91,6 +95,10 @@ class VisionPipelineConfig:
         self.patch_margin = float(patch_margin)
         self.min_territory = int(min_territory)
         self.arena_rounds = int(arena_rounds)
+        self.line_read = bool(line_read)
+        self.line_span = int(line_span)
+        self.line_stride = int(line_stride)
+        self.line_overlap = int(line_overlap)
 
 
 class VisionPipelineResult:
@@ -144,6 +152,7 @@ class VisionPipeline:
         nlp=None,
         crossover=None,
         joint=None,
+        line_read_fn: Optional[Callable] = None,
     ):
         self.embed_fn = embed_fn
         self.ocr = ocr
@@ -153,6 +162,7 @@ class VisionPipeline:
         self._log_fn = log or (lambda m: None)
         self.nlp = nlp
         self.crossover = crossover
+        self.line_read_fn = line_read_fn
         self.logs: List[str] = _LiveLog(self._log_fn)
 
     def _phase(self, name: str):
@@ -313,6 +323,13 @@ class VisionPipeline:
                 except Exception as e:
                     self._log(f"  ⚠ 거터 검출 실패({e}) → 거터 없이 진행합니다.")
 
+            tboxes: List = []
+            try:
+                from .text_boxes import detect_text_boxes
+                tboxes = detect_text_boxes(image, ocr=self.ocr, log=self.logs)
+            except Exception as e:
+                self._log(f"  ⏭ 텍스트 박스 검출 생략: {e}")
+
             schema_fields = (schema or {}).get("fields", {}) or {}
             table_cats = set()
             array_cats = set()
@@ -344,6 +361,7 @@ class VisionPipeline:
                 table_categories=table_cats,
                 identity_category=identity_cat,
                 title_rows=max(1, int(grid.rows * self.config.title_suppress_ratio)),
+                text_boxes=tboxes,
             )
             result.plans = plans
             self._log(f"  확정 크롭 {len(plans)}개")
@@ -357,6 +375,20 @@ class VisionPipeline:
             self._refresh_slots()
 
             self._log("═══ STEP 4: Crop + Upscale + OCR ═══")
+            reader = self.line_read_fn if self.config.line_read else None
+            if reader is not None and refine_fn is not None:
+                self._log(
+                    f"  🔁 [LINE READ] 활성 — 창당 {self.config.line_span}행 "
+                    f"/ 보폭 {self.config.line_stride}행 "
+                    f"/ 겹침 {self.config.line_overlap}행"
+                )
+            elif reader is not None:
+                reader = None
+                self._log(
+                    "  ⏭ [LINE READ] 정제 LLM 이 없어 행 판독을 생략하고 "
+                    "PP-OCRv5 인식 결과를 그대로 씁니다."
+                )
+
             fields = extract_from_crops(
                 image, plans, self.ocr,
                 refine_fn=refine_fn,
@@ -366,6 +398,8 @@ class VisionPipeline:
                 nlp=self.nlp,
                 log=self.logs,
                 array_categories=array_cats,
+                text_boxes=tboxes,
+                line_read_fn=reader,
             )
             result.fields = fields
 
@@ -492,8 +526,9 @@ def run_vision_pipeline(
     refine_fn: Optional[Callable[[str, str, Image.Image], dict]] = None,
     nlp=None,
     crossover=None,
+    line_read_fn: Optional[Callable] = None,
 ) -> VisionPipelineResult:
     return VisionPipeline(
         embed_fn, ocr=ocr, embedder=embedder, config=config,
-        log=log, nlp=nlp, crossover=crossover,
+        log=log, nlp=nlp, crossover=crossover, line_read_fn=line_read_fn,
     ).run(image, schema, refine_fn=refine_fn)

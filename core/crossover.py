@@ -52,12 +52,26 @@ def _vram_free_gb() -> float:
 
 def _empty_cache():
     try:
+        from .memory import reclaim
+        reclaim()
+        return
+    except Exception:
+        pass
+    try:
         import torch
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
     except Exception:
         pass
+
+
+def _ram_free_gb() -> float:
+    try:
+        from .memory import usable_ram_gb
+        return usable_ram_gb()
+    except Exception:
+        return 0.0
 
 
 class Slot:
@@ -135,6 +149,7 @@ class CrossoverSwitch:
         self._log_fn = log or (lambda m: None)
         self.transitions: List[dict] = []
         self.evictions: List[dict] = []
+        self._thrash_warned: set = set()
 
     def _log(self, msg: str):
         try:
@@ -160,15 +175,35 @@ class CrossoverSwitch:
 
     EVICT_LAST = (SLOT_JOINT, SLOT_OCR)
 
+    RAM_STAGE_RATIO = 2.4
+    RAM_STAGE_FLOOR = 1.5
+
+    THRASH_WINDOW = 6
+    THRASH_LIMIT = 3
+
     def _make_room_for(self, name: str, protect: Sequence[str]) -> List[str]:
         slot = self.slots.get(name)
         if slot is None or slot.est_gb <= 0.0 or self.budget_gb <= 0.0:
             return []
 
         need = slot.est_gb + self.headroom_gb
+        ram_need = slot.est_gb * self.RAM_STAGE_RATIO + self.RAM_STAGE_FLOOR
+
         free = _vram_free_gb()
-        if free >= need:
+        ram = _ram_free_gb()
+
+        vram_ok = free >= need
+        ram_ok = ram <= 0.0 or ram >= ram_need
+
+        if vram_ok and ram_ok:
             return []
+
+        if not ram_ok:
+            self._log(
+                f"  🧹 [RAM 압박] '{slot.label}' 적재에는 시스템 RAM "
+                f"{ram_need:.1f} GB 가 필요한데 {ram:.1f} GB 뿐입니다. "
+                f"가중치는 GPU 로 가기 전에 RAM 을 먼저 거칩니다."
+            )
 
         protect_set = set(protect) | {name}
         candidates = [
@@ -182,13 +217,31 @@ class CrossoverSwitch:
             )
         )
 
+        recent = [e.get("evicted") for e in self.evictions[-self.THRASH_WINDOW:]]
+
         evicted: List[str] = []
         for cand in candidates:
-            if _vram_free_gb() >= need:
+            if _vram_free_gb() >= need and (
+                _ram_free_gb() <= 0.0 or _ram_free_gb() >= ram_need
+            ):
                 break
+
+            hits = recent.count(cand.name)
+            if hits >= self.THRASH_LIMIT and cand.name not in self._thrash_warned:
+                self._thrash_warned.add(cand.name)
+                self._log(
+                    f"  🔁 [스래싱] '{cand.label}' 이 최근 {self.THRASH_WINDOW}회 "
+                    f"중 {hits}번 반납되었습니다. 메모리가 모든 모델을 담기에 "
+                    f"부족해 같은 모델을 반복해서 올렸다 내리는 중입니다."
+                )
+                self._log(
+                    f"     실행 시간이 크게 늘어납니다. RAM 을 확보하거나 "
+                    f"더 작은 모델을 쓰는 편이 빠릅니다."
+                )
+
             self._log(
-                f"  🧹 [VRAM 압박] '{slot.label}'({slot.est_gb:.1f} GB) 적재를 위해 "
-                f"'{cand.label}'({cand.est_gb:.1f} GB) 를 먼저 반납합니다."
+                f"  🧹 [메모리 압박] '{slot.label}'({slot.est_gb:.1f} GB) 적재를 "
+                f"위해 '{cand.label}'({cand.est_gb:.1f} GB) 를 먼저 반납합니다."
             )
             if self.release(cand.name):
                 evicted.append(cand.name)
@@ -196,14 +249,27 @@ class CrossoverSwitch:
                     "for": name,
                     "evicted": cand.name,
                     "need_gb": round(need, 2),
+                    "ram_need_gb": round(ram_need, 2),
                 })
 
         after = _vram_free_gb()
+        ram_after = _ram_free_gb()
+
         if after < need:
             self._log(
                 f"  ⚠️ VRAM 여유 {after:.2f} GB < 필요 {need:.2f} GB. "
                 f"'{slot.label}' 로드가 실패할 수 있습니다."
             )
+
+        if ram_after > 0.0 and ram_after < ram_need:
+            key = f"ram:{name}"
+            if key not in self._thrash_warned:
+                self._thrash_warned.add(key)
+                self._log(
+                    f"  ⚠️ 시스템 RAM 여유 {ram_after:.1f} GB < 권장 "
+                    f"{ram_need:.1f} GB ('{slot.label}'). 로드가 느려지거나 "
+                    f"실패할 수 있습니다. 같은 경고는 이후 생략합니다."
+                )
         return evicted
 
     def get(self, name: str) -> Optional[object]:
@@ -225,13 +291,21 @@ class CrossoverSwitch:
                 self._make_room_for(name, protect or [])
 
             before = _vram_free_gb()
+            ram_before = _ram_free_gb()
             try:
                 obj = slot.acquire()
                 slot.last_error = ""
             except Exception as e:
                 slot.last_error = str(e)
                 self._log(f"  ❌ [{slot.label}] 로드 실패: {e}")
+                slot.instance = None
                 _empty_cache()
+                ram_after = _ram_free_gb()
+                if ram_before > 0.0:
+                    self._log(
+                        f"  🧹 [RAM] 실패한 적재분 회수 "
+                        f"{ram_before:.1f} → {ram_after:.1f} GB"
+                    )
                 raise
 
             after = _vram_free_gb()
@@ -341,6 +415,7 @@ class CrossoverSwitch:
                 "budget_gb": round(self.budget_gb, 2),
                 "loaded_est_gb": round(self.loaded_estimate_gb(), 2),
                 "vram_free_gb": round(_vram_free_gb(), 3),
+                "ram_free_gb": round(_ram_free_gb(), 2),
                 "slots": {n: s.stats() for n, s in self.slots.items()},
                 "transitions": len(self.transitions),
                 "evictions": len(self.evictions),
@@ -350,7 +425,8 @@ class CrossoverSwitch:
         s = self.stats()
         lines = [
             f"  페이즈: {s['phase']} | 전환 {s['transitions']}회 "
-            f"| VRAM 여유 {s['vram_free_gb']:.2f} GB"
+            f"| VRAM 여유 {s['vram_free_gb']:.2f} GB "
+            f"| RAM 여유 {s['ram_free_gb']:.1f} GB"
         ]
         for name, info in s["slots"].items():
             mark = "ON " if info["loaded"] else "off"

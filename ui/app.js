@@ -1294,7 +1294,7 @@ window.addEventListener("DOMContentLoaded", function () {
               "js-warn"
             );
             appendLog(
-              "   정제 LLM(Qwen3.5-2B)은 양자화/오프로드로 로드되며, " +
+              "   정제 LLM(Qwen3.5-4B)은 4bit 양자화/오프로드로 로드되며, " +
               "부족하면 OCR 원문으로 폴백합니다.",
               "js-info"
             );
