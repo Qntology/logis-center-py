@@ -682,6 +682,70 @@ class PaddleOCRRec:
             out.extend(self._ctc_decode(logits))
         return out
 
+    def _split_lines_boxed(
+        self, image: Image.Image
+    ) -> List[Tuple[Image.Image, Tuple[int, int, int, int]]]:
+        boxes = self.detect_boxes(image)
+
+        kept: List[Tuple[int, int, int, int]] = []
+        for (x0, y0, x1, y1) in boxes:
+            bw = int(x1) - int(x0)
+            bh = int(y1) - int(y0)
+            if bw < 4 or bh < LINE_MIN_HEIGHT:
+                continue
+            if bw >= image.width * 0.95 and bh >= image.height * 0.80:
+                continue
+            kept.append((int(x0), int(y0), int(x1), int(y1)))
+
+        if kept:
+            kept.sort(key=lambda b: (b[1], b[0]))
+            out: List[Tuple[Image.Image, Tuple[int, int, int, int]]] = []
+            for (x0, y0, x1, y1) in kept[:LINE_MAX]:
+                px0 = max(0, x0 - 2)
+                py0 = max(0, y0 - 2)
+                px1 = min(image.width, x1 + 2)
+                py1 = min(image.height, y1 + 2)
+                if px1 - px0 < 4 or py1 - py0 < 4:
+                    continue
+                out.append((image.crop((px0, py0, px1, py1)), (px0, py0, px1, py1)))
+            return out
+
+        shared = split_text_lines(image, boxes=None, log=None)
+        if len(shared) > 1:
+            return [(l.image, tuple(l.bbox)) for l in shared]
+
+        return [(image, (0, 0, image.width, image.height))]
+
+    def recognize_boxed(
+        self, image: Image.Image
+    ) -> List[Tuple[str, float, Tuple[int, int, int, int]]]:
+        if not self.available or image is None:
+            return []
+        if image.width < 4 or image.height < 4:
+            return []
+
+        items = self._split_lines_boxed(image)
+        if not items:
+            return []
+
+        crops = [c for c, _b in items]
+        boxes = [b for _c, b in items]
+        pairs = self.recognize_lines(crops)
+
+        out: List[Tuple[str, float, Tuple[int, int, int, int]]] = []
+        for i, (text, score) in enumerate(pairs):
+            if i >= len(boxes):
+                break
+            t = str(text or "").strip()
+            if not t:
+                continue
+            out.append((t, float(score), boxes[i]))
+
+        if out:
+            self.last_scores = [s for _t, s, _b in out]
+            self.mean_score = float(np.mean(self.last_scores))
+        return out
+
     def ocr_image(
         self,
         image: Image.Image,
@@ -690,19 +754,8 @@ class PaddleOCRRec:
         repetition_penalty: float = 1.0,
         **kwargs,
     ) -> str:
-        if not self.available or image is None:
-            return ""
-        if image.width < 4 or image.height < 4:
-            return ""
-
-        lines = self._split_lines(image)
-        pairs = self.recognize_lines(lines)
-        if pairs:
-            self.last_scores = [s for _t, s in pairs]
-            self.mean_score = (
-                float(np.mean(self.last_scores)) if self.last_scores else 0.0
-            )
-        return "\n".join(t for t, _s in pairs if t.strip())
+        rows = self.recognize_boxed(image)
+        return "\n".join(t for t, _s, _b in rows)
 
     def ocr_crop(
         self,

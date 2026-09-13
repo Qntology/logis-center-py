@@ -5,7 +5,7 @@ import numpy as np
 import torch
 
 from .device import configure_backends, detect_accelerator, select_dtype
-from .memory import can_stage, model_disk_gb, reclaim, usable_ram_gb
+from .memory import can_stage, make_room, model_disk_gb, reclaim, usable_ram_gb
 from .model_manager import (
     BOOTSTRAP_LANGUAGES,
     LLM_PATH,
@@ -299,6 +299,20 @@ class RefinerLLM:
             self.stage_gb = self.weight_gb
 
         ok, why = can_stage(self.stage_gb, log=self._log, label=self.label)
+
+        if not ok:
+            need = self.stage_gb * (1.0 + 0.15) + 1.2
+            self._log(
+                f"  🪜 [{self.label}] 1차 점검 실패 — 강한 회수를 시도한 뒤 "
+                f"다시 판정합니다."
+            )
+            got, room = make_room(
+                need, release_fn=None, log=self._log, label=self.label
+            )
+            if got:
+                ok = True
+                why = f"회수 후 가용 {room:.1f} GB ≥ 필요 {need:.1f} GB"
+
         if not ok:
             tip = (
                 "    · pip install bitsandbytes 로 4bit 양자화를 켜면\n"
@@ -342,7 +356,7 @@ class RefinerLLM:
 
                 if self.budget_gb > 0:
                     cap = max(1.0, self.budget_gb - 0.9)
-                    room = max(2.0, usable_ram_gb() - 1.5)
+                    room = max(1.0, usable_ram_gb() - 1.2)
                     kwargs["max_memory"] = {
                         0: f"{cap:.1f}GiB",
                         "cpu": f"{room:.1f}GiB",
@@ -351,6 +365,18 @@ class RefinerLLM:
                         f"  🧮 [{self.label}] 메모리 상한 — GPU {cap:.1f} GiB "
                         f"/ CPU {room:.1f} GiB"
                     )
+
+                offload = Path(self.model_path).parent / ".offload"
+                try:
+                    offload.mkdir(parents=True, exist_ok=True)
+                    kwargs["offload_folder"] = str(offload)
+                    kwargs["offload_state_dict"] = True
+                    self._log(
+                        f"  💽 [{self.label}] 상한 초과분은 디스크로 "
+                        f"오프로드합니다 — {offload}"
+                    )
+                except Exception as e:
+                    self._log(f"  ⏭ 오프로드 폴더 준비 실패 ({e})")
             else:
                 kwargs["device_map"] = "auto"
 

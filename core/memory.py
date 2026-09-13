@@ -10,8 +10,13 @@ BYTES_GB = 1024.0 ** 3
 RAM_SAFETY_GB = 1.2
 RAM_HEADROOM_RATIO = 0.15
 
+RECLAIM_ROUNDS = 3
+RECLAIM_SETTLE_SEC = 0.15
+TRIM_MIN_GAIN_GB = 0.15
+
 ENV_RAM_LIMIT = "NMS_RAM_LIMIT_GB"
 ENV_ALLOW_LOW_RAM = "NMS_ALLOW_LOW_RAM"
+ENV_NO_TRIM = "NMS_NO_WORKING_SET_TRIM"
 
 
 def _has_psutil() -> bool:
@@ -199,29 +204,123 @@ def report_lines() -> list:
     ]
 
 
-def reclaim(log: Optional[Callable[[str], None]] = None, label: str = "") -> float:
-    before = usable_ram_gb()
+def trim_working_set() -> bool:
+    if str(os.environ.get(ENV_NO_TRIM, "0")).strip().lower() in (
+        "1", "true", "yes", "on"
+    ):
+        return False
+    if not sys.platform.startswith("win"):
+        return False
+    try:
+        import ctypes
+        handle = ctypes.windll.kernel32.GetCurrentProcess()
+        ok = ctypes.windll.psapi.EmptyWorkingSet(handle)
+        if not ok:
+            ok = ctypes.windll.kernel32.SetProcessWorkingSetSizeEx(
+                handle, ctypes.c_size_t(-1), ctypes.c_size_t(-1), 0
+            )
+        return bool(ok)
+    except Exception:
+        return False
 
-    gc.collect()
+
+def _cuda_purge():
     try:
         import torch
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
-            try:
-                torch.cuda.ipc_collect()
-            except Exception:
-                pass
+        if not torch.cuda.is_available():
+            return
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        try:
+            torch.cuda.ipc_collect()
+        except Exception:
+            pass
+        try:
+            torch.cuda.reset_peak_memory_stats()
+        except Exception:
+            pass
     except Exception:
         pass
-    gc.collect()
+
+
+def reclaim(
+    log: Optional[Callable[[str], None]] = None,
+    label: str = "",
+    rounds: int = RECLAIM_ROUNDS,
+    aggressive: bool = True,
+) -> float:
+    import time
+
+    before = usable_ram_gb()
+    trimmed = False
+
+    for i in range(max(1, int(rounds))):
+        gc.collect()
+        _cuda_purge()
+        gc.collect()
+
+        if aggressive and i == 0:
+            trimmed = trim_working_set()
+
+        if i + 1 < int(rounds):
+            time.sleep(RECLAIM_SETTLE_SEC)
+            mid = usable_ram_gb()
+            if before > 0.0 and (mid - before) < TRIM_MIN_GAIN_GB:
+                continue
 
     after = usable_ram_gb()
     gained = max(0.0, after - before)
 
-    if log is not None and gained >= 0.2:
+    if log is not None and gained >= TRIM_MIN_GAIN_GB:
+        tail = " | 작업 집합 트리밍" if trimmed else ""
         log(
             f"  🧹 [RAM] {label or '회수'} — {before:.1f} → {after:.1f} GB "
-            f"(+{gained:.1f} GB)"
+            f"(+{gained:.1f} GB){tail}"
         )
     return after
+
+
+def make_room(
+    need_gb: float,
+    release_fn: Optional[Callable[[], bool]] = None,
+    log: Optional[Callable[[str], None]] = None,
+    label: str = "",
+    max_rounds: int = 6,
+) -> Tuple[bool, float]:
+    need = float(need_gb)
+    room = usable_ram_gb()
+
+    if room <= 0.0 or room >= need:
+        return True, room
+
+    if log is not None:
+        log(
+            f"  🪜 [RAM STAGE] {label} — 필요 {need:.1f} GB / 현재 "
+            f"{room:.1f} GB. 단계적으로 확보합니다."
+        )
+
+    room = reclaim(log=log, label=f"{label} 1단계 회수")
+    if room >= need:
+        return True, room
+
+    if release_fn is None:
+        return False, room
+
+    for i in range(max(1, int(max_rounds))):
+        try:
+            released = bool(release_fn())
+        except Exception:
+            released = False
+
+        if not released:
+            break
+
+        room = reclaim(
+            log=log, label=f"{label} {i + 2}단계 회수", rounds=2
+        )
+        if log is not None:
+            log(f"     · 회차 {i + 1}: 가용 {room:.1f} GB / 목표 {need:.1f} GB")
+        if room >= need:
+            return True, room
+
+    return room >= need, room

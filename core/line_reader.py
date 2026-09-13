@@ -18,6 +18,9 @@ BAND_SPLIT_ROUNDS = 3
 BAND_GATE_STEP = 0.12
 BAND_SPLIT_MIN_H = LINE_MIN_H * 2
 
+VERT_OVERLAP_RATIO = 0.30
+VERT_MERGE_GAP = 2
+
 WINDOW_LINES = 1
 WINDOW_STRIDE = 1
 WINDOW_OVERLAP = 1
@@ -197,6 +200,52 @@ def _refine_tall_bands(
     return cur
 
 
+def _resolve_vertical_overlap(
+    bands: List[Tuple[int, int]]
+) -> List[Tuple[int, int]]:
+    items = sorted(bands, key=lambda b: (b[0], b[1]))
+    if len(items) < 2:
+        return items
+
+    out: List[Tuple[int, int]] = []
+    for y0, y1 in items:
+        if not out:
+            out.append((y0, y1))
+            continue
+
+        py0, py1 = out[-1]
+        if y0 >= py1:
+            out.append((y0, y1))
+            continue
+
+        overlap = py1 - y0
+        span = min(py1 - py0, y1 - y0)
+        if span <= 0:
+            continue
+
+        if overlap >= span * (1.0 - VERT_OVERLAP_RATIO):
+            out[-1] = (min(py0, y0), max(py1, y1))
+            continue
+
+        cut = (py1 + y0) // 2
+        if cut - py0 >= LINE_MIN_H:
+            out[-1] = (py0, cut)
+        if y1 - cut >= LINE_MIN_H:
+            out.append((cut, y1))
+        elif y1 > out[-1][1]:
+            out[-1] = (out[-1][0], y1)
+
+    merged: List[Tuple[int, int]] = []
+    for y0, y1 in out:
+        if merged and y0 - merged[-1][1] <= VERT_MERGE_GAP:
+            if (y1 - merged[-1][0]) <= (y1 - y0) * 1.6:
+                merged[-1] = (merged[-1][0], y1)
+                continue
+        merged.append((y0, y1))
+
+    return [b for b in merged if b[1] - b[0] >= LINE_MIN_H]
+
+
 def _row_bands(image: Image.Image) -> List[Tuple[int, int]]:
     gray = np.asarray(image.convert("L"), dtype=np.float32)
     h, w = gray.shape
@@ -216,7 +265,8 @@ def _row_bands(image: Image.Image) -> List[Tuple[int, int]]:
     if not bands:
         return []
 
-    return _refine_tall_bands(prof, bands)
+    bands = _refine_tall_bands(prof, bands)
+    return _resolve_vertical_overlap(bands)
 
 
 def _trim_columns(
@@ -267,7 +317,38 @@ def split_lines(
 
     if usable:
         usable.sort(key=lambda b: (b[1], b[0]))
-        for i, (x0, y0, x1, y1) in enumerate(usable[:LINE_MAX]):
+
+        pruned: List[Tuple[int, int, int, int]] = []
+        merged_n = 0
+        for box in usable:
+            hit = -1
+            for i, keep in enumerate(pruned):
+                vy = min(keep[3], box[3]) - max(keep[1], box[1])
+                if vy <= 0:
+                    continue
+                span = min(keep[3] - keep[1], box[3] - box[1])
+                if span <= 0:
+                    continue
+                if vy < span * (1.0 - VERT_OVERLAP_RATIO):
+                    continue
+                hx = min(keep[2], box[2]) - max(keep[0], box[0])
+                if hx <= 0:
+                    continue
+                hit = i
+                break
+
+            if hit < 0:
+                pruned.append(box)
+                continue
+
+            k = pruned[hit]
+            pruned[hit] = (
+                min(k[0], box[0]), min(k[1], box[1]),
+                max(k[2], box[2]), max(k[3], box[3]),
+            )
+            merged_n += 1
+
+        for i, (x0, y0, x1, y1) in enumerate(pruned[:LINE_MAX]):
             px0 = max(0, x0 - LINE_PAD_X)
             py0 = max(0, y0 - LINE_PAD_Y)
             px1 = min(image.width, x1 + LINE_PAD_X)
@@ -275,10 +356,14 @@ def split_lines(
             line = TextLine(i, (px0, py0, px1, py1), image.crop((px0, py0, px1, py1)))
             line.source = "detector"
             out.append(line)
+
         if log is not None:
+            tail = (
+                f" (세로로 겹친 박스 {merged_n}쌍 병합)" if merged_n else ""
+            )
             log.append(
-                f"    📚 [LINE SPLIT] 검출 박스 {len(out)}개를 그대로 "
-                f"행으로 씁니다."
+                f"    📚 [LINE SPLIT] 검출 박스 {len(out)}개를 행으로 "
+                f"씁니다{tail}."
             )
         return out
 

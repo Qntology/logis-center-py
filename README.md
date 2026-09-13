@@ -575,14 +575,10 @@ No model weights are redistributed with this repository. Every checkpoint is fet
 | [paddlepaddle](https://github.com/PaddlePaddle/Paddle) | PP-OCRv5 execution runtime | Apache-2.0 |
 | [paddleocr](https://github.com/PaddlePaddle/PaddleOCR) | `TextRecognition`, `TextDetection` | Apache-2.0 |
 | [bitsandbytes](https://github.com/bitsandbytes-foundation/bitsandbytes) | NF4 4-bit quantization | MIT |
-| [pdf2image](https://github.com/Belval/pdf2image) | Last-resort PDF render path (not installed by default) | MIT |
-| [poppler](https://poppler.freedesktop.org/) | External binary required only by pdf2image | GPL-2.0 / GPL-3.0 |
 
-### PDF Handling — Permissive by Default
+### PDF Handling — Fully Permissive
 
 PDF support runs on **PDFium**, the engine Chrome uses, via the `pypdfium2` wrapper. PDFium is **BSD-3-Clause**; the wrapper is dual-licensed **Apache-2.0 OR BSD-3-Clause**. The published wheels embed the prebuilt native library, so there is no Poppler, no Ghostscript, and no external binary to install.
-
-Earlier revisions used `PyMuPDF` (AGPL-3.0-only), which would have forced source disclosure on any binary distribution of this Apache-2.0 project. It has been removed entirely — `import fitz` no longer appears anywhere in the codebase.
 
 Backend resolution order in `core/pdf_render.py`:
 
@@ -590,13 +586,42 @@ Backend resolution order in `core/pdf_render.py`:
 |-------|---------|--------|------|---------|
 | 1 | `pypdfium2` | ✅ | ✅ | Apache-2.0 / BSD-3-Clause |
 | 2 | `pypdf` | ❌ | ✅ | BSD-3-Clause |
-| 3 | `pdf2image` | ✅ | ❌ | MIT wrapper, **GPL Poppler binary** |
 
-Only the first two are installed by `requirements.txt`. The Poppler path exists purely as a manual escape hatch and logs a license warning when it activates. If no backend is present, PDF input is disabled with an actionable message while image and text input keep working.
+Both are installed by `requirements.txt`. If neither is present, PDF input is disabled with an actionable message while image and text input keep working.
 
 ### Text Layer Shortcut
 
 Digital PDFs already carry an extractable text layer. When at least half the processed pages qualify (≥40 characters and ≥20 alphanumerics each), the engine skips OCR and the VLM entirely and feeds the embedded text straight into the text pipeline:
+
+### License Compatibility — No Copyleft
+
+Every runtime dependency of this project is permissively licensed. There is **no GPL, no LGPL, and no AGPL** component in the dependency graph, so the Apache-2.0 terms of this repository apply cleanly to any redistribution, including closed-source binaries.
+
+| License family | Count | Examples |
+|----------------|-------|----------|
+| Apache-2.0 | 8 | transformers, safetensors, tokenizers, accelerate, sentencepiece, stanza, opencv, paddleocr |
+| BSD-3-Clause | 7 | torch, torchvision, numpy, pywebview, pypdfium2, pypdf, psutil, protobuf |
+| MIT | 2 | PyYAML, bitsandbytes |
+| HPND (MIT-CMU) | 1 | pillow |
+| **Copyleft (GPL / LGPL / AGPL)** | **0** | — |
+
+Two copyleft dependencies existed in earlier revisions and have been removed:
+
+| Removed | License | Replacement |
+|---------|---------|-------------|
+| `PyMuPDF` (`import fitz`) | AGPL-3.0-only | `pypdfium2` — BSD-3-Clause PDFium |
+| `pdf2image` + Poppler binary | MIT wrapper, GPL-2.0/3.0 binary | `pypdf` — BSD-3-Clause text fallback |
+
+Neither `fitz` nor `pdf2image` appears anywhere in the codebase, and neither is referenced by `core/pdf_render.py`'s backend resolution. A clean checkout installs no copyleft package.
+
+To verify after installation:
+
+```bash
+pip install pip-licenses
+pip-licenses --format=markdown --order=license
+```
+
+Model weights are fetched at runtime from their original publishers and are not redistributed here; each carries its own license as listed above. All currently referenced checkpoints are Apache-2.0 except `skt/A.X-VE`, which is optional and used only as a fallback patch-grid provider.
 
 ### GPU Notices
 
@@ -615,9 +640,11 @@ Licensed under the MIT License and/or Apache License 2.0.
 
 #### Intel oneDNN
 
-PaddlePaddle bundles oneDNN (MKL-DNN), licensed under Apache-2.0.
+PaddlePaddle bundles oneDNN (MKL-DNN), licensed under **Apache-2.0**.
 This project disables the oneDNN execution path by default — see the note under [Runtime Flags](#runtime-flags).
 [oneDNN License](https://github.com/oneapi-src/oneDNN/blob/main/LICENSE)
+
+All GPU-related components listed above are permissively licensed or vendor EULAs governing the driver stack, not the application source. None imposes copyleft obligations on this repository.
 
 ---
 

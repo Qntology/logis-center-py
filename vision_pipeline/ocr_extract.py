@@ -6,6 +6,10 @@ from .text_upscale import crop_region
 
 LINE_READ_MIN_LINES = 2
 
+DEDUP_IOU = 0.35
+DEDUP_CENTER_RATIO = 0.55
+DEDUP_TEXT_SIM = 0.80
+
 from .text_upscale import (
     decide_tile_count,
     fit_for_vlm,
@@ -91,6 +95,126 @@ class ExtractedField:
         return f"<Extracted {self.category} '{preview}' score={self.score:+.4f}>"
 
 
+def _norm_text(text: str) -> str:
+    return "".join(
+        ch for ch in str(text or "").lower()
+        if ch.isalnum() or ord(ch) > 0x2FFF
+    )
+
+
+def _text_similarity(a: str, b: str) -> float:
+    ca = _norm_text(a)
+    cb = _norm_text(b)
+    if not ca or not cb:
+        return 0.0
+    if ca == cb:
+        return 1.0
+
+    m, n = len(ca), len(cb)
+    prev = [0] * (n + 1)
+    for i in range(1, m + 1):
+        cur = [0] * (n + 1)
+        x = ca[i - 1]
+        for j in range(1, n + 1):
+            if x == cb[j - 1]:
+                cur[j] = prev[j - 1] + 1
+            else:
+                cur[j] = cur[j - 1] if cur[j - 1] >= prev[j] else prev[j]
+        prev = cur
+    return (2.0 * prev[n]) / float(m + n)
+
+
+def _box_iou(
+    a: Tuple[int, int, int, int],
+    b: Tuple[int, int, int, int],
+) -> float:
+    ix0 = max(a[0], b[0])
+    iy0 = max(a[1], b[1])
+    ix1 = min(a[2], b[2])
+    iy1 = min(a[3], b[3])
+    if ix0 >= ix1 or iy0 >= iy1:
+        return 0.0
+    inter = float((ix1 - ix0) * (iy1 - iy0))
+    area_a = float(max(1, (a[2] - a[0]) * (a[3] - a[1])))
+    area_b = float(max(1, (b[2] - b[0]) * (b[3] - b[1])))
+    return inter / (area_a + area_b - inter)
+
+
+def _center_inside(
+    a: Tuple[int, int, int, int],
+    b: Tuple[int, int, int, int],
+) -> bool:
+    acx = (a[0] + a[2]) * 0.5
+    acy = (a[1] + a[3]) * 0.5
+    bh = max(1.0, float(b[3] - b[1]))
+    if not (b[0] <= acx <= b[2]):
+        return False
+    return abs(acy - (b[1] + b[3]) * 0.5) <= bh * DEDUP_CENTER_RATIO
+
+
+def dedup_rows(
+    rows: Sequence[Tuple[str, float, Tuple[int, int, int, int]]],
+    log: Optional[List[str]] = None,
+    category: str = "",
+) -> List[Tuple[str, float, Tuple[int, int, int, int]]]:
+    items = [r for r in rows if str(r[0] or "").strip()]
+    if len(items) <= 1:
+        return list(items)
+
+    items.sort(key=lambda r: (-float(r[1]), r[2][1], r[2][0]))
+
+    kept: List[Tuple[str, float, Tuple[int, int, int, int]]] = []
+    dropped_geo = 0
+    dropped_txt = 0
+
+    for text, score, box in items:
+        hit = -1
+        reason = ""
+
+        for i, (ktext, _ks, kbox) in enumerate(kept):
+            if _box_iou(box, kbox) >= DEDUP_IOU:
+                hit = i
+                reason = "geo"
+                break
+            if _center_inside(box, kbox) or _center_inside(kbox, box):
+                if _text_similarity(text, ktext) >= DEDUP_TEXT_SIM:
+                    hit = i
+                    reason = "geo"
+                    break
+            if _text_similarity(text, ktext) >= 0.95:
+                hit = i
+                reason = "txt"
+                break
+
+        if hit < 0:
+            kept.append((text, score, box))
+            continue
+
+        if reason == "geo":
+            dropped_geo += 1
+        else:
+            dropped_txt += 1
+
+        ktext, kscore, kbox = kept[hit]
+        if float(score) > float(kscore):
+            merged = (
+                min(kbox[0], box[0]), min(kbox[1], box[1]),
+                max(kbox[2], box[2]), max(kbox[3], box[3]),
+            )
+            kept[hit] = (text, score, merged)
+
+    kept.sort(key=lambda r: (r[2][1], r[2][0]))
+
+    if log is not None and (dropped_geo or dropped_txt):
+        log.append(
+            f"    🔁 [TILE DEDUP] '{category}' 타일 겹침에서 같은 줄이 "
+            f"중복 인식되어 {dropped_geo + dropped_txt}건을 제거했습니다 "
+            f"(좌표 겹침 {dropped_geo} / 문자 동일 {dropped_txt}). "
+            f"{len(items)}줄 → {len(kept)}줄"
+        )
+    return kept
+
+
 def _ocr_tiles(
     ocr,
     image: Image.Image,
@@ -112,33 +236,56 @@ def _ocr_tiles(
 
     if log is not None:
         log.append(
-            f"    🧱 [TILE PLAN] '{category}' → {tiles}타일 (겹침 25%) "
+            f"    🧱 [TILE PLAN] '{category}' → {tiles}타일 (겹침 12%) "
             f"| 사유: {reason} | 표행 {table_rows} "
             f"| 판독가능 {legible}/{patches}"
         )
 
-    usable = ocr is not None and getattr(ocr, "available", False)
+    usable = (
+        ocr is not None
+        and getattr(ocr, "available", False)
+        and hasattr(ocr, "recognize_boxed")
+    )
+
+    def _read(crop_img, origin, scale):
+        if not usable or crop_img is None:
+            return []
+        try:
+            rows = ocr.recognize_boxed(crop_img)
+        except Exception as e:
+            if log is not None:
+                log.append(f"    ⚠ OCR 실패: {e}")
+            return []
+
+        ox, oy = origin
+        sx, sy = scale
+        out = []
+        for text, score, box in rows:
+            gx0 = int(ox + box[0] / max(1e-6, sx))
+            gy0 = int(oy + box[1] / max(1e-6, sy))
+            gx1 = int(ox + box[2] / max(1e-6, sx))
+            gy1 = int(oy + box[3] / max(1e-6, sy))
+            out.append((text, score, (gx0, gy0, gx1, gy1)))
+        return out
 
     if tiles <= 1:
         crop, factor, mode = prepare_crop(
             image, bbox, target_px=target_px, log=log, text_boxes=text_boxes
         )
-        text = ""
-        if usable:
-            try:
-                text = ocr.ocr_image(crop)
-            except Exception as e:
-                if log is not None:
-                    log.append(f"    ⚠ OCR 실패: {e}")
-        elif log is not None:
+        if not usable and log is not None:
             log.append(
                 f"    ⏭ [{category}] PP-OCRv5 rec 미가동 — OCR 초안 없이 "
                 f"VLM 판독에 맡깁니다."
             )
-        return text, factor, mode, 1, crop
+        rows = _read(crop, (bbox[0], bbox[1]), (factor, factor))
+        rows = dedup_rows(rows, log=log, category=category)
+        return (
+            "\n".join(t for t, _s, _b in rows),
+            factor, mode, 1, crop,
+        )
 
-    boxes = plan_overlap_tiles(bbox, tiles, overlap_ratio=0.25)
-    chunks: List[str] = []
+    boxes = plan_overlap_tiles(bbox, tiles, overlap_ratio=0.12)
+    collected: List[Tuple[str, float, Tuple[int, int, int, int]]] = []
     factor = 1.0
     mode = ""
     first_crop: Optional[Image.Image] = None
@@ -150,17 +297,20 @@ def _ocr_tiles(
         if i == 0:
             first_crop = crop
             factor, mode = f, m
-        if not usable:
-            continue
-        try:
-            txt = ocr.ocr_image(crop)
-        except Exception:
-            txt = ""
-        txt = (txt or "").strip()
-        if txt and txt not in chunks:
-            chunks.append(txt)
+        collected.extend(_read(crop, (tb[0], tb[1]), (f, f)))
 
-    return "\n".join(chunks), factor, mode, len(boxes), first_crop
+    if log is not None and collected:
+        log.append(
+            f"    📥 [TILE READ] '{category}' 타일 {len(boxes)}장에서 "
+            f"{len(collected)}줄 수집 (원본 좌표로 환산)"
+        )
+
+    rows = dedup_rows(collected, log=log, category=category)
+
+    return (
+        "\n".join(t for t, _s, _b in rows),
+        factor, mode, len(boxes), first_crop,
+    )
 
 
 def read_by_lines(
