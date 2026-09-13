@@ -363,6 +363,20 @@ def build_field_heatmaps(
     return out, chrome_ref
 
 
+IDENTITY_FIELDS = ("doc_number", "issue_date", "reference_number")
+
+
+def _identity_categories(schema: Optional[dict]) -> set:
+    fields = (schema or {}).get("fields", {}) or {}
+    out = set()
+    for name, d in fields.items():
+        if not isinstance(d, dict):
+            continue
+        if bool(d.get("top_region")) or name in IDENTITY_FIELDS:
+            out.add(str(d.get("category") or DEFAULT_CATEGORY))
+    return out
+
+
 def suppress_title_rows(
     heatmaps: Sequence[CategoryHeatmap],
     grid: VisionPatchGrid,
@@ -371,15 +385,11 @@ def suppress_title_rows(
     schema: Optional[dict] = None,
     log: Optional[List[str]] = None,
 ) -> List[CategoryHeatmap]:
-    band = max(1, int(grid.rows * top_ratio))
+    band = max(1, min(2, int(round(grid.rows * top_ratio))))
     if band >= grid.rows:
         return list(heatmaps)
 
-    fields = (schema or {}).get("fields", {}) or {}
-    exempt = {
-        name for name, d in fields.items()
-        if isinstance(d, dict) and bool(d.get("top_region"))
-    }
+    exempt = _identity_categories(schema)
 
     cut = band * grid.cols
     hit = 0
@@ -397,10 +407,14 @@ def suppress_title_rows(
         hit += 1
 
     if log is not None:
-        skip = f" | 면제 {len(exempt)}개({', '.join(sorted(exempt))})" if exempt else ""
+        skip = (
+            f" | 면제 {len(exempt)}개({', '.join(sorted(exempt))})"
+            if exempt else ""
+        )
         log.append(
-            f"  🧹 제목 행 억제: 상단 {band}행에 −{abs(penalty):.2f} "
-            f"패널티 적용 {hit}개{skip}"
+            f"  🚫 [TITLE ROW SUPPRESSION] 상단 {band}행(제목 인쇄 행만) "
+            f"−{abs(penalty):.2f} 적용 {hit}개{skip} — 식별 카테고리 봉우리가 "
+            f"값 행에서 결정되도록 남깁니다."
         )
     return list(heatmaps)
 
@@ -466,18 +480,20 @@ def spatial_residual(
     med = s[len(s) // 2]
     dev = sorted(abs(r - med) for r in ratios)
     mad = dev[len(dev) // 2]
-    if mad <= 1e-6:
-        if log is not None:
-            log.append("  ⏭ 확산도가 고르므로 공간 잔차화를 건너뜁니다.")
-        return list(heatmaps)
 
-    gate = med + mad
+    gate = med + mad if mad > 1e-6 else med
     applied = 0
     reverted = 0
 
+    if log is not None:
+        log.append(
+            f"  🧭 [SPATIAL RESIDUAL GATE] 확산도 중앙값 {med:.3f} + MAD "
+            f"{mad:.3f} = {gate:.3f} 를 넘는 카테고리에만 잔차화를 적용합니다."
+        )
+
     for h in heatmaps:
         ratio = h.active_count() / max(1, h.scores.size)
-        if ratio <= gate:
+        if ratio < gate:
             continue
 
         before = h.scores.copy()
@@ -494,7 +510,7 @@ def spatial_residual(
 
         hot_after = int(np.sum(residual > 0.0))
 
-        if hot_after == 0 or hot_after >= hot_before:
+        if hot_after == 0:
             reverted += 1
             continue
 
@@ -502,9 +518,14 @@ def spatial_residual(
         finite = np.isfinite(h.scores)
         h.top_score = float(h.scores[finite].max()) if finite.any() else 0.0
         applied += 1
+        if log is not None:
+            log.append(
+                f"     🧭 {h.category}: 활성 {hot_before} → {hot_after}"
+            )
 
     if log is not None:
         log.append(
-            f"  🧭 공간 잔차화: gate={gate:.3f} 적용 {applied}개 / 되돌림 {reverted}개"
+            f"  🧭 [SPATIAL RESIDUAL] 전역 톤 + 행 확산 + 열 확산을 분해해 "
+            f"잔차만 남겼습니다. 적용 {applied}개 / 되돌림 {reverted}개"
         )
     return list(heatmaps)

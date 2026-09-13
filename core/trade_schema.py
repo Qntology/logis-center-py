@@ -9,9 +9,19 @@ TRADE_DOMAIN = "trade"
 TRADE_BIAS_NODE = "shipping_doc"
 
 ARRAY_CATEGORIES = (
-    "items", "containers", "parties", "other_parties", "charges",
-    "test_results", "findings_and_damage", "account_ledger",
-    "adjustments", "packing_details", "licensed_items", "purchased_items",
+    "items", "containers", "charges", "test_results",
+    "findings_and_damage", "account_ledger", "adjustments",
+    "packing_details", "licensed_items", "purchased_items",
+)
+
+TABLE_CATEGORIES = ("items", "containers")
+
+ROOT_PROMOTE_FIELDS = (
+    "doc_number", "doc_type", "issue_date", "amount", "currency",
+    "grand_total_amount", "hs_code", "package_count",
+    "special_instructions", "means_of_conveyance", "party_role",
+    "reference_bl", "reference_invoice", "incoterms", "weight_gross",
+    "total_price", "quantity",
 )
 
 LANG_NODE_ALIAS: Dict[str, str] = {
@@ -236,6 +246,8 @@ def build_doc_schema(bias: dict, doc_type: str, lang_code: str = "") -> dict:
             entry["format"] = fmt
         if category in ARRAY_CATEGORIES:
             entry["array"] = True
+        if category in TABLE_CATEGORIES:
+            entry["table"] = True
 
         loc = lang_node_entry(bias, lang_code, field)
         for key in ("bias", "prejudice", "label"):

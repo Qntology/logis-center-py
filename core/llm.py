@@ -31,6 +31,12 @@ SCHEMA_ECHO_TOKENS = frozenset({
     "copy from ocr text or empty string",
 })
 
+VISION_PLACEHOLDERS = (
+    ("<|vision_start|>", "<|image_pad|>", "<|vision_end|>"),
+    ("<|vision_start|>", "<|video_pad|>", "<|vision_end|>"),
+    ("<image>", "", ""),
+)
+
 
 def _load_with_dtype(loader, path, dtype, **kwargs):
     try:
@@ -148,6 +154,9 @@ class RefinerLLM:
         self.low_vram = bool(low_vram)
         self.budget_gb = float(budget_gb or 0.0)
         self.load_mode = "standard"
+        self.vision = False
+        self.processor = None
+        self._vision_marker_logged = False
 
         self.device, self.accel_label = detect_accelerator(device)
         self.dtype = select_dtype(self.device)
@@ -176,9 +185,110 @@ class RefinerLLM:
             else:
                 kwargs["device_map"] = "auto"
 
-        self.model = _load_with_dtype(
-            AutoModelForCausalLM, self.model_path, self.dtype, **kwargs
-        )
+        self.model = None
+        for loader_name in (
+            "AutoModelForImageTextToText",
+            "AutoModelForVision2Seq",
+        ):
+            try:
+                import transformers as _tf
+                loader = getattr(_tf, loader_name, None)
+                if loader is None:
+                    continue
+                self.model = _load_with_dtype(
+                    loader, self.model_path, self.dtype, **kwargs
+                )
+                self.vision = True
+                self._log(
+                    f"  👁 [{self.label}] 비전-언어 모델로 로드했습니다 "
+                    f"({loader_name}) — 크롭 이미지를 직접 읽습니다."
+                )
+                break
+            except Exception as e:
+                self._log(
+                    f"  ⏭ [{self.label}] {loader_name} 로드 불가 "
+                    f"({type(e).__name__}: {str(e)[:90]})"
+                )
+                self.model = None
+
+        if self.model is None:
+            self.model = _load_with_dtype(
+                AutoModelForCausalLM, self.model_path, self.dtype, **kwargs
+            )
+            self.vision = False
+            self._log(
+                f"  📄 [{self.label}] 텍스트 전용으로 로드했습니다 "
+                f"— OCR 원문만 정제합니다."
+            )
+
+        if self.vision:
+            try:
+                from transformers import AutoProcessor
+                self.processor = AutoProcessor.from_pretrained(
+                    self.model_path, trust_remote_code=True
+                )
+                self._log(
+                    f"  👁 [{self.label}] 프로세서 "
+                    f"{type(self.processor).__name__} 준비"
+                )
+            except Exception as e:
+                self._log(
+                    f"  ⚠ [{self.label}] 프로세서 로드 실패({e}) "
+                    f"→ 텍스트 경로로 되돌립니다."
+                )
+                self.vision = False
+                self.processor = None
+
+        if self.vision and self.processor is not None:
+            try:
+                from PIL import Image as _Img, ImageDraw as _Draw
+                probe = _Img.new("RGB", (448, 224), (255, 255, 255))
+                _Draw.Draw(probe).text((20, 90), "ZX7QK", fill=(0, 0, 0))
+
+                enc = self._encode_via_template("Read the text.", probe)
+                mode = "template"
+                if enc is None:
+                    enc, err = self._encode_manual("Read the text.", probe)
+                    mode = "manual"
+                    if enc is None:
+                        raise RuntimeError(f"인코딩 실패: {err}")
+
+                keys = sorted(enc.keys())
+                ids = enc.get("input_ids")
+                n_tok = int(ids.shape[-1]) if ids is not None else 0
+                self._log(
+                    f"  🧭 [{self.label}] 비전 인코딩 자가검진 — 경로 {mode} "
+                    f"| 키 {keys} | 토큰 {n_tok}"
+                )
+
+                got = self.generate_with_image(
+                    "Read the printed text and reply with it only.",
+                    probe, max_new_tokens=16,
+                )
+                low = str(got or "").strip().lower()
+                bad = low in ("", "user", "assistant", "system")
+                if bad:
+                    self._log(
+                        f"  ⚠ [{self.label}] 비전 경로 응답이 역할 토큰"
+                        f"({got[:24]!r}) — 텍스트 경로를 사용합니다."
+                    )
+                    self.vision = False
+                else:
+                    self._log(
+                        f"  ✅ [{self.label}] 비전 경로 자가검진 통과 "
+                        f"(응답 {got[:24]!r})"
+                    )
+            except Exception as e:
+                self._log(
+                    f"  ⚠ [{self.label}] 비전 경로 자가검진 실패 "
+                    f"({type(e).__name__}: {e}) — 텍스트 경로를 사용합니다."
+                )
+                from . import diagnostics as _diag
+                if _diag.enabled(2):
+                    import traceback
+                    for line in traceback.format_exc().splitlines()[-10:]:
+                        self._log(f"      {line}")
+                self.vision = False
 
         if self.device.type != "cuda" and self.load_mode == "standard":
             self.model.to(self.device)
@@ -226,6 +336,11 @@ class RefinerLLM:
         )
         self._kv_adapter = _fp8.Fp8KVCacheAdapter(self.label, log=self._log)
         self.fp8_kv = bool(self._kv_adapter.build() is not None)
+        if self.fp8_kv and self.vision:
+            self._log(
+                f"  ⏭ [{self.label}] 멀티모달 생성에서는 fp8 KV 를 쓰지 "
+                f"않습니다 (위치 인덱싱이 캐시 길이에 의존)."
+            )
 
     def _try_quant_config(self):
         try:
@@ -256,6 +371,195 @@ class RefinerLLM:
             self._log_fn(msg)
         except Exception:
             pass
+
+    def _encode_via_template(self, prompt: str, pil):
+        messages = [{
+            "role": "user",
+            "content": [
+                {"type": "image", "image": pil},
+                {"type": "text", "text": prompt},
+            ],
+        }]
+        try:
+            enc = self.processor.apply_chat_template(
+                messages,
+                add_generation_prompt=True,
+                tokenize=True,
+                return_dict=True,
+                return_tensors="pt",
+            )
+        except Exception as e:
+            if not self._vision_marker_logged:
+                self._log(
+                    f"  ⏭ [{self.label}] 프로세서 템플릿 경로 불가 "
+                    f"({type(e).__name__}: {str(e)[:70]}) → 수동 확장"
+                )
+            return None
+
+        if enc is None:
+            return None
+        keys = set(enc.keys()) if hasattr(enc, "keys") else set()
+        if "pixel_values" not in keys and "pixel_values_videos" not in keys:
+            return None
+        if not self._vision_marker_logged:
+            self._log(
+                f"  👁 [{self.label}] 프로세서 템플릿 경로 사용 "
+                f"| 키 {sorted(keys)}"
+            )
+            self._vision_marker_logged = True
+        return enc
+
+    def _image_pad_count(self, img_enc) -> int:
+        for key in ("image_grid_thw", "image_sizes"):
+            thw = img_enc.get(key) if hasattr(img_enc, "get") else None
+            if thw is None:
+                continue
+            try:
+                arr = thw[0]
+                vals = [int(v) for v in (arr.tolist() if hasattr(arr, "tolist") else arr)]
+            except Exception:
+                continue
+            if not vals:
+                continue
+            total = 1
+            for v in vals:
+                total *= max(1, v)
+            merge = 1
+            ip = getattr(self.processor, "image_processor", None)
+            m = getattr(ip, "merge_size", None) or getattr(
+                self.processor, "merge_size", None
+            )
+            if isinstance(m, int) and m > 0:
+                merge = m * m
+            return max(1, total // merge)
+
+        pv = img_enc.get("pixel_values") if hasattr(img_enc, "get") else None
+        if pv is not None and hasattr(pv, "shape"):
+            try:
+                return max(1, int(pv.shape[0]))
+            except Exception:
+                return 1
+        return 1
+
+    def _encode_manual(self, prompt: str, pil):
+        ip = getattr(self.processor, "image_processor", None)
+        tok = getattr(self.processor, "tokenizer", None) or self.tokenizer
+        if ip is None or tok is None:
+            return None, RuntimeError("image_processor 또는 tokenizer 없음")
+
+        try:
+            img_enc = ip(images=[pil], return_tensors="pt")
+        except Exception as e:
+            return None, e
+
+        vocab = set()
+        try:
+            vocab = set(tok.get_vocab().keys())
+        except Exception:
+            vocab = set()
+
+        start, pad, end = "<|vision_start|>", "<|image_pad|>", "<|vision_end|>"
+        for s, p, e in VISION_PLACEHOLDERS:
+            probe = p or s
+            if probe and probe in vocab:
+                start, pad, end = s, p, e
+                break
+
+        n_pad = self._image_pad_count(img_enc)
+        marker = f"{start}{pad * n_pad}{end}" if pad else start
+
+        if not self._vision_marker_logged:
+            self._log(
+                f"  👁 [{self.label}] 수동 확장 — 플레이스홀더 '{pad or start}' "
+                f"× {n_pad}개"
+            )
+            self._vision_marker_logged = True
+
+        messages = [{"role": "user", "content": f"{marker}\n{prompt}"}]
+        try:
+            text = tok.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+        except Exception:
+            text = f"{marker}\n{prompt}"
+        if marker not in text:
+            text = f"{marker}\n{text}"
+
+        try:
+            txt_enc = tok([text], return_tensors="pt")
+        except Exception as e:
+            return None, e
+
+        enc = dict(txt_enc)
+        for k, v in (img_enc.items() if hasattr(img_enc, "items") else []):
+            enc[k] = v
+        return enc, None
+
+    @torch.no_grad()
+    def generate_with_image(
+        self,
+        prompt: str,
+        image,
+        max_new_tokens: Optional[int] = None,
+    ) -> str:
+        if not self.vision or self.processor is None or image is None:
+            return self.generate(prompt, max_new_tokens=max_new_tokens)
+
+        pil = image.convert("RGB")
+        last = None
+
+        enc = self._encode_via_template(prompt, pil)
+        if enc is None:
+            enc, last = self._encode_manual(prompt, pil)
+
+        if enc is None:
+            self._log(
+                f"  ⚠ [{self.label}] 이미지 인코딩 실패"
+                f"({type(last).__name__ if last else '?'}: "
+                f"{str(last)[:110]}) → 텍스트 경로"
+            )
+            from . import diagnostics as _diag
+            if _diag.enabled(2):
+                import traceback
+                for line in traceback.format_exc().splitlines()[-10:]:
+                    self._log(f"      {line}")
+            return self.generate(prompt, max_new_tokens=max_new_tokens)
+
+        enc = {
+            k: (v.to(self.model.device) if hasattr(v, "to") else v)
+            for k, v in enc.items()
+        }
+
+        gen_kwargs = {
+            "max_new_tokens": int(max_new_tokens or self.max_new_tokens),
+            "do_sample": False,
+        }
+
+        try:
+            out = self.model.generate(**enc, **gen_kwargs)
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            self._log(f"  ⚠ [{self.label}] VRAM 부족으로 이미지 생성을 건너뜁니다.")
+            return ""
+        except Exception as e:
+            self._log(
+                f"  ⚠ [{self.label}] 이미지 생성 실패 "
+                f"({type(e).__name__}: {e}) → 텍스트 경로"
+            )
+            from . import diagnostics as _diag
+            if _diag.enabled(2):
+                import traceback
+                for line in traceback.format_exc().splitlines()[-8:]:
+                    self._log(f"      {line}")
+            return self.generate(prompt, max_new_tokens=max_new_tokens)
+
+        ids = enc.get("input_ids")
+        start = int(ids.shape[-1]) if ids is not None else 0
+        gen = out[0][start:]
+        try:
+            return self.processor.decode(gen, skip_special_tokens=True).strip()
+        except Exception:
+            return self.tokenizer.decode(gen, skip_special_tokens=True).strip()
 
     @torch.no_grad()
     def generate(self, prompt: str, max_new_tokens: Optional[int] = None) -> str:
@@ -327,6 +631,148 @@ class RefinerLLM:
     def _compact(text: str) -> str:
         return "".join(ch for ch in str(text or "").lower() if ch.isalnum())
 
+    @staticmethod
+    def _has_identity(row: Dict[str, str]) -> bool:
+        vals = [str(v).strip() for v in row.values() if str(v or "").strip()]
+        if not vals:
+            return False
+        if len(vals) >= 2:
+            return True
+        return any(any(ch.isalpha() for ch in v) for v in vals)
+
+    def refine_array(
+        self,
+        category: str,
+        field_specs: Dict[str, str],
+        raw_text: str,
+        existing: Optional[List[dict]] = None,
+        label_bank: Optional[Sequence[str]] = None,
+        hint: str = "",
+        image=None,
+    ) -> List[dict]:
+        import json
+
+        use_vision = bool(self.vision and image is not None)
+        body = str(raw_text or "").strip()
+        if not field_specs:
+            return []
+        if not body and not use_vision:
+            return []
+
+        lines = [f'    "{k}": <{v or "value"} or null>' for k, v in field_specs.items()]
+
+        if use_vision:
+            prompt = (
+                "You read one cropped table region of a business document image "
+                "and extract every data row.\n"
+                "Copy values exactly as printed. Never invent a value.\n"
+                "Printed column headers are NOT values. One object per row.\n"
+                "Return ONLY a JSON array, no markdown, no reasoning.\n\n"
+                f"REGION: {category}\n"
+                + (f"HINT: {hint}\n" if hint else "")
+                + (f"OCR DRAFT (may be wrong):\n{body}\n\n" if body else "")
+                + "SCHEMA: [\n  {\n" + ",\n".join(lines) + "\n  }\n]"
+            )
+        else:
+            prompt = (
+                "You extract repeated table rows from noisy OCR text of one region "
+                "of a business document.\n"
+                "Copy values verbatim from the OCR TEXT. Never invent a value.\n"
+                "Printed column headers are NOT values. Return one object per row.\n"
+                "Return ONLY a JSON array, no markdown, no reasoning.\n\n"
+                f"REGION: {category}\n"
+                + (f"HINT: {hint}\n" if hint else "")
+                + f"OCR TEXT:\n{body}\n\n"
+                "SCHEMA: [\n  {\n" + ",\n".join(lines) + "\n  }\n]"
+            )
+
+        budget = min(1280, 96 + 32 * len(field_specs))
+        try:
+            if use_vision:
+                out = self.generate_with_image(
+                    prompt, image, max_new_tokens=budget
+                )
+            else:
+                out = self.generate(prompt, max_new_tokens=budget)
+        except Exception:
+            return []
+
+        cleaned = self._strip_reasoning(out)
+        cleaned = cleaned.replace("```json", "").replace("```", "").strip()
+
+        parsed = None
+        a0 = cleaned.find("[")
+        a1 = cleaned.rfind("]")
+        if a0 != -1 and a1 > a0:
+            try:
+                parsed = json.loads(cleaned[a0: a1 + 1])
+            except Exception:
+                parsed = None
+        if parsed is None:
+            o0 = cleaned.find("{")
+            o1 = cleaned.rfind("}")
+            if o0 != -1 and o1 > o0:
+                try:
+                    obj = json.loads(cleaned[o0: o1 + 1])
+                except Exception:
+                    obj = None
+                if isinstance(obj, dict):
+                    self._log(
+                        f"    🔧 [ARRAY COERCE] [{category}] 단일 객체 응답을 "
+                        f"원소 1개 배열로 승격합니다."
+                    )
+                    parsed = [obj]
+        if not isinstance(parsed, list):
+            self._log(f"    🚫 [{category}] 배열 응답 파싱 실패 — 폐기합니다.")
+            return []
+
+        labels = {self._compact(t) for t in (label_bank or []) if t}
+        cb = self._compact(body)
+        ground = (not use_vision) and bool(cb)
+
+        seen = {json.dumps(r, sort_keys=True, ensure_ascii=False)
+                for r in (existing or [])}
+        kept: List[dict] = []
+        dropped_ident = 0
+        dropped_dup = 0
+
+        for item in parsed:
+            if not isinstance(item, dict):
+                continue
+            row: Dict[str, str] = {}
+            for key, val in item.items():
+                if key not in field_specs:
+                    continue
+                if isinstance(val, (int, float)) and not isinstance(val, bool):
+                    val = str(val)
+                if not isinstance(val, str):
+                    continue
+                v = val.strip()
+                if not v or self.is_schema_echo(v, key):
+                    continue
+                cv = self._compact(v)
+                if not cv or cv in labels:
+                    continue
+                if ground and cv not in cb:
+                    continue
+                row[key] = v
+
+            if not self._has_identity(row):
+                dropped_ident += 1
+                continue
+            sig = json.dumps(row, sort_keys=True, ensure_ascii=False)
+            if sig in seen:
+                dropped_dup += 1
+                continue
+            seen.add(sig)
+            kept.append(row)
+
+        self._log(
+            f"    ➕ [{category}] 배열 신규 {len(kept)}건 | 겹침 중복 "
+            f"{dropped_dup}건 제거 | 정체 없는 행 {dropped_ident}건 폐기"
+        )
+        return kept
+
     def refine_category(
         self,
         category: str,
@@ -335,11 +781,15 @@ class RefinerLLM:
         claimed: Optional[Dict[str, str]] = None,
         label_bank: Optional[Sequence[str]] = None,
         hint: str = "",
+        image=None,
     ) -> Dict[str, str]:
         import json
 
+        use_vision = bool(self.vision and image is not None)
         body = str(raw_text or "").strip()
-        if not body or not field_specs:
+        if not field_specs:
+            return {}
+        if not body and not use_vision:
             return {}
 
         lines = [f'  "{k}": <{v or "value"} or null>' for k, v in field_specs.items()]
@@ -351,22 +801,42 @@ class RefinerLLM:
                 + "\n\n"
             )
 
-        prompt = (
-            "You extract structured fields from noisy OCR text of one region "
-            "of a business document.\n"
-            "Copy values verbatim from the OCR TEXT. Never invent a value.\n"
-            "Printed form labels are NOT values. If a field is absent, use null.\n"
-            "Return ONLY a JSON object, no markdown, no reasoning.\n\n"
-            f"REGION: {category}\n"
-            + (f"HINT: {hint}\n" if hint else "")
-            + banned
-            + f"OCR TEXT:\n{body}\n\n"
-            "SCHEMA: {\n" + ",\n".join(lines) + "\n}"
-        )
+        if use_vision:
+            prompt = (
+                "You read one cropped region of a business document image and "
+                "extract structured fields.\n"
+                "Copy values exactly as printed. Never invent a value.\n"
+                "Printed form labels are NOT values. If a field is absent, "
+                "use null.\n"
+                "Return ONLY a JSON object, no markdown, no reasoning.\n\n"
+                f"REGION: {category}\n"
+                + (f"HINT: {hint}\n" if hint else "")
+                + banned
+                + (f"OCR DRAFT (may be wrong):\n{body}\n\n" if body else "")
+                + "SCHEMA: {\n" + ",\n".join(lines) + "\n}"
+            )
+        else:
+            prompt = (
+                "You extract structured fields from noisy OCR text of one region "
+                "of a business document.\n"
+                "Copy values verbatim from the OCR TEXT. Never invent a value.\n"
+                "Printed form labels are NOT values. If a field is absent, use null.\n"
+                "Return ONLY a JSON object, no markdown, no reasoning.\n\n"
+                f"REGION: {category}\n"
+                + (f"HINT: {hint}\n" if hint else "")
+                + banned
+                + f"OCR TEXT:\n{body}\n\n"
+                "SCHEMA: {\n" + ",\n".join(lines) + "\n}"
+            )
 
         budget = min(1024, 64 + 24 * len(field_specs))
         try:
-            out = self.generate(prompt, max_new_tokens=budget)
+            if use_vision:
+                out = self.generate_with_image(
+                    prompt, image, max_new_tokens=budget
+                )
+            else:
+                out = self.generate(prompt, max_new_tokens=budget)
         except Exception:
             return {}
 
@@ -392,6 +862,7 @@ class RefinerLLM:
         labels = {self._compact(t) for t in (label_bank or []) if t}
         claimed_c = {self._compact(v) for v in (claimed or {}).values() if v}
         cb = self._compact(body)
+        ground = (not use_vision) and bool(cb)
 
         kept: Dict[str, str] = {}
         echo = 0
@@ -429,7 +900,7 @@ class RefinerLLM:
                     f"\"{v[:36]}\" 는 이미 다른 축이 확정한 값입니다."
                 )
                 continue
-            if cv not in cb:
+            if ground and cv not in cb:
                 halluc += 1
                 continue
             kept[key] = v

@@ -322,3 +322,154 @@ def row_gutters(
         hard_floor=hard_floor,
         max_ratio=0.35,
     )
+
+
+def _otsu(values: np.ndarray) -> float:
+    v = np.asarray(values, dtype=np.float64).reshape(-1)
+    v = v[np.isfinite(v)]
+    if v.size < 2:
+        return float(v.mean()) if v.size else 0.0
+    lo = float(v.min())
+    hi = float(v.max())
+    if hi - lo < 1e-9:
+        return lo
+    hist, edges = np.histogram(v, bins=64, range=(lo, hi))
+    total = float(hist.sum())
+    if total <= 0:
+        return lo
+    centers = (edges[:-1] + edges[1:]) * 0.5
+    w = np.cumsum(hist).astype(np.float64)
+    m = np.cumsum(hist.astype(np.float64) * centers)
+    mt = float(m[-1])
+    denom = w * (total - w)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        between = (mt * w / total - m) ** 2 / denom
+    if not np.any(np.isfinite(between)):
+        return lo
+    between = np.where(np.isfinite(between), between, -np.inf)
+    return float(centers[int(np.argmax(between))])
+
+
+class LegibilityMap:
+    def __init__(
+        self,
+        rows: int,
+        cols: int,
+        ink: np.ndarray,
+        sharp: np.ndarray,
+        ink_gate: float,
+        sharp_gate: float,
+    ):
+        self.rows = int(rows)
+        self.cols = int(cols)
+        self.ink = np.asarray(ink, dtype=np.float32)
+        self.sharp = np.asarray(sharp, dtype=np.float32)
+        self.ink_gate = float(ink_gate)
+        self.sharp_gate = float(sharp_gate)
+
+        self.blank = self.ink <= self.ink_gate
+        inked = ~self.blank
+        self.legible = inked & (self.sharp > self.sharp_gate)
+        self.illegible = inked & ~self.legible
+
+    @property
+    def size(self) -> int:
+        return int(self.ink.size)
+
+    def counts(self) -> Tuple[int, int, int]:
+        return (
+            int(self.blank.sum()),
+            int(self.illegible.sum()),
+            int(self.legible.sum()),
+        )
+
+    def row_legible(self) -> np.ndarray:
+        m = self.legible.reshape(self.rows, self.cols)
+        return m.sum(axis=1).astype(np.int32)
+
+    def row_inked(self) -> np.ndarray:
+        m = (~self.blank).reshape(self.rows, self.cols)
+        return m.sum(axis=1).astype(np.int32)
+
+    def report(self) -> str:
+        b, i, l = self.counts()
+        ok = "분리 성공" if (l > 0 and b > 0) else "분리 실패"
+        return (
+            f"  🔎 [LEGIBILITY] 여백 {b} | 판독불가 {i} | 판독가능 {l} / "
+            f"{self.size} | ink_gate {self.ink_gate:.2f} "
+            f"| sharp_gate {self.sharp_gate:.3f} | {ok}"
+        )
+
+
+def legibility_map(
+    image: Image.Image,
+    rows: int,
+    cols: int,
+) -> LegibilityMap:
+    rows = max(1, int(rows))
+    cols = max(1, int(cols))
+    gray = np.asarray(image.convert("L"), dtype=np.float32)
+    h, w = gray.shape
+    ink_img = 255.0 - gray
+
+    ink = np.zeros((rows * cols,), dtype=np.float32)
+    sharp = np.zeros((rows * cols,), dtype=np.float32)
+
+    ystep = h / float(rows)
+    xstep = w / float(cols)
+
+    for r in range(rows):
+        y0 = int(r * ystep)
+        y1 = max(y0 + 1, int((r + 1) * ystep))
+        for c in range(cols):
+            x0 = int(c * xstep)
+            x1 = max(x0 + 1, int((c + 1) * xstep))
+            seg = ink_img[y0:min(y1, h), x0:min(x1, w)]
+            idx = r * cols + c
+            if seg.size == 0:
+                continue
+            ink[idx] = float(seg.mean())
+            if seg.shape[0] >= 2 and seg.shape[1] >= 2:
+                gx = float(np.abs(np.diff(seg, axis=1)).mean())
+                gy = float(np.abs(np.diff(seg, axis=0)).mean())
+                sharp[idx] = float((gx + gy) * 0.5 / 255.0)
+
+    ink_gate = _otsu(ink)
+    inked = ink > ink_gate
+    sharp_gate = _otsu(sharp[inked]) if int(inked.sum()) >= 2 else 0.0
+
+    return LegibilityMap(rows, cols, ink, sharp, ink_gate, sharp_gate)
+
+
+def table_row_band(
+    legibility: LegibilityMap,
+    min_span: int = 2,
+) -> Tuple[int, int, int]:
+    inked = legibility.row_inked()
+    if inked.size == 0:
+        return -1, -1, 0
+    active = inked[inked > 0]
+    if active.size < 2:
+        return -1, -1, 0
+
+    gate = _otsu(active.astype(np.float64))
+    dense = inked >= max(gate, float(np.median(active)))
+
+    best = (-1, -1, 0)
+    start = -1
+    for r in range(int(inked.size)):
+        if dense[r] and start < 0:
+            start = r
+        elif not dense[r] and start >= 0:
+            span = r - start
+            if span > best[2]:
+                best = (start, r - 1, span)
+            start = -1
+    if start >= 0:
+        span = int(inked.size) - start
+        if span > best[2]:
+            best = (start, int(inked.size) - 1, span)
+
+    if best[2] < int(min_span):
+        return -1, -1, 0
+    return best

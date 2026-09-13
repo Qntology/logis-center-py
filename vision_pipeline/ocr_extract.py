@@ -2,7 +2,14 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 from PIL import Image
 
-from .text_upscale import decide_tile_count, plan_overlap_tiles, prepare_crop
+from .text_upscale import crop_region
+
+from .text_upscale import (
+    decide_tile_count,
+    fit_for_vlm,
+    plan_overlap_tiles,
+    prepare_crop,
+)
 from .vision_nms import CropPlan
 
 
@@ -34,6 +41,7 @@ class ExtractedField:
         self.lemma = ""
         self.nlp_meta: dict = {}
         self.field_values: Dict[str, str] = {}
+        self.rows: List[dict] = []
 
     @property
     def value(self) -> str:
@@ -84,8 +92,22 @@ def _ocr_tiles(
     target_px: float,
     max_tiles: int,
     log: Optional[List[str]] = None,
+    category: str = "",
+    table_rows: int = 0,
+    legible: int = 0,
+    patches: int = 0,
 ) -> Tuple[str, float, str, int, Optional[Image.Image]]:
-    tiles = decide_tile_count(image, bbox, max_tiles=max_tiles)
+    tiles, reason = decide_tile_count(
+        image, bbox, max_tiles=max_tiles,
+        table_rows=table_rows, legible=legible, patches=patches,
+    )
+
+    if log is not None:
+        log.append(
+            f"    🧱 [TILE PLAN] '{category}' → {tiles}타일 (겹침 25%) "
+            f"| 사유: {reason} | 표행 {table_rows} "
+            f"| 판독가능 {legible}/{patches}"
+        )
 
     if tiles <= 1:
         crop, factor, mode = prepare_crop(image, bbox, target_px=target_px, log=log)
@@ -96,9 +118,6 @@ def _ocr_tiles(
                 log.append(f"    ⚠ OCR 실패: {e}")
             text = ""
         return text, factor, mode, 1, crop
-
-    if log is not None:
-        log.append(f"    🧱 {tiles}타일 분할 (겹침 25%)")
 
     boxes = plan_overlap_tiles(bbox, tiles, overlap_ratio=0.25)
     chunks: List[str] = []
@@ -179,15 +198,21 @@ def extract_from_crops(
     keep_crop: bool = True,
     nlp=None,
     log: Optional[List[str]] = None,
+    array_categories: Optional[set] = None,
 ) -> List[ExtractedField]:
     out: List[ExtractedField] = []
+    arrays = set(array_categories or ())
 
     for plan in plans:
         if log is not None:
             log.append(f"  ✂️ '{plan.category}' 크롭 px{plan.bbox}")
 
         text, factor, mode, tiles, crop = _ocr_tiles(
-            ocr, image, plan.bbox, target_px, max_tiles, log=log
+            ocr, image, plan.bbox, target_px, max_tiles, log=log,
+            category=plan.category,
+            table_rows=int(getattr(plan, "table_rows", 0)),
+            legible=int(getattr(plan, "legible", 0)),
+            patches=int(getattr(plan, "patches_total", 0)),
         )
 
         cleaned, nlp_meta = nlp_clean_ocr(text, nlp=nlp, log=log)
@@ -199,9 +224,16 @@ def extract_from_crops(
 
         refined = {}
         values: Dict[str, str] = {}
-        if refine_fn is not None and cleaned.strip():
+        if refine_fn is not None:
+            vlm_crop = crop
+            if vlm_crop is None:
+                vlm_crop = crop_region(image, plan.bbox)
             try:
-                refined = refine_fn(plan.category, cleaned, crop) or {}
+                vlm_crop = fit_for_vlm(vlm_crop, log=log)
+            except Exception:
+                pass
+            try:
+                refined = refine_fn(plan.category, cleaned, vlm_crop) or {}
             except Exception as e:
                 if log is not None:
                     log.append(f"    ⚠ 정제 추출 실패: {e}")
@@ -212,6 +244,13 @@ def extract_from_crops(
                         str(k): str(v) for k, v in inner.items()
                         if isinstance(v, str) and v.strip()
                     }
+                rowset = refined.get("__rows__")
+                if isinstance(rowset, list):
+                    rows_out = [r for r in rowset if isinstance(r, dict) and r]
+                else:
+                    rows_out = []
+            else:
+                rows_out = []
 
         field = ExtractedField(
             category=plan.category,
@@ -229,6 +268,7 @@ def extract_from_crops(
         field.lemma = nlp_meta.get("lemma", "")
         field.nlp_meta = nlp_meta
         field.field_values = values
+        field.rows = rows_out if plan.category in arrays else []
         out.append(field)
 
         if log is not None:
@@ -249,9 +289,19 @@ def fields_to_record(
     schema: Optional[dict] = None,
 ) -> Dict[str, object]:
     record: Dict[str, object] = {}
+    raw_text: Dict[str, str] = {}
     schema_fields = set((schema or {}).get("fields", {}) or {})
 
     for f in fields:
+        if getattr(f, "rows", None):
+            prev = record.get(f.category)
+            merged = list(prev) if isinstance(prev, list) else []
+            for r in f.rows:
+                if r not in merged:
+                    merged.append(r)
+            record[f.category] = merged
+            continue
+
         if f.field_values:
             for key, val in f.field_values.items():
                 if not val:
@@ -267,6 +317,8 @@ def fields_to_record(
         if not val:
             continue
         if schema_fields and f.category not in schema_fields:
+            prev = raw_text.get(f.category, "")
+            raw_text[f.category] = (prev + "\n" + val).strip() if prev else val
             continue
         if f.category in record:
             prev = record[f.category]
@@ -279,4 +331,88 @@ def fields_to_record(
 
     for name in schema_fields:
         record.setdefault(name, None)
+
+    if raw_text:
+        record["__ocr_by_category__"] = raw_text
     return record
+
+
+def record_to_json(
+    record: Dict[str, object],
+    schema: Optional[dict] = None,
+    drop_empty: bool = True,
+    source_path: str = "",
+    lang_code: str = "",
+) -> Dict[str, object]:
+    clean: Dict[str, object] = {}
+    for key, val in record.items():
+        if key.startswith("__"):
+            continue
+        if drop_empty and (val is None or val == "" or val == []):
+            continue
+        clean[key] = val
+
+    ocr_raw = record.get("__ocr_by_category__")
+    ocr_raw = ocr_raw if isinstance(ocr_raw, dict) else {}
+
+    def _fallback(reason: str) -> Dict[str, object]:
+        fields = (schema or {}).get("fields", {}) or {}
+        grouped: Dict[str, Dict[str, object]] = {}
+        for key, val in clean.items():
+            definition = fields.get(key)
+            cat = (
+                str(definition.get("category") or "misc")
+                if isinstance(definition, dict) else "misc"
+            )
+            grouped.setdefault(cat, {})[key] = val
+        out: Dict[str, object] = {
+            "doc_type": (schema or {}).get("code") or "",
+            "domain": (schema or {}).get("domain") or "",
+            "fields": clean,
+            "by_category": grouped,
+            "shape_error": reason,
+        }
+        if ocr_raw:
+            out["ocr_by_category"] = ocr_raw
+        return out
+
+    try:
+        from core.record_shape import build_record, relay_plan
+    except Exception as e:
+        return _fallback(f"{type(e).__name__}: {e}")
+
+    try:
+        payload = build_record(
+            clean, schema or {},
+            source_path=source_path,
+            lang_code=lang_code,
+            has_vision=True,
+            ocr_pool=ocr_raw,
+        )
+    except TypeError as e:
+        try:
+            payload = build_record(
+                clean, schema or {},
+                source_path=source_path,
+                lang_code=lang_code,
+                has_vision=True,
+            )
+            payload["shape_warning"] = (
+                f"ocr_pool 미지원 build_record — {type(e).__name__}: {e}"
+            )
+        except Exception as e2:
+            return _fallback(f"{type(e2).__name__}: {e2}")
+    except Exception as e:
+        return _fallback(f"{type(e).__name__}: {e}")
+
+    try:
+        plan = relay_plan(payload, str(payload.get("doc_type") or ""))
+    except Exception:
+        plan = []
+    if plan:
+        payload["relay_plan"] = plan
+
+    if ocr_raw:
+        payload["ocr_by_category"] = ocr_raw
+
+    return payload

@@ -12,11 +12,17 @@ from .field_heatmap import (
     suppress_title_rows,
 )
 from .nms_arena import ArenaResult, run_arena
-from .ocr_extract import ExtractedField, extract_from_crops, fields_to_record
+from .ocr_extract import (
+    ExtractedField,
+    extract_from_crops,
+    fields_to_record,
+    record_to_json,
+)
 from .patch_grid import (
     VisionPatchGrid,
     build_patch_grid,
     column_gutters,
+    legibility_map,
     row_gutters,
 )
 from .text_upscale import VISION_PATCH_PX
@@ -59,6 +65,7 @@ class VisionPipelineConfig:
         prefer_grid: str = "ocr",
         lang_code: str = "",
         doc_code: str = "",
+        source_path: str = "",
         enable_gutters: bool = True,
         max_crop_cols: int = 0,
         patch_margin: float = 0.12,
@@ -78,6 +85,7 @@ class VisionPipelineConfig:
         self.prefer_grid = prefer_grid
         self.lang_code = str(lang_code or "")
         self.doc_code = str(doc_code or "")
+        self.source_path = str(source_path or "")
         self.enable_gutters = bool(enable_gutters)
         self.max_crop_cols = int(max_crop_cols)
         self.patch_margin = float(patch_margin)
@@ -98,6 +106,7 @@ class VisionPipelineResult:
         self.fields: List[ExtractedField] = []
         self.verdicts: List = []
         self.record: Dict[str, object] = {}
+        self.json: Dict[str, object] = {}
         self.log: List[str] = []
         self.elapsed: float = 0.0
 
@@ -118,6 +127,7 @@ class VisionPipelineResult:
             "results": [f.to_dict(include_image=include_images) for f in self.fields],
             "grounding": [v.to_dict() for v in self.verdicts],
             "record": self.record,
+            "json": self.json,
             "elapsed": round(self.elapsed, 3),
             "log": self.log,
         }
@@ -230,6 +240,21 @@ class VisionPipeline:
                 f"| dim={grid.dim} | src={grid.source}"
             )
 
+            if self.joint is not None and grid.source == "siglip2":
+                try:
+                    self.joint.release_vision(
+                        f"패치 {grid.num_patches}개를 호스트로 확보"
+                    )
+                except Exception as e:
+                    self._log(f"  ⚠ 비전 반납 실패({e})")
+
+            legib = None
+            try:
+                legib = legibility_map(image, grid.rows, grid.cols)
+                self._log(legib.report())
+            except Exception as e:
+                self._log(f"  ⏭ 판독성 맵 생략: {e}")
+
             self._log("═══ STEP 2: 필드 친화도 맵 (Column Cosine) ═══")
             heatmaps, chrome_ref = build_field_heatmaps(
                 grid, schema, self.embed_fn,
@@ -288,6 +313,25 @@ class VisionPipeline:
                 except Exception as e:
                     self._log(f"  ⚠ 거터 검출 실패({e}) → 거터 없이 진행합니다.")
 
+            schema_fields = (schema or {}).get("fields", {}) or {}
+            table_cats = set()
+            array_cats = set()
+            identity_cat = ""
+            for _fname, _fdef in schema_fields.items():
+                if not isinstance(_fdef, dict):
+                    continue
+                _cat = str(_fdef.get("category") or "misc")
+                if _fdef.get("array"):
+                    array_cats.add(_cat)
+                if _fdef.get("table"):
+                    table_cats.add(_cat)
+                if _fname == "doc_number" and not identity_cat:
+                    identity_cat = _cat
+            self._log(
+                f"  🧾 표 통합 대상 {sorted(table_cats)} | "
+                f"배열 추출 대상 {sorted(array_cats)}"
+            )
+
             plans = plan_crops(
                 heatmaps, grid,
                 iou_threshold=self.config.iou_threshold,
@@ -296,6 +340,10 @@ class VisionPipeline:
                 row_gutters=rgut,
                 max_crop_cols=self.config.max_crop_cols,
                 log=self.logs,
+                legibility=legib,
+                table_categories=table_cats,
+                identity_category=identity_cat,
+                title_rows=max(1, int(grid.rows * self.config.title_suppress_ratio)),
             )
             result.plans = plans
             self._log(f"  확정 크롭 {len(plans)}개")
@@ -317,6 +365,7 @@ class VisionPipeline:
                 keep_crop=self.config.keep_crop,
                 nlp=self.nlp,
                 log=self.logs,
+                array_categories=array_cats,
             )
             result.fields = fields
 
@@ -350,12 +399,80 @@ class VisionPipeline:
                 record = apply_verdicts(record, verdicts)
 
             result.record = record
+
+            try:
+                result.json = record_to_json(
+                    record, schema,
+                    source_path=self.config.source_path,
+                    lang_code=self.config.lang_code,
+                )
+            except Exception as e:
+                import traceback
+                self._log(
+                    f"  ⚠ 레코드 정형화 실패 ({type(e).__name__}: {e}) "
+                    f"— 원시 record 로 대체합니다."
+                )
+                for line in traceback.format_exc().splitlines()[-8:]:
+                    self._log(f"      {line}")
+                result.json = {
+                    "doc_type": str(
+                        (schema or {}).get("code")
+                        or (schema or {}).get("doc_type") or ""
+                    ),
+                    "domain": str((schema or {}).get("domain") or ""),
+                    "fields": {
+                        k: v for k, v in record.items()
+                        if not k.startswith("__")
+                        and v not in (None, "", [])
+                    },
+                    "ocr_by_category": record.get("__ocr_by_category__") or {},
+                    "shape_error": f"{type(e).__name__}: {e}",
+                }
+
             result.ok = True
+
+            self._log("═══ 추출 결과 (JSON) ═══")
+            try:
+                import json as _json
+                dumped = _json.dumps(
+                    result.json, ensure_ascii=False, indent=2
+                )
+            except Exception as e:
+                dumped = f"(직렬화 실패: {e})"
+            for line in dumped.splitlines():
+                self._log(f"  {line}")
+
+            filled = sum(
+                1 for k, v in record.items()
+                if not k.startswith("__") and v not in (None, "", [])
+            )
+            total = len((schema or {}).get("fields", {}) or {})
+            self._log(
+                f"  📦 추출 요약 — 채워진 필드 {filled}/{total} "
+                f"| 크롭 {len(plans)}개 | 접지 유지 "
+                f"{sum(1 for v in result.verdicts if v.accepted)}건"
+            )
 
         except Exception as e:
             import traceback
             result.error = str(e)
             self._log(f"❌ 비전 파이프라인 오류:\n{traceback.format_exc()}")
+            if result.record and not result.json:
+                result.json = {
+                    "fields": {
+                        k: v for k, v in result.record.items()
+                        if not k.startswith("__")
+                        and v not in (None, "", [])
+                    },
+                    "ocr_by_category": result.record.get(
+                        "__ocr_by_category__"
+                    ) or {},
+                    "pipeline_error": f"{type(e).__name__}: {e}",
+                }
+                self._log(
+                    "  🩹 오류 발생 전까지 확보한 추출값을 JSON 으로 "
+                    "보존했습니다."
+                )
         finally:
             self._phase("idle")
 

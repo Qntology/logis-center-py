@@ -1,5 +1,6 @@
+import math
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -12,6 +13,7 @@ SIGLIP_TEXT_MAX_LEN = 64
 SIGLIP_IMAGE_MEAN = 0.5
 SIGLIP_IMAGE_STD = 0.5
 TEXT_BATCH = 64
+DEFAULT_MAX_PATCHES = 256
 
 TENSOR_ATTRS = (
     "pooler_output",
@@ -46,8 +48,8 @@ class Siglip2Joint:
         device: Optional[str] = None,
         label: str = "siglip2",
         log=None,
-        max_patches: int = 0,
-        fp8_weights: bool = True,
+        max_patches: int = DEFAULT_MAX_PATCHES,
+        fp8_weights: bool = False,
     ):
         from transformers import AutoConfig, AutoModel, AutoTokenizer
 
@@ -218,14 +220,37 @@ class Siglip2Joint:
             return np.zeros(max(1, self.dim), dtype=np.float32)
         return mat[0]
 
-    def _preprocess(self, image: Image.Image) -> torch.Tensor:
-        img = image.convert("RGB").resize(
-            (self.image_size, self.image_size), Image.BICUBIC
-        )
-        arr = np.asarray(img, dtype=np.float32) / 255.0
+    def _letterbox(self, image: Image.Image) -> Tuple[Image.Image, Tuple[int, int, int, int]]:
+        ps = max(1, int(self.patch_size))
+        side = int(self.image_size)
+        w, h = image.convert("RGB").size
+        scale = min(side / float(max(1, w)), side / float(max(1, h)))
+        nw = max(ps, int(round(w * scale)) // ps * ps)
+        nh = max(ps, int(round(h * scale)) // ps * ps)
+        nw = min(nw, side)
+        nh = min(nh, side)
+
+        resized = image.convert("RGB").resize((nw, nh), Image.BICUBIC)
+        canvas = Image.new("RGB", (side, side), (255, 255, 255))
+        ox = ((side - nw) // 2 // ps) * ps
+        oy = ((side - nh) // 2 // ps) * ps
+        canvas.paste(resized, (ox, oy))
+
+        c0 = ox // ps
+        r0 = oy // ps
+        c1 = c0 + nw // ps - 1
+        r1 = r0 + nh // ps - 1
+        return canvas, (r0, r1, c0, c1)
+
+    def _to_tensor(self, img: Image.Image) -> torch.Tensor:
+        arr = np.asarray(img.convert("RGB"), dtype=np.float32) / 255.0
         arr = (arr - SIGLIP_IMAGE_MEAN) / SIGLIP_IMAGE_STD
         t = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0)
         return t.to(device=self.device, dtype=self._param_dtype)
+
+    def _preprocess(self, image: Image.Image) -> torch.Tensor:
+        canvas, _box = self._letterbox(image)
+        return self._to_tensor(canvas)
 
     @torch.no_grad()
     def _dense_patch_features(self, hidden: torch.Tensor) -> torch.Tensor:
@@ -247,23 +272,81 @@ class Siglip2Joint:
     @staticmethod
     def _pool_grid(
         feats: np.ndarray, rows: int, cols: int, target: int
-    ) -> tuple:
+    ) -> Tuple[np.ndarray, int, int]:
         if target <= 0 or rows * cols <= target:
             return feats, rows, cols
 
-        step = 2
-        r, c = rows, cols
-        cur = feats
-        while (r // step) * (c // step) > target and r >= step * 2 and c >= step * 2:
-            r2, c2 = r // step, c // step
-            cur = cur.reshape(r2, step, c2, step, cur.shape[-1]).mean(axis=(1, 3))
-            cur = cur.reshape(r2 * c2, -1)
-            r, c = r2, c2
-        return cur, r, c
+        dim = int(feats.shape[-1])
+        cube = feats.reshape(rows, cols, dim)
+
+        scale = math.sqrt(float(target) / float(rows * cols))
+        nr = max(2, min(rows, int(round(rows * scale))))
+        nc = max(2, min(cols, int(round(cols * scale))))
+        while nr * nc > target and (nr > 2 or nc > 2):
+            if nr >= nc and nr > 2:
+                nr -= 1
+            elif nc > 2:
+                nc -= 1
+            else:
+                break
+
+        redges = np.linspace(0, rows, nr + 1).astype(int)
+        cedges = np.linspace(0, cols, nc + 1).astype(int)
+
+        out = np.zeros((nr, nc, dim), dtype=np.float32)
+        for i in range(nr):
+            r0 = redges[i]
+            r1 = max(r0 + 1, redges[i + 1])
+            for j in range(nc):
+                c0 = cedges[j]
+                c1 = max(c0 + 1, cedges[j + 1])
+                out[i, j] = cube[r0:r1, c0:c1, :].mean(axis=(0, 1))
+
+        return out.reshape(nr * nc, dim), int(nr), int(nc)
+
+    def attach_vision(self):
+        if self.vision_model is None:
+            return
+        try:
+            dev = next(self.vision_model.parameters()).device
+        except StopIteration:
+            return
+        if dev.type != self.device.type:
+            self._log(f"  🔌 [{self.label}] 비전 타워 재부착 (JIT)")
+            self.vision_model.to(self.device)
+
+    def release_vision(self, reason: str = ""):
+        if self.vision_model is None:
+            return
+        try:
+            dev = next(self.vision_model.parameters()).device
+        except StopIteration:
+            return
+        if dev.type == "cpu":
+            return
+        try:
+            nbytes = sum(
+                p.numel() * p.element_size()
+                for p in self.vision_model.parameters()
+            )
+        except Exception:
+            nbytes = 0
+        self.vision_model.to("cpu")
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+        self._log(
+            f"  ♻️ [VISION RELEASE] {self.label} 비전 가중치를 반납했습니다 "
+            f"(약 {nbytes / 1e6:.0f} MB){' — ' + reason if reason else ''}"
+        )
 
     @torch.no_grad()
     def embed_image_patches(self, image: Image.Image) -> dict:
-        px = self._preprocess(image)
+        self.attach_vision()
+        canvas, box = self._letterbox(image)
+        px = self._to_tensor(canvas)
+
         out = self.vision_model(pixel_values=px)
         hidden = _as_tensor(out, ("last_hidden_state",))
         if hidden is None:
@@ -283,10 +366,24 @@ class Siglip2Joint:
             if side * side == feats.shape[0]:
                 rows = cols = side
 
+        r0, r1, c0, c1 = box
+        if 0 <= r0 <= r1 < rows and 0 <= c0 <= c1 < cols:
+            cube = feats.reshape(rows, cols, -1)[r0:r1 + 1, c0:c1 + 1, :]
+            rows = int(r1 - r0 + 1)
+            cols = int(c1 - c0 + 1)
+            feats = cube.reshape(rows * cols, -1)
+            self._log(
+                f"  🧬 [PATCH GRID] 종횡비 보존 레터박스 → 내용 격자 "
+                f"{rows}x{cols}={rows * cols} (전체 {self.rows}x{self.cols})"
+            )
+
         if self.max_patches > 0 and rows * cols > self.max_patches:
-            feats, rows, cols = self._pool_grid(
-                feats.reshape(rows, cols, -1).reshape(rows * cols, -1),
-                rows, cols, self.max_patches,
+            br, bc = rows, cols
+            feats, rows, cols = self._pool_grid(feats, rows, cols, self.max_patches)
+            self._log(
+                f"  🧬 [PATCH POOL] {br}x{bc}={br * bc} → {rows}x{cols}="
+                f"{rows * cols} (상한 {self.max_patches}) — 패치 하나가 "
+                f"라벨+값 셀 전체를 보도록 거칠게 만듭니다."
             )
 
         norms = np.linalg.norm(feats, axis=1, keepdims=True)

@@ -144,6 +144,12 @@ def plan_kv_cache(
     log=None,
 ) -> Dict[str, object]:
     cfg = getattr(model, "config", None)
+    for attr in ("text_config", "llm_config", "language_config"):
+        sub = getattr(cfg, attr, None)
+        if sub is not None and int(getattr(sub, "num_hidden_layers", 0) or 0) > 0:
+            cfg = sub
+            break
+
     layers = int(getattr(cfg, "num_hidden_layers", 0) or 0)
     heads_kv = int(
         getattr(cfg, "num_key_value_heads", 0)
@@ -240,9 +246,11 @@ class Fp8KVCacheAdapter:
             self._log(f"  ⏭ [FP8-KV] {self.reason} → 기본 캐시 사용")
             return None
 
+        if not self.enabled:
+            self._log(
+                f"  🧊 [FP8-KV] {self.label} KV 캐시를 E4M3 양자화-복원 "
+                f"경로로 전환했습니다. "
+                f"(Ampere 는 텐서코어 미지원이라 정밀도 절감 효과만)"
+            )
         self.enabled = True
-        self._log(
-            f"  🧊 [FP8-KV] {self.label} KV 캐시를 E4M3 양자화-복원 경로로 "
-            f"전환했습니다. (Ampere 는 텐서코어 미지원이라 정밀도 절감 효과만)"
-        )
         return cache

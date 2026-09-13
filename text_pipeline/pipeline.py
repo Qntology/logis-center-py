@@ -4,6 +4,7 @@ from typing import Callable, Dict, List, Optional, Sequence
 import numpy as np
 
 from .chunker import Chunk, ChunkerConfig, split_natural_language_to_chunks
+from .field_bank import flatten_text_values
 from .exclusive_assign import (
     Assignment,
     assignments_to_record,
@@ -97,6 +98,32 @@ class TextPipelineResult:
             "elapsed": round(self.elapsed, 3),
             "log": self.log,
         }
+
+
+def _match_field_by_label(bank, label: str) -> str:
+    target = "".join(ch for ch in str(label or "").lower() if ch.isalnum())
+    if not target:
+        return ""
+
+    best = ""
+    best_len = 0
+    for name in bank.field_names:
+        entry = bank.get(name)
+        if entry is None:
+            continue
+        cands = [name.replace("_", " ")]
+        for p in list(entry.label) + list(entry.bias):
+            cands.append(getattr(p, "text", ""))
+        for cand in cands:
+            c = "".join(ch for ch in str(cand or "").lower() if ch.isalnum())
+            if not c:
+                continue
+            if c == target:
+                return name
+            if (c in target or target in c) and len(c) > best_len:
+                best = name
+                best_len = len(c)
+    return best
 
 
 class TextPipeline:
@@ -203,7 +230,34 @@ class TextPipeline:
             bank = self.prepare_bank()
             result.bank_stats = bank.stats()
 
-            self._log("═══ PHASE A: 청크 분할 ═══")
+            self._log("═══ PHASE A: 입력 정제 + 청크 분할 ═══")
+
+            label_bank: List[str] = []
+            for _name, _d in (self.schema.get("fields", {}) or {}).items():
+                if not isinstance(_d, dict):
+                    continue
+                for _k in ("label", "semantic"):
+                    label_bank.extend(flatten_text_values(_d.get(_k)))
+
+            try:
+                from core.text_prep import (
+                    collect_label_value_pairs,
+                    enrich_chunks_with_metadata,
+                    pairs_to_confirmed_chunks,
+                    sanitize_llm_input,
+                )
+            except Exception as e:
+                self._log(f"  ⏭ 전처리 모듈 로드 실패({e}) — 원문으로 진행합니다.")
+                sanitize_llm_input = None
+
+            if sanitize_llm_input is not None:
+                before_len = len(text)
+                text = sanitize_llm_input(text)
+                self._log(
+                    f"  🧼 [SANITIZE] 제어문자·BOM·중복공백 제거 "
+                    f"{before_len}자 → {len(text)}자"
+                )
+
             chunks, words = split_natural_language_to_chunks(text, self.config.chunker())
             result.words = words
             result.chunks = chunks
@@ -213,6 +267,23 @@ class TextPipeline:
                 result.error = "청크를 생성하지 못했습니다."
                 result.log = self.logs
                 return result
+
+            if sanitize_llm_input is not None:
+                pairs = collect_label_value_pairs(
+                    text, label_bank=label_bank, log=self.logs
+                )
+                confirmed = pairs_to_confirmed_chunks(pairs, words)
+                if confirmed:
+                    chunks.extend(confirmed)
+                    chunks.sort(key=lambda c: (c.start, -(c.end - c.start)))
+                    result.chunks = chunks
+                    self._log(
+                        f"  ✅ [CONFIRMED PROMOTE] 라벨↔값 쌍 {len(confirmed)}건을 "
+                        f"확정 청크로 승격했습니다."
+                    )
+                enrich_chunks_with_metadata(
+                    chunks, label_bank=label_bank, log=self.logs
+                )
 
             self._log("═══ PHASE B: SURPRISAL 채점 ═══")
             vectors = self._embed_chunks(chunks)
@@ -258,6 +329,27 @@ class TextPipeline:
                 self._log(f"  PLINKO 결과 {len(plinko)}건")
 
             self._log("═══ PHASE F: 배타 배정 ═══")
+
+            resolved = 0
+            for c in active:
+                if not getattr(c, "confirmed", False):
+                    continue
+                if c.property and c.property != "unclassified":
+                    continue
+                hints = getattr(c, "bias_phrases", None) or []
+                if not hints:
+                    continue
+                pick = _match_field_by_label(bank, hints[0])
+                if pick:
+                    c.property = pick
+                    c.score = max(c.score, 1.0)
+                    resolved += 1
+            if resolved:
+                self._log(
+                    f"  🏷 [LABEL BIND] 확정 청크 {resolved}건을 라벨 코사인으로 "
+                    f"필드에 결속했습니다."
+                )
+
             assignments, leftovers = exclusive_assign_for_indexing(
                 active,
                 bank.field_names,

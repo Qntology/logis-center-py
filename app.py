@@ -356,8 +356,18 @@ class NMSOcrApp:
         if joint_path:
             if SLOT_JOINT not in self.crossover.slots:
                 def _load_joint(p=joint_path, l=joint_label):
-                    from core.siglip_joint import Siglip2Joint
-                    return Siglip2Joint(p, label=l, log=self._log)
+                    import traceback
+                    try:
+                        from core.siglip_joint import Siglip2Joint
+                        return Siglip2Joint(p, label=l, log=self._log)
+                    except Exception as e:
+                        self._log(
+                            f"  ❌ [{l}] 조인트 생성 실패 "
+                            f"({type(e).__name__}: {e})"
+                        )
+                        for line in traceback.format_exc().splitlines()[-10:]:
+                            self._log(f"      {line}")
+                        raise
 
                 self.crossover.register(
                     SLOT_JOINT, _load_joint, label=joint_label, est_gb=1.6
@@ -1121,18 +1131,22 @@ class NMSOcrApp:
         fields = (schema or {}).get("fields", {}) or {}
         specs: Dict[str, Dict[str, str]] = {}
         labels: List[str] = []
+        array_cats: set = set()
 
         for name, definition in fields.items():
             d = definition if isinstance(definition, dict) else {}
             cat = str(d.get("category") or "misc")
             desc = str(d.get("semantic") or name.replace("_", " "))
             specs.setdefault(cat, {})[name] = desc[:90]
+            if d.get("array"):
+                array_cats.add(cat)
             for key in ("semantic", "label"):
                 v = d.get(key)
                 if isinstance(v, str) and v.strip():
                     labels.append(v.strip())
 
         claimed: Dict[str, str] = {}
+        rows_by_cat: Dict[str, List[dict]] = {}
 
         def _fn(category: str, raw_text: str, crop_image) -> dict:
             obj = self.crossover.get(SLOT_REFINER)
@@ -1146,14 +1160,35 @@ class NMSOcrApp:
             if not spec:
                 return obj.refine_field(category, raw_text, hint=hint)
 
+            if category in array_cats:
+                prev = rows_by_cat.setdefault(category, [])
+                if getattr(obj, "vision", False) and crop_image is not None:
+                    self._log(
+                        f"    📤 [{category}] "
+                        f"{crop_image.width}x{crop_image.height} 표 크롭 전송"
+                    )
+                rows = obj.refine_array(
+                    category, spec, raw_text,
+                    existing=prev, label_bank=labels, hint=hint,
+                    image=crop_image,
+                )
+                prev.extend(rows)
+                return {"__rows__": list(prev)}
+
             if claimed:
                 self._log(
                     f"    🔒 [ALREADY CLAIMED] 확정값 {len(claimed)}건을 "
                     f"금지 목록으로 전달합니다."
                 )
+            if getattr(obj, "vision", False) and crop_image is not None:
+                self._log(
+                    f"    📤 [{category}] "
+                    f"{crop_image.width}x{crop_image.height} 크롭 이미지 전송"
+                )
             got = obj.refine_category(
                 category, spec, raw_text,
                 claimed=claimed, label_bank=labels, hint=hint,
+                image=crop_image,
             )
             for k, v in got.items():
                 claimed.setdefault(k, v)
@@ -1240,6 +1275,23 @@ class NMSOcrApp:
         payload["language"] = self.language.to_dict() if self.language else {}
         payload["crossover"] = self.crossover.stats()
         payload["models_ready"] = self.models_ready
+
+        try:
+            from vision_pipeline.ocr_extract import record_to_json
+            payload["json"] = record_to_json(
+                res.record, schema,
+                source_path=self.current_path,
+                lang_code=self.lang_code if self.language_resolved else "",
+            )
+            import json as _json
+            self._log("═══ 추출 결과 (JSON) ═══")
+            for line in _json.dumps(
+                payload["json"], ensure_ascii=False, indent=2
+            ).splitlines():
+                self._log(f"  {line}")
+        except Exception as e:
+            self._log(f"  ⏭ JSON 요약 생략: {e}")
+
         self.last_result = payload
         return payload
 
@@ -1275,6 +1327,7 @@ class NMSOcrApp:
             lang_code=self.lang_code if self.language_resolved else "",
             prefer_grid=self.prefer_grid,
             doc_code=str(schema.get("code") or schema.get("doc_type") or ""),
+            source_path=self.current_path,
         )
         pipeline = VisionPipeline(
             self.vision_embed_fn, ocr=self.ocr, embedder=self.embedder,
@@ -1294,6 +1347,9 @@ class NMSOcrApp:
         payload["language"] = self.language.to_dict() if self.language else {}
         payload["crossover"] = self.crossover.stats()
         payload["models_ready"] = self.models_ready
+        payload["schema_code"] = str(
+            schema.get("code") or schema.get("doc_type") or ""
+        )
         absent = payload.get("absent_fields") or []
         if absent:
             self._log(
@@ -1305,6 +1361,34 @@ class NMSOcrApp:
         for line in self.crossover.report_lines():
             self._log(line)
         return payload
+
+    def get_result_json(self, pretty: bool = True) -> dict:
+        payload = self.last_result
+        if not payload:
+            return {"ok": False, "error": "아직 추출 결과가 없습니다."}
+
+        data = payload.get("json")
+        if not data:
+            data = {"fields": payload.get("record") or {}}
+
+        try:
+            text = json.dumps(
+                data, ensure_ascii=False, indent=2 if pretty else None
+            )
+        except Exception as e:
+            return {"ok": False, "error": f"직렬화 실패: {e}"}
+
+        return {"ok": True, "json": data, "text": text}
+
+    def print_result_json(self) -> dict:
+        res = self.get_result_json(pretty=True)
+        if not res.get("ok"):
+            self._log(f"  ⚠ {res.get('error')}")
+            return res
+        self._log("═══ 추출 결과 (JSON) ═══")
+        for line in str(res["text"]).splitlines():
+            self._log(f"  {line}")
+        return res
 
     def save_results(self, results_json: str = "") -> dict:
         payload = self.last_result
@@ -1344,6 +1428,10 @@ class NMSOcrApp:
             with open(OUTPUT_DIR / "record.json", "w", encoding="utf-8") as f:
                 json.dump(record, f, ensure_ascii=False, indent=2)
 
+            extracted = payload.get("json") or {"fields": record}
+            with open(OUTPUT_DIR / "extracted.json", "w", encoding="utf-8") as f:
+                json.dump(extracted, f, ensure_ascii=False, indent=2)
+
             indexed = self.index_to_zvec(payload)
 
             self._log(f"💾 결과 저장 완료: {OUTPUT_DIR}")
@@ -1360,8 +1448,15 @@ class NMSOcrApp:
 
         results = payload.get("results") or []
         record = payload.get("record") or {}
-        doc_type = str((payload.get("doc_type") or {}).get("code") or "")
-        doc_id = self.current_path or f"doc:{doc_type}"
+        shaped = payload.get("json") or {}
+        doc_type = str(
+            shaped.get("doc_type")
+            or (payload.get("doc_type") or {}).get("code")
+            or ""
+        )
+        doc_id = str(
+            shaped.get("id") or self.current_path or f"doc:{doc_type}"
+        )
 
         texts: List[str] = []
         rows: List[tuple] = []
@@ -1384,11 +1479,13 @@ class NMSOcrApp:
                 "score": item.get("score", 0.0),
             }))
 
-        summary = " ".join(
-            f"{k.replace('_', ' ')} {v}"
-            for k, v in record.items()
-            if isinstance(v, str) and v.strip()
-        ).strip()
+        summary = str(shaped.get("text") or "").strip()
+        if not summary:
+            summary = " ".join(
+                f"{k.replace('_', ' ')} {v}"
+                for k, v in record.items()
+                if isinstance(v, str) and v.strip()
+            ).strip()
         if summary:
             texts.append(summary[:2000])
             rows.append((doc_id, {
@@ -1396,7 +1493,13 @@ class NMSOcrApp:
                 "doc_id": doc_id,
                 "doc_type": doc_type,
                 "lang": self.lang_code,
-                "record": record,
+                "digest": shaped.get("digest", ""),
+                "cc": shaped.get("cc", ""),
+                "bcc": shaped.get("bcc", ""),
+                "ref": shaped.get("ref", ""),
+                "index": shaped.get("index", 0),
+                "no": shaped.get("no", ""),
+                "record": shaped or record,
             }))
 
         if not texts:
@@ -1679,7 +1782,10 @@ def run_cli(args) -> int:
         return 1
 
     print("\n═══ 추출 결과 ═══")
-    print(json.dumps(result.get("record", {}), ensure_ascii=False, indent=2))
+    print(json.dumps(
+        result.get("json") or result.get("record", {}),
+        ensure_ascii=False, indent=2,
+    ))
 
     if args.save:
         saved = app.save_results()
@@ -1774,6 +1880,12 @@ def run_ui(args) -> int:
 
         def save_results(self, results_json: str = ""):
             return app.save_results(results_json)
+
+        def get_result_json(self, pretty: bool = True):
+            return app.get_result_json(bool(pretty))
+
+        def print_result_json(self):
+            return app.print_result_json()
 
         def zvec_search(self, query: str = "", top_k: int = 10, namespace: str = "fields"):
             return app.zvec_search(query, int(top_k), namespace)
