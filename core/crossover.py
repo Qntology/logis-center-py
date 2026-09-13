@@ -149,6 +149,7 @@ class CrossoverSwitch:
         self._log_fn = log or (lambda m: None)
         self.transitions: List[dict] = []
         self.evictions: List[dict] = []
+        self._thrash_warned: set = set()
 
     def _log(self, msg: str):
         try:
@@ -176,6 +177,9 @@ class CrossoverSwitch:
 
     RAM_STAGE_RATIO = 2.4
     RAM_STAGE_FLOOR = 1.5
+
+    THRASH_WINDOW = 6
+    THRASH_LIMIT = 3
 
     def _make_room_for(self, name: str, protect: Sequence[str]) -> List[str]:
         slot = self.slots.get(name)
@@ -213,12 +217,28 @@ class CrossoverSwitch:
             )
         )
 
+        recent = [e.get("evicted") for e in self.evictions[-self.THRASH_WINDOW:]]
+
         evicted: List[str] = []
         for cand in candidates:
             if _vram_free_gb() >= need and (
                 _ram_free_gb() <= 0.0 or _ram_free_gb() >= ram_need
             ):
                 break
+
+            hits = recent.count(cand.name)
+            if hits >= self.THRASH_LIMIT and cand.name not in self._thrash_warned:
+                self._thrash_warned.add(cand.name)
+                self._log(
+                    f"  🔁 [스래싱] '{cand.label}' 이 최근 {self.THRASH_WINDOW}회 "
+                    f"중 {hits}번 반납되었습니다. 메모리가 모든 모델을 담기에 "
+                    f"부족해 같은 모델을 반복해서 올렸다 내리는 중입니다."
+                )
+                self._log(
+                    f"     실행 시간이 크게 늘어납니다. RAM 을 확보하거나 "
+                    f"더 작은 모델을 쓰는 편이 빠릅니다."
+                )
+
             self._log(
                 f"  🧹 [메모리 압박] '{slot.label}'({slot.est_gb:.1f} GB) 적재를 "
                 f"위해 '{cand.label}'({cand.est_gb:.1f} GB) 를 먼저 반납합니다."
@@ -240,12 +260,16 @@ class CrossoverSwitch:
                 f"  ⚠️ VRAM 여유 {after:.2f} GB < 필요 {need:.2f} GB. "
                 f"'{slot.label}' 로드가 실패할 수 있습니다."
             )
+
         if ram_after > 0.0 and ram_after < ram_need:
-            self._log(
-                f"  ⚠️ 시스템 RAM 여유 {ram_after:.1f} GB < 필요 "
-                f"{ram_need:.1f} GB. 로드 중 프로세스가 강제 종료될 수 "
-                f"있습니다. 다른 프로그램을 닫아 주세요."
-            )
+            key = f"ram:{name}"
+            if key not in self._thrash_warned:
+                self._thrash_warned.add(key)
+                self._log(
+                    f"  ⚠️ 시스템 RAM 여유 {ram_after:.1f} GB < 권장 "
+                    f"{ram_need:.1f} GB ('{slot.label}'). 로드가 느려지거나 "
+                    f"실패할 수 있습니다. 같은 경고는 이후 생략합니다."
+                )
         return evicted
 
     def get(self, name: str) -> Optional[object]:

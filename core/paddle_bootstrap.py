@@ -165,31 +165,39 @@ def _run_pip(
     return False, "\n".join(tail) if tail else f"pip 종료코드 {proc.returncode}"
 
 
+_late_warned = {"done": False}
+
+
 def configure_runtime(log: Optional[Callable[[str], None]] = None) -> Dict[str, str]:
     with _lock:
-        if _runtime_applied:
-            return dict(_runtime_applied)
+        fresh: Dict[str, str] = {}
 
         for key, val in RUNTIME_FLAGS.items():
             if os.environ.get(key) is None:
                 os.environ[key] = val
+                fresh[key] = val
                 _runtime_applied[key] = val
 
-        if has_module("paddle") and "paddle" in sys.modules:
+        late = has_module("paddle") and "paddle" in sys.modules
+
+        if late and fresh and not _late_warned["done"]:
+            _late_warned["done"] = True
             _log_to(
                 log,
                 "  ⚠ [PADDLE] paddle 이 이미 로드된 뒤라 환경 플래그가 "
-                "반영되지 않을 수 있습니다. 예측기 인자로 다시 강제합니다.",
+                "반영되지 않을 수 있습니다. 예측기 인자로 다시 강제합니다. "
+                "(이 경고는 한 번만 표시합니다)",
             )
 
-        if _runtime_applied:
-            brief = " | ".join(f"{k}={v}" for k, v in _runtime_applied.items())
+        if fresh:
+            brief = " | ".join(f"{k}={v}" for k, v in fresh.items())
             _log_to(
                 log,
                 f"  ⚙ [PADDLE] 런타임 플래그 적용 — {brief}\n"
                 f"     oneDNN 경로는 PP-OCRv5 det 의 double 배열 속성을 "
                 f"변환하지 못해 기본으로 끕니다.",
             )
+
         return dict(_runtime_applied)
 
 

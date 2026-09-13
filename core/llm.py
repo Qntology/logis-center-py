@@ -279,25 +279,48 @@ class RefinerLLM:
         configure_backends(self.device)
 
         self.weight_gb = model_disk_gb(self.model_path)
-        self.stage_gb = self.weight_gb
+
+        quant_ready = False
+        if self.low_vram and self.device.type == "cuda":
+            try:
+                import bitsandbytes  # noqa: F401
+                quant_ready = True
+            except Exception:
+                quant_ready = False
+
+        if quant_ready:
+            self.stage_gb = max(1.5, self.weight_gb * 0.35)
+            self._log(
+                f"  🧮 [{self.label}] 4bit 양자화는 샤드 단위로 스트리밍되어 "
+                f"전량이 동시에 RAM 에 있지 않습니다. 스테이징 추정 "
+                f"{self.stage_gb:.1f} GB (가중치 {self.weight_gb:.1f} GB)"
+            )
+        else:
+            self.stage_gb = self.weight_gb
 
         ok, why = can_stage(self.stage_gb, log=self._log, label=self.label)
         if not ok:
+            tip = (
+                "    · pip install bitsandbytes 로 4bit 양자화를 켜면\n"
+                "      스테이징 용량이 크게 줄어듭니다.\n"
+                if not quant_ready else ""
+            )
             raise MissingModelError(
                 f"[{self.label}] 시스템 메모리가 부족해 로드를 중단했습니다.\n"
                 f"  {why}\n"
-                f"  가중치 파일 {self.weight_gb:.1f} GB 는 GPU 로 올리기 전에\n"
-                f"  일단 시스템 RAM 에 펼쳐집니다. 4bit 양자화를 써도\n"
-                f"  이 단계는 피할 수 없습니다.\n"
+                f"  가중치 {self.weight_gb:.1f} GB 를 GPU 로 올리려면\n"
+                f"  시스템 RAM 에 약 {self.stage_gb:.1f} GB 의 작업 공간이\n"
+                f"  필요합니다.\n"
                 f"  해결 방법:\n"
+                f"{tip}"
                 f"    · 다른 프로그램을 닫아 RAM 을 확보하세요.\n"
                 f"    · Windows 가상 메모리(페이지 파일)를 늘리세요.\n"
                 f"    · 더 작은 모델을 쓰세요.\n"
-                f"    · 강행하려면 set {'NMS_ALLOW_LOW_RAM'}=1"
+                f"    · 강행하려면 set NMS_ALLOW_LOW_RAM=1"
             )
         self._log(
             f"  📊 [{self.label}] 메모리 사전 점검 통과 — {why} "
-            f"| 가중치 {self.weight_gb:.1f} GB"
+            f"| 가중치 {self.weight_gb:.1f} GB / 스테이징 {self.stage_gb:.1f} GB"
         )
 
         self.tokenizer = AutoTokenizer.from_pretrained(

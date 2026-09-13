@@ -349,8 +349,15 @@ def extract_from_crops(
             elif merged and not cleaned.strip():
                 cleaned = merged
 
-        refined = {}
+        if not line_texts and cleaned.strip():
+            line_texts = [
+                ln.strip() for ln in cleaned.splitlines() if ln.strip()
+            ]
+
+        refined: Dict[str, object] = {}
         values: Dict[str, str] = {}
+        rows_out: List[dict] = []
+
         if refine_fn is not None:
             vlm_crop = crop
             if vlm_crop is None:
@@ -391,10 +398,36 @@ def extract_from_crops(
                 rowset = refined.get("__rows__")
                 if isinstance(rowset, list):
                     rows_out = [r for r in rowset if isinstance(r, dict) and r]
-                else:
-                    rows_out = []
-            else:
-                rows_out = []
+
+        if refine_fn is None and plan.category in arrays and not rows_out:
+            field_name = str(plan.top_field or plan.category)
+            seen_rows: set = set()
+            for row_text in (line_texts or cleaned.splitlines()):
+                t = str(row_text or "").strip()
+                if len(t) < 2:
+                    continue
+                key = "".join(ch for ch in t.lower() if ch.isalnum())
+                if not key or key in seen_rows:
+                    continue
+                seen_rows.add(key)
+                rows_out.append({field_name: t})
+            if rows_out and log is not None:
+                log.append(
+                    f"    🛟 [OCR ONLY] 정제 LLM 없이 '{plan.category}' 의 "
+                    f"OCR 행 {len(rows_out)}건을 '{field_name}' 값으로 "
+                    f"직접 승격했습니다."
+                )
+
+        if refine_fn is None and plan.category not in arrays and not values:
+            field_name = str(plan.top_field or plan.category)
+            body = cleaned.strip()
+            if len(body) >= 2:
+                values[field_name] = body
+                if log is not None:
+                    log.append(
+                        f"    🛟 [OCR ONLY] 정제 LLM 없이 '{plan.category}' 의 "
+                        f"OCR 원문을 '{field_name}' 값으로 직접 씁니다."
+                    )
 
         field = ExtractedField(
             category=plan.category,

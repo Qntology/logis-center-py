@@ -1081,10 +1081,21 @@ class NMSOcrApp:
     def ensure_models_ready(self, fetch: bool = True) -> dict:
         with self._models_lock:
             has_input = self.current_image is not None or bool(self.current_text)
-            need_base = (not self.base_ready) or self.crossover.get(SLOT_OCR) is None
+
+            need_base = not self.base_ready
+            if not need_base:
+                if SLOT_OCR not in self.crossover.slots:
+                    need_base = True
+                elif SLOT_JOINT not in self.crossover.slots and \
+                        SLOT_VISION not in self.crossover.slots:
+                    need_base = True
 
             if need_base or not self.models_ready:
-                self._log("🧩 모델이 준비되지 않아 실행과 함께 자동 로드합니다.")
+                self._log(
+                    f"🧩 모델이 준비되지 않아 실행과 함께 자동 로드합니다. "
+                    f"(base_ready={self.base_ready} / "
+                    f"models_ready={self.models_ready})"
+                )
                 res = dict(self.load_models(fetch=fetch) or {})
                 res["auto_loaded"] = True
                 return res
@@ -1284,20 +1295,21 @@ class NMSOcrApp:
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
-    def classify_document(self) -> dict:
+    def classify_document(self, skip_ready: bool = False) -> dict:
         with self.job_slot("문서 유형 분류"):
-            return self._classify_document_body()
+            return self._classify_document_body(skip_ready=skip_ready)
 
-    def _classify_document_body(self) -> dict:
+    def _classify_document_body(self, skip_ready: bool = False) -> dict:
         if self.current_image is None:
             return {"ok": False, "error": "이미지가 로드되지 않았습니다."}
 
-        ready = self.ensure_models_ready()
-        if not ready.get("ok"):
-            return {
-                "ok": False,
-                "error": ready.get("error", "모델 자동 로드에 실패했습니다."),
-            }
+        if not skip_ready:
+            ready = self.ensure_models_ready()
+            if not ready.get("ok"):
+                return {
+                    "ok": False,
+                    "error": ready.get("error", "모델 자동 로드에 실패했습니다."),
+                }
 
         if not self.ensure_step("doc_type", required=True):
             return {"ok": False, "error": "문서 유형 분류에 필요한 모델이 없습니다."}
@@ -1666,7 +1678,7 @@ class NMSOcrApp:
                 return loaded
             schema = loaded["schema"]
         else:
-            cls = self.classify_document()
+            cls = self._classify_document_body(skip_ready=True)
             if not cls.get("ok"):
                 return cls
             loaded = self.load_schema(cls["schema"])
@@ -1803,16 +1815,37 @@ class NMSOcrApp:
         for line in memory_mod.report_lines():
             self._log(line)
 
-        if self.ocr is not None and getattr(self.ocr, "available", False):
-            self._log(
-                f"  🔤 행 판독에 전용 인식기를 함께 씁니다 — "
-                f"{getattr(self.ocr, 'label', 'PP-OCRv5 rec')} "
-                f"(백엔드 {getattr(self.ocr, 'backend', '-')})"
-            )
+        if SLOT_OCR in self.crossover.slots:
+            rec = self.ocr
+            if rec is None:
+                try:
+                    rec = self.crossover.acquire(SLOT_OCR)
+                except Exception as e:
+                    self._log(f"  ⚠ 전용 인식기 획득 실패({e})")
+                    rec = None
+
+            if rec is not None and getattr(rec, "available", False):
+                self._log(
+                    f"  🔤 행 판독에 전용 인식기를 함께 씁니다 — "
+                    f"{getattr(rec, 'label', 'PP-OCRv5 rec')} "
+                    f"(백엔드 {getattr(rec, 'backend', '-')})"
+                )
+            else:
+                self._log(
+                    "  ⚠ 전용 인식기가 동작하지 않아 행 판독이 VLM 단독으로 "
+                    "진행됩니다."
+                )
         else:
             self._log(
-                "  ⚠ 전용 인식기를 쓸 수 없어 행 판독이 VLM 단독으로 "
-                "진행됩니다. 겹침 투표만으로는 유사 글자 구분이 약해집니다."
+                "  ⚠ 전용 인식기 슬롯이 없어 행 판독이 VLM 단독으로 "
+                "진행됩니다."
+            )
+
+        if not use_refiner:
+            self._log(
+                "  🛟 정제 LLM 이 없으므로 PP-OCRv5 인식 결과를 그대로 "
+                "필드 값으로 씁니다. 구조화 품질은 낮아지지만 판독 "
+                "정확도는 유지됩니다."
             )
 
         line_on = str(os.environ.get("NMS_LINE_READ", "1")).strip().lower() \

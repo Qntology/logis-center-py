@@ -1,6 +1,7 @@
 import json
 import math
 import re
+import threading
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -387,7 +388,7 @@ class PaddleOCRRec:
             self.detector = detector
             return
         if self.detector is None:
-            self.detector = PaddleTextDetector(log=self._log_fn)
+            self.detector = shared_detector(log=self._log_fn)
 
     def detect_boxes(self, image: Image.Image) -> List[Tuple[int, int, int, int]]:
         self.attach_detector()
@@ -759,19 +760,45 @@ class PaddleOCRRec:
         }
 
     def unload(self):
-        try:
-            if self._model is not None:
-                self._model.to("cpu")
-        except Exception:
-            pass
         self._model = None
         self._rec = None
+        self.detector = None
         self.available = False
         try:
-            if self._torch is not None and self._torch.cuda.is_available():
-                self._torch.cuda.empty_cache()
+            from .memory import reclaim
+            reclaim()
         except Exception:
-            pass
+            try:
+                if self._torch is not None and self._torch.cuda.is_available():
+                    self._torch.cuda.empty_cache()
+            except Exception:
+                pass
+        self._torch = None
+
+
+_DETECTOR_LOCK = threading.RLock()
+_DETECTOR: Optional["PaddleTextDetector"] = None
+
+
+def shared_detector(log=None) -> "PaddleTextDetector":
+    global _DETECTOR
+    with _DETECTOR_LOCK:
+        if _DETECTOR is None:
+            _DETECTOR = PaddleTextDetector(log=log)
+        elif log is not None:
+            _DETECTOR._log_fn = log
+        return _DETECTOR
+
+
+def reset_shared_detector():
+    global _DETECTOR
+    with _DETECTOR_LOCK:
+        if _DETECTOR is not None:
+            try:
+                _DETECTOR.unload()
+            except Exception:
+                pass
+        _DETECTOR = None
 
 
 class PaddleTextDetector:

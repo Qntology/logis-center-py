@@ -376,11 +376,17 @@ class VisionPipeline:
 
             self._log("═══ STEP 4: Crop + Upscale + OCR ═══")
             reader = self.line_read_fn if self.config.line_read else None
-            if reader is not None:
+            if reader is not None and refine_fn is not None:
                 self._log(
                     f"  🔁 [LINE READ] 활성 — 창당 {self.config.line_span}행 "
                     f"/ 보폭 {self.config.line_stride}행 "
                     f"/ 겹침 {self.config.line_overlap}행"
+                )
+            elif reader is not None:
+                reader = None
+                self._log(
+                    "  ⏭ [LINE READ] 정제 LLM 이 없어 행 판독을 생략하고 "
+                    "PP-OCRv5 인식 결과를 그대로 씁니다."
                 )
 
             fields = extract_from_crops(
