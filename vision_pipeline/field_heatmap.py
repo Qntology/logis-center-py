@@ -72,6 +72,39 @@ PREJUDICE_WEIGHT = 1.00
 CROSS_PREJUDICE_WEIGHT = 0.85
 ANY_LANG_KEY = "*"
 
+DEFAULT_CATEGORY = "misc"
+
+
+def _category_of(name: str, definition: dict) -> str:
+    cat = str((definition or {}).get("category") or "").strip()
+    return cat if cat else DEFAULT_CATEGORY
+
+
+def _identity_drop_fields(schema: dict, doc_code: str) -> Dict[str, str]:
+    fields = (schema or {}).get("fields", {}) or {}
+    code = str(doc_code or "").strip().lower()
+    drop: Dict[str, str] = {}
+
+    if "doc_type" in fields:
+        drop["doc_type"] = (
+            "STEP 1 비전 판정이 이미 확정한 축입니다. 제목 행에 반응해 "
+            "카테고리 봉우리를 제목 쪽으로 끌어당깁니다."
+        )
+
+    if not code:
+        return drop
+
+    for name, definition in fields.items():
+        if not name.startswith("reference_"):
+            continue
+        tail = name[len("reference_"):].replace("_", "")
+        if tail and (tail == code or code.endswith(tail) or tail.endswith(code)):
+            drop[name] = (
+                f"'{doc_code}' 문서가 자기 자신을 가리키는 축입니다. "
+                f"doc_number 와 라벨이 겹쳐 정체성 축을 잠식합니다."
+            )
+    return drop
+
 
 def _as_list(raw) -> List[str]:
     from text_pipeline.field_bank import flatten_text_values
@@ -143,9 +176,10 @@ def build_field_heatmaps(
     grid: VisionPatchGrid,
     schema: dict,
     embed_fn: Callable[[List[str]], np.ndarray],
-    cross_prejudice: bool = True,
+    cross_prejudice: bool = False,
     lang_code: str = "",
     log: Optional[List[str]] = None,
+    doc_code: str = "",
 ) -> Tuple[List[CategoryHeatmap], np.ndarray]:
     fields = (schema or {}).get("fields", {}) or {}
     if not fields or grid.embeddings.size == 0:
@@ -153,25 +187,39 @@ def build_field_heatmaps(
             log.append("⚪ 히트맵 생성 대상이 없습니다.")
         return [], np.zeros((0,), dtype=np.float32)
 
-    cache = _AnchorCache(embed_fn, expect_dim=int(grid.dim))
+    drop = _identity_drop_fields(schema, doc_code)
+    if log is not None:
+        for name, why in drop.items():
+            log.append(f"  🧹 [ANCHOR DROP] '{name}' — {why}")
 
+    cache = _AnchorCache(embed_fn, expect_dim=int(grid.dim))
     negatives: Tuple[str, ...] = tuple(CHROME_ANCHORS) + HEATMAP_CHROME_ANCHORS
 
+    cat_fields: Dict[str, List[str]] = {}
     field_bias: Dict[str, List[Tuple[str, float]]] = {}
     field_prej: Dict[str, List[Tuple[str, float]]] = {}
     all_phrases: List[str] = list(negatives)
 
     for name, definition in fields.items():
+        if name in drop:
+            continue
         definition = definition if isinstance(definition, dict) else {}
         b = _phrases_of(definition, lang_code)
         p = _prejudice_of(definition, lang_code)
+        if not b:
+            continue
         field_bias[name] = b
         field_prej[name] = p
+        cat_fields.setdefault(_category_of(name, definition), []).append(name)
         all_phrases.extend(t for t, _w in b)
         all_phrases.extend(t for t, _w in p)
 
-    vecs = cache.get_many(sorted(set(all_phrases)))
+    if not cat_fields:
+        if log is not None:
+            log.append("  ❌ 카테고리로 묶을 필드가 없습니다.")
+        return [], np.zeros((0,), dtype=np.float32)
 
+    vecs = cache.get_many(sorted(set(all_phrases)))
     if not vecs:
         if log is not None:
             msg = cache.report() or "텍스트 앵커 임베딩을 얻지 못했습니다."
@@ -182,93 +230,118 @@ def build_field_heatmaps(
 
     if log is not None:
         scope = lang_code if lang_code else "전체 언어"
-        log.append(
-            f"  📖 앵커 임베딩 {len(vecs)}구 × {grid.dim}차원 "
-            f"(필드 {len(fields)}개 / 크롬 {len(chrome_vecs)}구 / 사전 스코프 {scope})"
+        total_phr = sum(
+            len([1 for t, _w in field_bias[f] if t in vecs])
+            for fs in cat_fields.values() for f in fs
         )
+        log.append(
+            f"  📐 [VISION COLUMN BANK] 카테고리 {len(cat_fields)}개 "
+            f"| 필드 구 {total_phr}개 | 편견 구 {len(chrome_vecs)}개 "
+            f"(카테고리 단위 축약) | 패치 {grid.num_patches}개 | 스코프 {scope}"
+        )
+        log.append(
+            "  🧹 [PREJUDICE SCOPE v3] 교차 카테고리 편견 폐기"
+            "(열 센터링이 이미 수행)"
+        )
+        for cat in sorted(cat_fields.keys()):
+            log.append(
+                f"    📖 [CAT '{cat}'] 필드 {len(cat_fields[cat])}개: "
+                + ", ".join(sorted(cat_fields[cat])[:8])
+            )
 
     n = grid.num_patches
+    pm = np.asarray(grid.embeddings, dtype=np.float32)
+    pm = pm / np.maximum(np.linalg.norm(pm, axis=1, keepdims=True), 1e-8)
+
     raw: Dict[str, np.ndarray] = {}
+    top_field_map: Dict[str, str] = {}
     bank_sizes: Dict[str, int] = {}
 
-    for name in fields.keys():
-        bpairs = [(vecs[t], w) for t, w in field_bias[name] if t in vecs]
-        if not bpairs:
-            if log is not None:
-                log.append(f"  ⚪ '{name}' 앵커 확보 실패 → 히트맵 제외")
+    for cat, names_in in cat_fields.items():
+        cols: List[np.ndarray] = []
+        owner: List[str] = []
+        for fname in names_in:
+            for t, w in field_bias[fname]:
+                v = vecs.get(t)
+                if v is None:
+                    continue
+                cols.append(np.asarray(v, dtype=np.float32).reshape(-1) * float(w))
+                owner.append(fname)
+        if not cols:
             continue
 
-        ppairs = [(vecs[t], w) for t, w in field_prej[name] if t in vecs]
-        ppairs.extend((v, PREJUDICE_WEIGHT) for v in chrome_vecs)
-        if cross_prejudice:
-            for other, pairs in field_bias.items():
-                if other == name:
-                    continue
-                for t, w in pairs:
-                    if t in vecs:
-                        ppairs.append((vecs[t], min(w, CROSS_PREJUDICE_WEIGHT)))
+        bmat = np.stack(cols).astype(np.float32)
+        sims = pm @ bmat.T
+        best_idx = np.argmax(sims, axis=1)
+        bias_map = sims[np.arange(sims.shape[0]), best_idx]
 
-        bmat = np.stack([v for v, _w in bpairs]).astype(np.float32)
-        bw = np.asarray([w for _v, w in bpairs], dtype=np.float32)
-        bias_map = np.max((grid.embeddings @ bmat.T) * bw[None, :], axis=1)
+        ppairs: List[np.ndarray] = list(chrome_vecs)
+        for fname in names_in:
+            for t, _w in field_prej.get(fname, []):
+                v = vecs.get(t)
+                if v is not None:
+                    ppairs.append(np.asarray(v, dtype=np.float32).reshape(-1))
 
         if ppairs:
-            pmat = np.stack([v for v, _w in ppairs]).astype(np.float32)
-            pw = np.asarray([w for _v, w in ppairs], dtype=np.float32)
-            prej_map = np.maximum(
-                np.max((grid.embeddings @ pmat.T) * pw[None, :], axis=1), 0.0
-            )
+            pmat = np.stack(ppairs).astype(np.float32) * PREJUDICE_WEIGHT
+            prej_map = np.maximum(np.max(pm @ pmat.T, axis=1), 0.0)
         else:
             prej_map = np.zeros((n,), dtype=np.float32)
 
-        raw[name] = (bias_map - prej_map).astype(np.float32)
-        bank_sizes[name] = len(bpairs)
+        raw[cat] = (bias_map - prej_map).astype(np.float32)
+        bank_sizes[cat] = int(bmat.shape[0])
+        peak = int(np.argmax(raw[cat]))
+        top_field_map[cat] = owner[int(best_idx[peak])]
 
     if not raw:
         if log is not None:
-            log.append(
-                "  ❌ 모든 필드의 앵커 확보에 실패했습니다. "
-                "스키마의 semantic / label / value 가 비어 있는지 확인하세요."
-            )
+            log.append("  ❌ 모든 카테고리의 앵커 확보에 실패했습니다.")
         return [], np.zeros((0,), dtype=np.float32)
 
-    names = list(raw.keys())
-    stack = np.stack([raw[k] for k in names])
-
-    penalties = np.asarray(
-        [gumbel_expected_z(max(1, bank_sizes[k])) for k in names], dtype=np.float32
-    ).reshape(-1, 1)
+    cats = list(raw.keys())
+    stack = np.stack([raw[k] for k in cats])
 
     patch_mu = stack.mean(axis=0, keepdims=True)
     patch_sd = np.maximum(stack.std(axis=0, keepdims=True), 1e-6)
-    affinity = ((stack - patch_mu) / patch_sd) - penalties * 0.25
+    affinity = (stack - patch_mu) / patch_sd
 
-    field_mu = affinity.mean(axis=1, keepdims=True)
-    field_sd = np.maximum(affinity.std(axis=1, keepdims=True), 1e-6)
-    calibrated = (affinity - field_mu) / field_sd
+    field_penalty = np.asarray(
+        [gumbel_expected_z(max(1, len(cat_fields[k]))) for k in cats],
+        dtype=np.float32,
+    ).reshape(-1, 1)
+    affinity = affinity - field_penalty
+
+    if log is not None:
+        brief = " | ".join(
+            f"{k}({len(cat_fields[k])}필드 −{float(field_penalty[i, 0]):.3f})"
+            for i, k in enumerate(cats)
+        )
+        log.append(f"  ⚖️ [CATEGORY-NEUTRAL] max-pool 필드 수 편향 보정: {brief}")
+
+    cat_mu = affinity.mean(axis=1, keepdims=True)
+    cat_sd = np.maximum(affinity.std(axis=1, keepdims=True), 1e-6)
+    calibrated = (affinity - cat_mu) / cat_sd
 
     chrome_ref = np.zeros((n,), dtype=np.float32)
     if chrome_vecs:
         cmat = np.stack(chrome_vecs).astype(np.float32)
-        chrome_raw = np.max(grid.embeddings @ cmat.T, axis=1)
-        chrome_affinity = (
-            (chrome_raw - patch_mu.reshape(-1)) / patch_sd.reshape(-1)
-        ) - gumbel_expected_z(max(1, len(chrome_vecs))) * 0.25
-        c_mu = float(chrome_affinity.mean())
-        c_sd = max(float(chrome_affinity.std()), 1e-6)
-        chrome_ref = ((chrome_affinity - c_mu) / c_sd).astype(np.float32)
+        chrome_raw = np.max(pm @ cmat.T, axis=1)
+        chrome_aff = (chrome_raw - patch_mu.reshape(-1)) / patch_sd.reshape(-1)
+        c_mu = float(chrome_aff.mean())
+        c_sd = max(float(chrome_aff.std()), 1e-6)
+        chrome_ref = ((chrome_aff - c_mu) / c_sd).astype(np.float32)
 
     out: List[CategoryHeatmap] = []
-    for i, name in enumerate(names):
+    for i, cat in enumerate(cats):
         scores = calibrated[i].astype(np.float32)
         peak = int(np.argmax(scores))
         out.append(
             CategoryHeatmap(
-                category=name,
+                category=cat,
                 scores=scores,
-                top_field=name,
+                top_field=top_field_map.get(cat, cat),
                 top_score=float(scores[peak]),
-                bank_size=bank_sizes[name],
+                bank_size=bank_sizes.get(cat, 0),
                 affinity=affinity[i].astype(np.float32),
             )
         )
@@ -277,13 +350,14 @@ def build_field_heatmaps(
 
     if log is not None:
         log.append(
-            f"  📏 정규화: 패치축 z → 앵커수 패널티 → 필드축 재보정 "
+            f"  📏 정규화: 패치축 z → 카테고리 필드수 보정 → 카테고리축 재보정 "
             f"(크롬 기준선 평균 {float(chrome_ref.mean()):+.4f})"
         )
         for h in out:
             log.append(
-                f"  🔥 {h.category:<26} top={h.top_score:+.4f} "
-                f"active={h.active_count()}/{h.scores.size} bank={h.bank_size}"
+                f"  🔥 [HEATMAP] {h.category:<16} 활성 패치 "
+                f"{h.active_count()}/{h.scores.size} | Top: {h.top_field}"
+                f"({h.top_score:+.4f}) | 구 {h.bank_size}개"
             )
 
     return out, chrome_ref

@@ -17,6 +17,21 @@ from .model_manager import (
 )
 
 
+import re
+
+THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+TYPE_MARKER_RE = re.compile(r"\{(String|Number|Boolean|Array)\}", re.IGNORECASE)
+FIELD_ECHO_RE = re.compile(r"^(field|value|val|text|key|item|raw)([ _\-]?\d+)?$")
+
+SCHEMA_ECHO_TOKENS = frozenset({
+    "", "-", "--", "...", "n/a", "na", "null", "none", "undefined", "unknown",
+    "string", "number", "boolean", "array", "object",
+    "value", "val", "field", "text", "key", "item", "raw",
+    "cleaned value", "empty string", "cleaned value or empty string",
+    "copy from ocr text or empty string",
+})
+
+
 def _load_with_dtype(loader, path, dtype, **kwargs):
     try:
         return loader.from_pretrained(path, dtype=dtype, **kwargs)
@@ -58,6 +73,11 @@ class TextEmbedder:
             f"  ✅ [{self.label}] 임베딩 모델 로드 "
             f"({self.model_path} | dim={self.dim} | {self.device}/{self.dtype})"
         )
+
+        from . import diagnostics
+        diagnostics.describe_config(self.model.config, self.label, self._log)
+        diagnostics.describe_module(self.model, self.label, self._log)
+        diagnostics.probe_space(self.label, self.encode, self._log)
 
     def _log(self, msg: str):
         try:
@@ -177,6 +197,36 @@ class RefinerLLM:
             f"({self.load_mode} | {self.dtype}{placement})"
         )
 
+        from . import diagnostics as _diag
+        from . import fp8 as _fp8
+
+        _diag.describe_config(self.model.config, self.label, self._log)
+        _diag.describe_module(self.model, self.label, self._log)
+
+        try:
+            emb = self.model.get_input_embeddings()
+            head = self.model.get_output_embeddings()
+            tied = (
+                emb is not None and head is not None
+                and emb.weight.data_ptr() == head.weight.data_ptr()
+            )
+            if emb is not None:
+                self._log(
+                    f"  🧮 [{self.label}] embed_tokens "
+                    f"{list(emb.weight.shape)} "
+                    f"{str(emb.weight.dtype).replace('torch.', '')} "
+                    f"({emb.weight.numel() * emb.weight.element_size() / 1e6:.0f} MB) "
+                    f"| lm_head {'tied — 중복 없음' if tied else '별도 가중치'}"
+                )
+        except Exception:
+            pass
+
+        self.kv_plan = _fp8.plan_kv_cache(
+            self.model, 4096, label=self.label, log=self._log
+        )
+        self._kv_adapter = _fp8.Fp8KVCacheAdapter(self.label, log=self._log)
+        self.fp8_kv = bool(self._kv_adapter.build() is not None)
+
     def _try_quant_config(self):
         try:
             import bitsandbytes  # noqa: F401
@@ -219,12 +269,17 @@ class RefinerLLM:
 
         enc = self.tokenizer([text], return_tensors="pt").to(self.model.device)
 
+        gen_kwargs = {
+            "max_new_tokens": int(max_new_tokens or self.max_new_tokens),
+            "do_sample": False,
+        }
+        if getattr(self, "fp8_kv", False):
+            cache = self._kv_adapter.build()
+            if cache is not None:
+                gen_kwargs["past_key_values"] = cache
+
         try:
-            out = self.model.generate(
-                **enc,
-                max_new_tokens=int(max_new_tokens or self.max_new_tokens),
-                do_sample=False,
-            )
+            out = self.model.generate(**enc, **gen_kwargs)
         except torch.cuda.OutOfMemoryError:
             torch.cuda.empty_cache()
             self._log(f"  ⚠ [{self.label}] VRAM 부족으로 생성을 건너뜁니다.")
@@ -239,16 +294,168 @@ class RefinerLLM:
         gen = out[0][len(enc["input_ids"][0]):]
         return self.tokenizer.decode(gen, skip_special_tokens=True).strip()
 
+    @staticmethod
+    def _strip_reasoning(text: str) -> str:
+        s = str(text or "")
+        s = THINK_BLOCK_RE.sub(" ", s)
+        idx = s.rfind("</think>")
+        if idx >= 0:
+            s = s[idx + len("</think>"):]
+        idx = s.rfind("<think>")
+        if idx >= 0:
+            s = s[:idx]
+        return s.strip()
+
+    @staticmethod
+    def is_schema_echo(value: str, field_name: str = "") -> bool:
+        v = str(value or "").strip()
+        if not v:
+            return True
+        low = v.lower().strip(" .:\"'`")
+        if low in SCHEMA_ECHO_TOKENS:
+            return True
+        if TYPE_MARKER_RE.search(v):
+            return True
+        if FIELD_ECHO_RE.match(low):
+            return True
+        fname = str(field_name or "").strip().lower()
+        if fname and low in (fname, fname.replace("_", " ")):
+            return True
+        return False
+
+    @staticmethod
+    def _compact(text: str) -> str:
+        return "".join(ch for ch in str(text or "").lower() if ch.isalnum())
+
+    def refine_category(
+        self,
+        category: str,
+        field_specs: Dict[str, str],
+        raw_text: str,
+        claimed: Optional[Dict[str, str]] = None,
+        label_bank: Optional[Sequence[str]] = None,
+        hint: str = "",
+    ) -> Dict[str, str]:
+        import json
+
+        body = str(raw_text or "").strip()
+        if not body or not field_specs:
+            return {}
+
+        lines = [f'  "{k}": <{v or "value"} or null>' for k, v in field_specs.items()]
+        banned = ""
+        if claimed:
+            banned = (
+                "ALREADY CLAIMED (do NOT return these values again):\n"
+                + "\n".join(f"  - {v}" for v in list(claimed.values())[:20])
+                + "\n\n"
+            )
+
+        prompt = (
+            "You extract structured fields from noisy OCR text of one region "
+            "of a business document.\n"
+            "Copy values verbatim from the OCR TEXT. Never invent a value.\n"
+            "Printed form labels are NOT values. If a field is absent, use null.\n"
+            "Return ONLY a JSON object, no markdown, no reasoning.\n\n"
+            f"REGION: {category}\n"
+            + (f"HINT: {hint}\n" if hint else "")
+            + banned
+            + f"OCR TEXT:\n{body}\n\n"
+            "SCHEMA: {\n" + ",\n".join(lines) + "\n}"
+        )
+
+        budget = min(1024, 64 + 24 * len(field_specs))
+        try:
+            out = self.generate(prompt, max_new_tokens=budget)
+        except Exception:
+            return {}
+
+        cleaned = self._strip_reasoning(out)
+        cleaned = cleaned.replace("```json", "").replace("```", "").strip()
+        start = cleaned.find("{")
+        end = cleaned.rfind("}")
+        if start == -1 or end <= start:
+            self._log(
+                f"  🚫 [{self.label}] '{category}' 잘린 JSON 응답 폐기 "
+                f"— OCR 원문을 유지합니다."
+            )
+            return {}
+
+        try:
+            parsed = json.loads(cleaned[start: end + 1])
+        except Exception:
+            self._log(f"  🚫 [{self.label}] '{category}' JSON 파싱 실패 응답 폐기")
+            return {}
+        if not isinstance(parsed, dict):
+            return {}
+
+        labels = {self._compact(t) for t in (label_bank or []) if t}
+        claimed_c = {self._compact(v) for v in (claimed or {}).values() if v}
+        cb = self._compact(body)
+
+        kept: Dict[str, str] = {}
+        echo = 0
+        label_echo = 0
+        halluc = 0
+        dup = 0
+
+        for key, val in parsed.items():
+            if key not in field_specs:
+                continue
+            if isinstance(val, (int, float)) and not isinstance(val, bool):
+                val = str(val)
+            if not isinstance(val, str):
+                continue
+            v = val.strip()
+            if not v:
+                continue
+            if self.is_schema_echo(v, key):
+                echo += 1
+                continue
+            cv = self._compact(v)
+            if not cv:
+                continue
+            if cv in labels:
+                label_echo += 1
+                self._log(
+                    f"    🚫 [LABEL ECHO] [{category}] '{key}' = \"{v[:36]}\" "
+                    f"— 서식의 인쇄 라벨이므로 폐기합니다."
+                )
+                continue
+            if cv in claimed_c:
+                dup += 1
+                self._log(
+                    f"    ⚠️ [CLAIM VIOLATION] [{category}] '{key}' = "
+                    f"\"{v[:36]}\" 는 이미 다른 축이 확정한 값입니다."
+                )
+                continue
+            if cv not in cb:
+                halluc += 1
+                continue
+            kept[key] = v
+
+        self._log(
+            f"    ✅ [{category}] 신규 {len(kept)}건 | 스키마 에코 폐기 {echo}건 "
+            f"| 라벨 에코 {label_echo}건 | 환각 {halluc}건 | 중복 {dup}건"
+        )
+        return kept
+
     def refine_field(self, field_name: str, raw_text: str, hint: str = "") -> dict:
         import json
 
+        body = str(raw_text or "").strip()
+        if not body:
+            return {}
+
         prompt = (
             "You extract one field value from noisy OCR text of a business document.\n"
-            "Return ONLY a JSON object, no markdown, no explanation.\n\n"
+            "Copy the value verbatim from the OCR TEXT. Never invent a value.\n"
+            "If the OCR TEXT does not contain this field, return an empty string.\n"
+            "Return ONLY a JSON object. No markdown, no explanation, no reasoning.\n\n"
             f"FIELD: {field_name}\n"
             + (f"HINT: {hint}\n" if hint else "")
-            + f"OCR TEXT:\n{raw_text}\n\n"
-            'SCHEMA: {"value": "<cleaned value or empty string>"}'
+            + f"OCR TEXT:\n{body}\n\n"
+            'SCHEMA: {"value": "<copy from OCR TEXT or empty string>"}'
         )
 
         try:
@@ -256,15 +463,66 @@ class RefinerLLM:
         except Exception:
             return {}
 
-        cleaned = out.replace("```json", "").replace("```", "").strip()
+        cleaned = self._strip_reasoning(out)
+        cleaned = cleaned.replace("```json", "").replace("```", "").strip()
+        if not cleaned:
+            return {}
+
+        value = ""
         start = cleaned.find("{")
         end = cleaned.rfind("}")
-        if start == -1 or end == -1 or end <= start:
-            return {"value": cleaned}
-        try:
-            return json.loads(cleaned[start: end + 1])
-        except Exception:
-            return {"value": cleaned}
+
+        if start != -1 and end > start:
+            try:
+                parsed = json.loads(cleaned[start: end + 1])
+            except Exception:
+                parsed = None
+
+            if not isinstance(parsed, dict):
+                self._log(
+                    f"  🚫 [{self.label}] '{field_name}' JSON 파싱 실패 응답 폐기 "
+                    f"— OCR 원문을 유지합니다."
+                )
+                return {}
+
+            for key in ("value", "text", field_name):
+                v = parsed.get(key)
+                if isinstance(v, str) and v.strip():
+                    value = v.strip()
+                    break
+
+            if not value:
+                self._log(
+                    f"  🚫 [{self.label}] '{field_name}' 스키마 에코 응답 폐기 "
+                    f"(키 {list(parsed.keys())[:4]}) — OCR 원문을 유지합니다."
+                )
+                return {}
+        else:
+            if "{" in cleaned or '"' in cleaned:
+                self._log(
+                    f"  🚫 [{self.label}] '{field_name}' 잘린 JSON 응답 폐기 "
+                    f"— OCR 원문을 유지합니다."
+                )
+                return {}
+            value = cleaned
+
+        if self.is_schema_echo(value, field_name):
+            self._log(
+                f"  🚫 [{self.label}] '{field_name}' 플레이스홀더 "
+                f"'{value[:24]}' 폐기 — OCR 원문을 유지합니다."
+            )
+            return {}
+
+        cv = self._compact(value)
+        cb = self._compact(body)
+        if cv and cb and cv not in cb:
+            self._log(
+                f"  🚫 [{self.label}] '{field_name}' 응답 '{value[:24]}' 이 "
+                f"OCR 원문에 없습니다 → 환각으로 보고 폐기합니다."
+            )
+            return {}
+
+        return {"value": value}
 
     def unload(self):
         try:
@@ -277,10 +535,15 @@ class RefinerLLM:
 
 
 class EmbeddingRouter:
-    def __init__(self, log=None):
+    def __init__(self, log=None, name: str = "router"):
         self._providers: List[tuple] = []
         self._log_fn = log or (lambda m: None)
         self.active = ""
+        self.name = str(name)
+        self.space_dim = 0
+        self.dims: Dict[str, int] = {}
+        self._failed: Dict[str, int] = {}
+        self._rejected: Dict[str, int] = {}
 
     def _log(self, msg: str):
         try:
@@ -288,11 +551,27 @@ class EmbeddingRouter:
         except Exception:
             pass
 
+    def lock_space(self, dim: int, owner: str = "") -> None:
+        self.space_dim = int(dim or 0)
+        if self.space_dim > 0:
+            self._log(
+                f"  🔒 [{self.name}] 임베딩 공간 {self.space_dim}차원으로 고정"
+                + (f" (기준 '{owner}')" if owner else "")
+                + " — 다른 차원의 제공자는 사용하지 않습니다."
+            )
+
     def register(self, name: str, fn: Callable[[List[str]], np.ndarray], priority: int = 0):
         self._providers.append((priority, name, fn))
         self._providers.sort(key=lambda t: t[0], reverse=True)
         if not self.active:
             self.active = name
+
+    def unregister(self, name: str) -> bool:
+        before = len(self._providers)
+        self._providers = [t for t in self._providers if t[1] != name]
+        if self.active == name:
+            self.active = self._providers[0][1] if self._providers else ""
+        return len(self._providers) != before
 
     def promote(self, name: str, priority: int = 80) -> bool:
         found = False
@@ -310,13 +589,32 @@ class EmbeddingRouter:
         self._log(f"  🔝 임베딩 제공자 우선순위 승격 → '{name}'")
         return True
 
+    def _note_failure(self, name: str, err: Exception) -> None:
+        cnt = self._failed.get(name, 0) + 1
+        self._failed[name] = cnt
+        if cnt <= 2:
+            self._log(
+                f"  ⚠ [{self.name}] 임베딩 제공자 '{name}' 실패 "
+                f"({type(err).__name__}: {err})"
+            )
+            from . import diagnostics
+            if diagnostics.enabled(2):
+                import traceback
+                for line in traceback.format_exc().splitlines()[-6:]:
+                    self._log(f"      {line}")
+        elif cnt == 3:
+            self._log(
+                f"  ⚠ [{self.name}] '{name}' 반복 실패 — 이후 동일 오류는 "
+                f"요약만 남깁니다."
+            )
+
     def encode(self, texts: Sequence[str]) -> np.ndarray:
         items = list(texts)
         for _prio, name, fn in self._providers:
             try:
                 mat = fn(items)
             except Exception as e:
-                self._log(f"  ⚠ 임베딩 제공자 '{name}' 실패: {e}")
+                self._note_failure(name, e)
                 continue
             if mat is None:
                 continue
@@ -325,17 +623,52 @@ class EmbeddingRouter:
                 mat = mat.reshape(1, -1)
             if mat.shape[0] == 0:
                 continue
+
+            dim = int(mat.shape[-1])
+            if self.dims.get(name) != dim:
+                self.dims[name] = dim
+
+            if self.space_dim and dim != self.space_dim:
+                cnt = self._rejected.get(name, 0) + 1
+                self._rejected[name] = cnt
+                if cnt <= 2:
+                    self._log(
+                        f"  🚫 [{self.name}] '{name}' 공간 불일치 "
+                        f"({dim}차원 ≠ 고정 {self.space_dim}차원) → 사용하지 않습니다."
+                    )
+                continue
+
             if self.active != name:
                 self.active = name
-                self._log(f"  🔀 임베딩 제공자 전환 → '{name}'")
+                self._log(f"  🔀 [{self.name}] 임베딩 제공자 전환 → '{name}' (dim={dim})")
             return mat
-        return np.zeros((len(items), 1), dtype=np.float32)
+
+        self._log(
+            f"  ❌ [{self.name}] 사용할 수 있는 임베딩 제공자가 없습니다 "
+            f"(등록 {len(self._providers)}개 / 실패 {sum(self._failed.values())}회 "
+            f"/ 공간 거부 {sum(self._rejected.values())}회)"
+        )
+        return np.zeros((len(items), max(1, self.space_dim)), dtype=np.float32)
 
     def __call__(self, texts: Sequence[str]) -> np.ndarray:
         return self.encode(texts)
 
     def providers(self) -> List[str]:
         return [name for _p, name, _f in self._providers]
+
+    def report_lines(self) -> List[str]:
+        lines = [
+            f"  🔀 [{self.name}] 활성 '{self.active or '-'}' "
+            f"| 고정 공간 {self.space_dim or '자유'}차원"
+        ]
+        for prio, name, _fn in self._providers:
+            lines.append(
+                f"      · {name:<20} prio={prio:>4} "
+                f"dim={self.dims.get(name, '?')} "
+                f"실패={self._failed.get(name, 0)} "
+                f"거부={self._rejected.get(name, 0)}"
+            )
+        return lines
 
 
 def _alphaedge_available() -> bool:
@@ -405,3 +738,19 @@ def resolve_refiner_path(
     if _alphaedge_available():
         return str(LLM_PATH), "alphaedge-ai"
     return "", ""
+
+
+def resolve_joint_path(
+    lang_code: str = "",
+    codes: Optional[Sequence[str]] = None,
+) -> tuple:
+    wanted: List[str] = []
+    for c in [lang_code] + list(codes or []) + list(BOOTSTRAP_LANGUAGES):
+        if c and c not in wanted:
+            wanted.append(c)
+
+    for code in wanted:
+        if lang_model_ready("siglip2", code):
+            return str(lang_model_dir("siglip2", code)), f"siglip2/{code}", code
+
+    return "", "", ""

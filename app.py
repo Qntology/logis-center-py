@@ -28,6 +28,7 @@ from core.crossover import (
     PHASE_GENERATION,
     PHASE_IDLE,
     SLOT_EMBEDDER,
+    SLOT_JOINT,
     SLOT_NLP,
     SLOT_OCR,
     SLOT_REFINER,
@@ -51,6 +52,7 @@ from core.llm import (
     TextEmbedder,
     resolve_embedder_path,
     resolve_embedder_paths,
+    resolve_joint_path,
     resolve_refiner_path,
 )
 from core.phrase_cache import CachedEmbedder
@@ -127,8 +129,8 @@ class NMSOcrApp:
         self.refiner: Optional[RefinerLLM] = None
         self.nlp = None
 
-        self.router = EmbeddingRouter(log=self._log)
-        self.vision_router = EmbeddingRouter(log=self._log)
+        self.router = EmbeddingRouter(log=self._log, name="text-router")
+        self.vision_router = EmbeddingRouter(log=self._log, name="joint-router")
         self.cached_router: Optional[CachedEmbedder] = None
         self.cached_vision: Optional[CachedEmbedder] = None
         self.language: Optional[LanguageVerdict] = None
@@ -141,6 +143,10 @@ class NMSOcrApp:
         self._embedder_slots: Dict[str, str] = {}
         self._primary_embedder_slot: str = ""
         self._hayai_provider_registered: bool = False
+        self._joint_registered: bool = False
+        self.joint_label: str = ""
+        self.joint_dim: int = 0
+        self.prefer_grid: str = "ocr"
 
         self.current_image: Optional[Image.Image] = None
         self.current_path: str = ""
@@ -160,6 +166,10 @@ class NMSOcrApp:
     @property
     def ocr(self):
         return self.crossover.get(SLOT_OCR)
+
+    @property
+    def joint(self):
+        return self.crossover.get(SLOT_JOINT)
 
     def embed_fn(self, texts):
         if self.cached_router is not None:
@@ -339,35 +349,138 @@ class NMSOcrApp:
             from core.ocr import HayaiOCR
             return HayaiOCR(str(ensure_model_dir("hayai")))
 
-        if SLOT_VISION not in self.crossover.slots:
-            self.crossover.register(SLOT_VISION, _load_vision, est_gb=0.9)
+        joint_path, joint_label, joint_code = resolve_joint_path(
+            self.lang_code, self.active_codes
+        )
+
+        if joint_path:
+            if SLOT_JOINT not in self.crossover.slots:
+                def _load_joint(p=joint_path, l=joint_label):
+                    from core.siglip_joint import Siglip2Joint
+                    return Siglip2Joint(p, label=l, log=self._log)
+
+                self.crossover.register(
+                    SLOT_JOINT, _load_joint, label=joint_label, est_gb=1.6
+                )
+                self.joint_label = joint_label
+                self.prefer_grid = "joint"
+                self._log(
+                    f"  🪢 SigLIP2 조인트 슬롯 등록 — '{joint_label}' "
+                    f"(언어 {joint_code}) | 패치 격자와 텍스트 앵커를 "
+                    f"동일 대조 공간에서 계산합니다."
+                )
+            if SLOT_VISION in self.crossover.slots:
+                self.crossover.release(SLOT_VISION)
+                self.crossover.slots.pop(SLOT_VISION, None)
+                self._log("  ⏭ A.X-VE 는 SigLIP2 조인트로 대체되어 등록하지 않습니다.")
+        else:
+            self.prefer_grid = "ocr"
+            if SLOT_VISION not in self.crossover.slots:
+                self.crossover.register(SLOT_VISION, _load_vision, est_gb=0.9)
+            self._log(
+                "  ⚠ SigLIP2 언어 텍스트 타워를 찾지 못해 Hayai 토큰 임베딩으로 "
+                "조인트 공간을 대체합니다. 필드 친화도 변별력이 크게 떨어집니다."
+            )
+
         if SLOT_OCR not in self.crossover.slots:
             self.crossover.register(SLOT_OCR, _load_ocr, est_gb=0.7)
 
-    def _register_embed_provider(self):
-        if self._hayai_provider_registered:
-            return
-
-        def _hayai_embed(texts):
+    def _hayai_embed_fn(self):
+        def _fn(texts):
             ocr = self.crossover.get(SLOT_OCR)
             if ocr is None:
                 ocr = self.crossover.acquire(SLOT_OCR)
             if ocr is None:
                 return None
             return ocr.embed_text_batch(texts)
+        return _fn
 
-        self.router.register("hayai", _hayai_embed, priority=10)
-        self.vision_router.register("hayai", _hayai_embed, priority=100)
-        self._hayai_provider_registered = True
+    def _register_embed_provider(self):
+        if not self._hayai_provider_registered:
+            self.router.register("hayai", self._hayai_embed_fn(), priority=10)
+            self._hayai_provider_registered = True
+
+        joint_on = SLOT_JOINT in self.crossover.slots
+
+        if joint_on and not self._joint_registered:
+            def _joint_embed(texts):
+                jnt = self.crossover.get(SLOT_JOINT)
+                if jnt is None:
+                    jnt = self.crossover.acquire(SLOT_JOINT)
+                if jnt is None:
+                    return None
+                return jnt.encode_text(texts)
+
+            label = self.joint_label or "siglip2"
+            self.vision_router.unregister("hayai")
+            self.vision_router.register(label, _joint_embed, priority=200)
+            self.vision_router.promote(label, priority=200)
+
+            jnt = self.crossover.get(SLOT_JOINT)
+            jdim = int(getattr(jnt, "dim", 0) or 0) if jnt is not None else 0
+            if jdim > 0:
+                self.vision_router.lock_space(jdim, owner=label)
+            self._joint_registered = True
+
+        if not joint_on:
+            self.vision_router.lock_space(0)
+            if "hayai" not in self.vision_router.providers():
+                self.vision_router.register(
+                    "hayai", self._hayai_embed_fn(), priority=100
+                )
+
+        recipe = (
+            f"{self.joint_label or 'siglip2'}-joint"
+            if self._joint_registered else "hayai-joint"
+        )
 
         probe = self.vision_router(["__dim_probe__"])
         dim = int(probe.shape[-1]) if probe is not None and probe.size else 0
+        self.joint_dim = dim
+
+        if self._joint_registered and dim <= 1:
+            self._log(
+                "  ❌ 조인트 텍스트 인코더가 동작하지 않습니다. "
+                "Hayai 공간으로 되돌립니다."
+            )
+            self._demote_joint()
+            return self._register_embed_provider()
+
         self.cached_vision = CachedEmbedder(
-            self.vision_router, recipe="hayai-joint", dim=dim, log=self._log
+            self.vision_router, recipe=recipe, dim=dim, log=self._log
         )
         self._log(
-            f"  🪢 비전-텍스트 공동 임베딩 채널 준비 (hayai, dim={dim}) — "
+            f"  🪢 비전-텍스트 공동 임베딩 채널 준비 "
+            f"({self.vision_router.active or recipe}, dim={dim}) — "
             f"패치 격자와 동일 공간에서만 코사인을 계산합니다."
+        )
+        for line in self.vision_router.report_lines():
+            self._log(line)
+
+    def _demote_joint(self):
+        label = self.joint_label or "siglip2"
+        try:
+            self.crossover.release(SLOT_JOINT)
+        except Exception:
+            pass
+        self.crossover.slots.pop(SLOT_JOINT, None)
+        self.vision_router.unregister(label)
+        self.vision_router.lock_space(0)
+        self._joint_registered = False
+        self.joint_label = ""
+        self.joint_dim = 0
+        self.prefer_grid = "ocr"
+        if SLOT_VISION not in self.crossover.slots:
+            def _load_vision():
+                from core.embedding import AXVEEmbedder
+                return AXVEEmbedder(str(ensure_model_dir("ax-ve")))
+            self.crossover.register(SLOT_VISION, _load_vision, est_gb=0.9)
+        if "hayai" not in self.vision_router.providers():
+            self.vision_router.register(
+                "hayai", self._hayai_embed_fn(), priority=100
+            )
+        self._log(
+            "  ↩ 조인트 슬롯을 내리고 Hayai 격자/앵커 단일 공간으로 복귀했습니다."
         )
 
     def load_base_models(self) -> dict:
@@ -397,14 +510,29 @@ class NMSOcrApp:
 
         self._register_slots()
 
-        try:
-            self._log("🔄 A.X-VE 비전 인코더 로드 중...")
-            self._progress(10, "A.X-VE 로드 중")
-            self.crossover.acquire(SLOT_VISION)
-            self._progress(30, "A.X-VE 완료")
-        except Exception as e:
-            self._log(f"❌ A.X-VE 로드 실패: {e}")
-            return {"ok": False, "error": str(e)}
+        if SLOT_JOINT in self.crossover.slots:
+            try:
+                self._log("🔄 SigLIP2 조인트(비전-텍스트) 로드 중...")
+                self._progress(10, "SigLIP2 조인트 로드 중")
+                self.crossover.acquire(SLOT_JOINT)
+                self._progress(30, "SigLIP2 조인트 완료")
+            except Exception as e:
+                self._log(f"⚠ SigLIP2 조인트 로드 실패({e}) → Hayai 공간으로 진행합니다.")
+                from core import diagnostics as _diag
+                if _diag.enabled(2):
+                    import traceback
+                    for line in traceback.format_exc().splitlines()[-8:]:
+                        self._log(f"      {line}")
+                self._demote_joint()
+        else:
+            try:
+                self._log("🔄 A.X-VE 비전 인코더 로드 중...")
+                self._progress(10, "A.X-VE 로드 중")
+                self.crossover.acquire(SLOT_VISION)
+                self._progress(30, "A.X-VE 완료")
+            except Exception as e:
+                self._log(f"❌ A.X-VE 로드 실패: {e}")
+                return {"ok": False, "error": str(e)}
 
         try:
             self._log("🔄 Hayai OCR 로드 중...")
@@ -454,11 +582,21 @@ class NMSOcrApp:
                 "예약 토큰으로 나올 수 있습니다. 이 경우 언어 확정은 보류됩니다."
             )
 
+        served = list(dict.fromkeys(
+            [c for c in judge_codes if c]
+            + list(BOOTSTRAP_LANGUAGES)
+            + list(installed_language_codes())
+        ))
+        self._log(
+            "  🎯 서비스 가능한 언어 스코프: " + ", ".join(served)
+        )
+
         detector = LanguageDetector(
             ocr=self.ocr,
             embed_fn=self.embed_fn,
             log=self._log,
             nlp=self.nlp,
+            served_codes=served,
         )
 
         if img is not None:
@@ -619,6 +757,16 @@ class NMSOcrApp:
                 + f" 모델을 사용합니다. (스코프 기준 '{code}')"
             )
         self._sync_registry_language()
+
+        jp, jl, jc = resolve_joint_path(self.lang_code, self.active_codes)
+        if jp and jl != self.joint_label:
+            self.crossover.release(SLOT_JOINT)
+            self.crossover.slots.pop(SLOT_JOINT, None)
+            self._joint_registered = False
+            self.joint_label = ""
+            self._register_slots()
+            self._register_embed_provider()
+            self._log(f"  🪢 조인트 공간을 '{jl}' (언어 {jc}) 로 재바인딩했습니다.")
 
         entries = self._register_text_embedders(self.active_codes, promote=True)
         if entries:
@@ -789,27 +937,81 @@ class NMSOcrApp:
 
     def list_schemas(self) -> dict:
         out = []
+        dictionaries = []
+
         for f in sorted(SCHEMA_DIR.glob("*.json")):
             try:
                 with open(f, "r", encoding="utf-8") as fh:
                     data = json.load(fh)
-                out.append({
-                    "filename": f.name,
-                    "domain": data.get("domain", "unknown"),
-                    "doc_type": data.get("doc_type", "unknown"),
-                    "field_count": len(data.get("fields", {}) or {}),
-                })
             except Exception:
+                dictionaries.append(f)
                 continue
+
+            fields = data.get("fields") if isinstance(data, dict) else None
+            if not isinstance(fields, dict) or not fields:
+                dictionaries.append(f)
+                continue
+
+            out.append({
+                "filename": f.name,
+                "domain": data.get("domain", "unknown"),
+                "doc_type": data.get("doc_type", "unknown"),
+                "field_count": len(fields),
+            })
+
+        if not out:
+            for f in dictionaries:
+                try:
+                    from core.trade_schema import load_trade_schemas
+                    schemas, _diag = load_trade_schemas(
+                        f, self.lang_code if self.language_resolved else ""
+                    )
+                except Exception:
+                    continue
+                for code, sch in schemas.items():
+                    out.append({
+                        "filename": f"{f.name}#{code}",
+                        "domain": sch.get("domain", "trade"),
+                        "doc_type": code,
+                        "field_count": len(sch.get("fields", {}) or {}),
+                    })
+                if schemas:
+                    break
+
         return {"ok": True, "schemas": out}
 
     def load_schema(self, filename: str) -> dict:
-        p = SCHEMA_DIR / filename
+        name = str(filename or "")
+        ref_code = ""
+        if "#" in name:
+            name, ref_code = name.split("#", 1)
+
+        p = SCHEMA_DIR / name
         if not p.exists():
             return {"ok": False, "error": f"스키마 없음: {filename}"}
+
         try:
-            with open(p, "r", encoding="utf-8") as f:
-                schema = json.load(f)
+            if ref_code:
+                from core.trade_schema import load_trade_schemas
+                schemas, diag = load_trade_schemas(
+                    p, self.lang_code if self.language_resolved else ""
+                )
+                for line in diag:
+                    self._log(line)
+                schema = schemas.get(ref_code)
+                if schema is None:
+                    return {
+                        "ok": False,
+                        "error": f"'{name}' 안에 '{ref_code}' 서식이 없습니다.",
+                    }
+                self._log(
+                    f"  📋 '{ref_code}' 서식 스키마 로드 — "
+                    f"필드 {len(schema.get('fields', {}) or {})}개"
+                )
+            else:
+                with open(p, "r", encoding="utf-8") as f:
+                    schema = json.load(f)
+
             return {
                 "ok": True,
                 "domain": schema.get("domain", ""),
@@ -841,12 +1043,34 @@ class NMSOcrApp:
         self._log("═══ 문서 유형 분류 (Doc Type NMS) ═══")
         pipeline = VisionPipeline(
             self.vision_embed_fn, ocr=self.ocr, embedder=self.embedder,
+            config=VisionPipelineConfig(
+                lang_code=self.lang_code if self.language_resolved else "",
+                prefer_grid=self.prefer_grid,
+            ),
             log=self._log, nlp=self.nlp,
+            crossover=self.crossover, joint=self.joint,
         )
-        verdict = pipeline.classify(self.current_image, SCHEMA_DIR)
+        sample = ""
+        if self.language is not None:
+            sample = str(getattr(self.language, "sample_text", "") or "")
+        if not sample:
+            sample = self.current_text or ""
+        verdict = pipeline.classify(
+            self.current_image, SCHEMA_DIR,
+            text_sample=sample,
+            text_embed_fn=self.embed_fn,
+        )
 
         if not verdict.code:
-            return {"ok": False, "error": "문서 유형을 판정하지 못했습니다."}
+            return {
+                "ok": False,
+                "error": (
+                    "문서 유형을 판정하지 못했습니다.\n"
+                    f"  스키마 경로 : {SCHEMA_DIR}\n"
+                    "  위 로그의 '📚 스키마 적재' 와 '📖 앵커 임베딩' 줄에서 "
+                    "스펙 수 / 임베딩 차원을 확인하세요."
+                ),
+            }
 
         if verdict.needs_llm:
             self._log(
@@ -890,18 +1114,50 @@ class NMSOcrApp:
         self._log(f"  ⏳ [{ref_label}] 정제 LLM 지연 로드 예약 — {mode}")
         return True
 
-    def _refine_fn(self, hint: str = ""):
+    def _refine_fn(self, hint: str = "", schema: Optional[dict] = None):
         if SLOT_REFINER not in self.crossover.slots:
             return None
 
-        def _fn(field_name: str, raw_text: str, crop_image) -> dict:
+        fields = (schema or {}).get("fields", {}) or {}
+        specs: Dict[str, Dict[str, str]] = {}
+        labels: List[str] = []
+
+        for name, definition in fields.items():
+            d = definition if isinstance(definition, dict) else {}
+            cat = str(d.get("category") or "misc")
+            desc = str(d.get("semantic") or name.replace("_", " "))
+            specs.setdefault(cat, {})[name] = desc[:90]
+            for key in ("semantic", "label"):
+                v = d.get(key)
+                if isinstance(v, str) and v.strip():
+                    labels.append(v.strip())
+
+        claimed: Dict[str, str] = {}
+
+        def _fn(category: str, raw_text: str, crop_image) -> dict:
             obj = self.crossover.get(SLOT_REFINER)
             if obj is None:
                 obj = self.crossover.acquire(SLOT_REFINER)
             if obj is None:
                 return {}
             self.refiner = obj
-            return obj.refine_field(field_name, raw_text, hint=hint)
+
+            spec = specs.get(category)
+            if not spec:
+                return obj.refine_field(category, raw_text, hint=hint)
+
+            if claimed:
+                self._log(
+                    f"    🔒 [ALREADY CLAIMED] 확정값 {len(claimed)}건을 "
+                    f"금지 목록으로 전달합니다."
+                )
+            got = obj.refine_category(
+                category, spec, raw_text,
+                claimed=claimed, label_bank=labels, hint=hint,
+            )
+            for k, v in got.items():
+                claimed.setdefault(k, v)
+            return {"__fields__": got}
 
         return _fn
 
@@ -1017,17 +1273,19 @@ class NMSOcrApp:
             iou_threshold=iou_threshold,
             margin_threshold=margin_threshold,
             lang_code=self.lang_code if self.language_resolved else "",
+            prefer_grid=self.prefer_grid,
+            doc_code=str(schema.get("code") or schema.get("doc_type") or ""),
         )
         pipeline = VisionPipeline(
             self.vision_embed_fn, ocr=self.ocr, embedder=self.embedder,
             config=cfg, log=self._log, nlp=self.nlp,
-            crossover=self.crossover,
+            crossover=self.crossover, joint=self.joint,
         )
 
         hint = f"document language: {language_name(self.lang_code)}"
         res = pipeline.run(
             self.current_image, schema,
-            refine_fn=self._refine_fn(hint) if use_refiner else None,
+            refine_fn=self._refine_fn(hint, schema) if use_refiner else None,
         )
 
         self._progress(100, "완료" if res.ok else "실패")
@@ -1086,10 +1344,150 @@ class NMSOcrApp:
             with open(OUTPUT_DIR / "record.json", "w", encoding="utf-8") as f:
                 json.dump(record, f, ensure_ascii=False, indent=2)
 
+            indexed = self.index_to_zvec(payload)
+
             self._log(f"💾 결과 저장 완료: {OUTPUT_DIR}")
-            return {"ok": True, "output_dir": str(OUTPUT_DIR)}
+            return {
+                "ok": True,
+                "output_dir": str(OUTPUT_DIR),
+                "zvec": indexed,
+            }
         except Exception as e:
             return {"ok": False, "error": str(e)}
+
+    def index_to_zvec(self, payload: dict) -> dict:
+        from core.zvec import CATALOG
+
+        results = payload.get("results") or []
+        record = payload.get("record") or {}
+        doc_type = str((payload.get("doc_type") or {}).get("code") or "")
+        doc_id = self.current_path or f"doc:{doc_type}"
+
+        texts: List[str] = []
+        rows: List[tuple] = []
+
+        for item in results:
+            value = str(item.get("value") or "").strip()
+            if not value:
+                continue
+            field = str(item.get("field_name") or item.get("category") or "")
+            leaf = f"{field.replace('_', ' ')} {value}".strip()
+            texts.append(leaf)
+            rows.append((f"{doc_id}#{field}", {
+                "kind": "field",
+                "doc_id": doc_id,
+                "doc_type": doc_type,
+                "lang": self.lang_code,
+                "field": field,
+                "value": value,
+                "bbox": item.get("bbox") or [],
+                "score": item.get("score", 0.0),
+            }))
+
+        summary = " ".join(
+            f"{k.replace('_', ' ')} {v}"
+            for k, v in record.items()
+            if isinstance(v, str) and v.strip()
+        ).strip()
+        if summary:
+            texts.append(summary[:2000])
+            rows.append((doc_id, {
+                "kind": "doc",
+                "doc_id": doc_id,
+                "doc_type": doc_type,
+                "lang": self.lang_code,
+                "record": record,
+            }))
+
+        if not texts:
+            self._log("  ⏭ [zvec] 적재할 값이 없습니다.")
+            return {"fields": 0, "docs": 0}
+
+        try:
+            mat = self.embed_fn(texts)
+        except Exception as e:
+            self._log(f"  ⚠ [zvec] 임베딩 실패: {e}")
+            return {"fields": 0, "docs": 0}
+
+        if mat is None:
+            self._log("  ⚠ [zvec] 임베딩이 비어 적재를 건너뜁니다.")
+            return {"fields": 0, "docs": 0}
+
+        mat = np.asarray(mat, dtype=np.float32)
+        if mat.ndim == 1:
+            mat = mat.reshape(1, -1)
+
+        dim = int(mat.shape[-1])
+        recipe = f"{self.router.active or 'router'}-{'+'.join(self.active_codes)}"
+        field_store = CATALOG.store("fields", dim, recipe)
+        doc_store = CATALOG.store("docs", dim, recipe)
+
+        f_items, d_items = [], []
+        for i, (rid, meta) in enumerate(rows):
+            if i >= mat.shape[0]:
+                break
+            if meta.get("kind") == "doc":
+                d_items.append((rid, mat[i], meta))
+            else:
+                f_items.append((rid, mat[i], meta))
+
+        n_f = field_store.upsert_many(f_items)
+        n_d = doc_store.upsert_many(d_items)
+
+        self._log(
+            f"  💽 [zvec] 적재 — 필드 {n_f}건 / 문서 {n_d}건 "
+            f"(dim={dim}, recipe={recipe})"
+        )
+        for line in (field_store.stats(), doc_store.stats()):
+            self._log(
+                f"     · {line['namespace']:<8} {line['entries']}건 "
+                f"/ 묘비 {line['tombstones']} / {line['bytes'] / 1e6:.2f} MB"
+            )
+        return {"fields": n_f, "docs": n_d}
+
+    def zvec_search(self, query: str, top_k: int = 10, namespace: str = "fields") -> dict:
+        from core.zvec import CATALOG
+
+        q = str(query or "").strip()
+        if not q:
+            return {"ok": False, "error": "질의가 비었습니다."}
+
+        try:
+            mat = self.embed_fn([q])
+        except Exception as e:
+            return {"ok": False, "error": f"임베딩 실패: {e}"}
+        if mat is None:
+            return {"ok": False, "error": "임베딩이 비었습니다."}
+
+        mat = np.asarray(mat, dtype=np.float32)
+        if mat.ndim == 1:
+            mat = mat.reshape(1, -1)
+
+        dim = int(mat.shape[-1])
+        recipe = f"{self.router.active or 'router'}-{'+'.join(self.active_codes)}"
+        store = CATALOG.store(namespace, dim, recipe)
+        hits = store.search(mat[0], top_k=int(top_k))
+
+        return {
+            "ok": True,
+            "namespace": namespace,
+            "hits": [
+                {"id": rid, "score": round(score, 6), "payload": meta}
+                for rid, score, meta in hits
+            ],
+        }
+
+    def zvec_stats(self) -> dict:
+        from core.zvec import CATALOG
+        return {"ok": True, "stores": CATALOG.stats()}
+
+    def zvec_purge(self) -> dict:
+        from core.zvec import CATALOG
+        CATALOG.purge_all()
+        self.cached_router = None
+        self.cached_vision = None
+        self._log("  🗑 [zvec] 전 네임스페이스를 비웠습니다.")
+        return {"ok": True}
 
     def toggle_devtools(self) -> dict:
         errors = []
@@ -1165,6 +1563,16 @@ class NMSOcrApp:
             "providers": self.router.providers(),
             "vision_providers": self.vision_router.providers(),
             "vision_cache": self.cached_vision.stats() if self.cached_vision else {},
+            "joint": {
+                "label": self.joint_label,
+                "dim": self.joint_dim,
+                "registered": self._joint_registered,
+                "prefer_grid": self.prefer_grid,
+                "loaded": self.joint is not None,
+                "space_dim": self.vision_router.space_dim,
+                "provider_dims": dict(self.vision_router.dims),
+                "text_provider_dims": dict(self.router.dims),
+            },
             "devtools": self.devtools_status(),
             "input": {
                 "path": self.current_path,
@@ -1366,6 +1774,15 @@ def run_ui(args) -> int:
 
         def save_results(self, results_json: str = ""):
             return app.save_results(results_json)
+
+        def zvec_search(self, query: str = "", top_k: int = 10, namespace: str = "fields"):
+            return app.zvec_search(query, int(top_k), namespace)
+
+        def zvec_stats(self):
+            return app.zvec_stats()
+
+        def zvec_purge(self):
+            return app.zvec_purge()
 
         def toggle_devtools(self):
             return app.toggle_devtools()

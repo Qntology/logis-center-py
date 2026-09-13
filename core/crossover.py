@@ -10,19 +10,20 @@ SLOT_OCR = "ocr"
 SLOT_EMBEDDER = "embedder"
 SLOT_REFINER = "refiner"
 SLOT_NLP = "nlp"
+SLOT_JOINT = "joint"
 
 PHASE_PLAN: Dict[str, Dict[str, List[str]]] = {
     PHASE_EMBEDDING: {
-        "keep": [SLOT_VISION, SLOT_OCR, SLOT_EMBEDDER, SLOT_NLP],
+        "keep": [SLOT_JOINT, SLOT_VISION, SLOT_OCR, SLOT_EMBEDDER, SLOT_NLP],
         "release": [SLOT_REFINER],
     },
     PHASE_GENERATION: {
         "keep": [SLOT_OCR, SLOT_REFINER, SLOT_NLP],
-        "release": [SLOT_VISION, SLOT_EMBEDDER],
+        "release": [SLOT_JOINT, SLOT_VISION, SLOT_EMBEDDER],
     },
     PHASE_IDLE: {
         "keep": [],
-        "release": [SLOT_VISION, SLOT_OCR, SLOT_EMBEDDER, SLOT_REFINER],
+        "release": [SLOT_JOINT, SLOT_VISION, SLOT_OCR, SLOT_EMBEDDER, SLOT_REFINER],
     },
 }
 
@@ -32,6 +33,7 @@ SLOT_LABELS: Dict[str, str] = {
     SLOT_EMBEDDER: "텍스트 임베딩",
     SLOT_REFINER: "정제 LLM",
     SLOT_NLP: "Stanza NLP",
+    SLOT_JOINT: "SigLIP2 조인트(비전-텍스트)",
 }
 
 

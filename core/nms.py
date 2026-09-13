@@ -1,5 +1,7 @@
 import math
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Sequence, Tuple, Optional
+
+import numpy as np
 
 
 class Candidate:
@@ -217,3 +219,64 @@ def gumbel_expected_z(n: int) -> float:
     if n <= 1:
         return 0.0
     return math.sqrt(2.0 * math.log(float(n)))
+
+
+def bank_internal_cohesion(vectors: Sequence[np.ndarray]) -> float:
+    rows: List[np.ndarray] = []
+    dim = 0
+    for v in (vectors or []):
+        if v is None:
+            continue
+        arr = np.asarray(v, dtype=np.float32).reshape(-1)
+        if arr.size == 0 or not np.any(arr):
+            continue
+        if dim == 0:
+            dim = int(arr.shape[-1])
+        if int(arr.shape[-1]) != dim:
+            continue
+        rows.append(arr)
+
+    if len(rows) < 2:
+        return 0.0
+
+    mat = np.stack(rows).astype(np.float32)
+    mat = mat / np.maximum(np.linalg.norm(mat, axis=1, keepdims=True), 1e-8)
+    sims = mat @ mat.T
+    iu = np.triu_indices(sims.shape[0], k=1)
+    val = float(np.mean(sims[iu]))
+    if not math.isfinite(val):
+        return 0.0
+    return max(0.0, min(1.0, val))
+
+
+def prejudice_dominates(own: float, prej: float, cohesion: float) -> bool:
+    if not math.isfinite(float(own)) or float(own) <= 0.0:
+        return True
+    relief = max(0.0, min(0.5, float(cohesion)))
+    return float(prej) > float(own) * (1.0 + relief)
+
+
+def decisive_margin(scores: Sequence[float]) -> Tuple[float, float, bool]:
+    vals: List[float] = []
+    for s in (scores or []):
+        try:
+            f = float(s)
+        except Exception:
+            continue
+        if math.isfinite(f):
+            vals.append(f)
+
+    if len(vals) < 2:
+        return 0.0, 0.0, True
+
+    vals.sort(reverse=True)
+    m12 = vals[0] - vals[1]
+
+    tail = vals[1:]
+    mean = sum(tail) / len(tail)
+    var = sum((v - mean) * (v - mean) for v in tail) / len(tail)
+    band = math.sqrt(max(var, 0.0))
+
+    if band <= 1e-6:
+        return m12, 0.0, m12 > 0.0
+    return m12, band, m12 >= band

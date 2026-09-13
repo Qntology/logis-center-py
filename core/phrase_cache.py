@@ -22,145 +22,65 @@ def _key_of(phrase: str) -> int:
 
 class PhraseCache:
     def __init__(self, recipe: str, dim: int, root: Optional[Path] = None):
+        from .zvec import CATALOG, ZvecStore
+
         self.recipe = recipe
         self.dim = int(dim)
-        self.root = Path(root or CACHE_ROOT)
-        self.path = self.root / f"{self._safe(recipe)}-d{self.dim}.bin"
-        self.mem: Dict[int, np.ndarray] = {}
         self.hits = 0
         self.misses = 0
         self._lock = threading.RLock()
-        self._loaded = False
 
-    @staticmethod
-    def _safe(name: str) -> str:
-        return "".join(ch if ch.isalnum() or ch in "-_." else "_" for ch in name)
-
-    def _record_size(self) -> int:
-        return 8 + self.dim * 4
+        if root is None:
+            self.store = CATALOG.store("phrases", self.dim, self.recipe)
+        else:
+            self.store = ZvecStore(
+                "phrases", self.dim, self.recipe, root=Path(root)
+            )
+        self.root = self.store.root
+        self.path = self.store.path
 
     def ensure_loaded(self) -> None:
-        with self._lock:
-            if self._loaded:
-                return
-            self._loaded = True
-
-            if not self.path.exists():
-                return
-
-            try:
-                raw = self.path.read_bytes()
-            except Exception:
-                return
-
-            if len(raw) < 16:
-                return
-
-            magic, version, dim = struct.unpack("<III", raw[:12])
-            if magic != CACHE_MAGIC or version != CACHE_VERSION or dim != self.dim:
-                try:
-                    self.path.unlink()
-                except Exception:
-                    pass
-                return
-
-            rec = self._record_size()
-            body = raw[16:]
-            n = len(body) // rec
-            for i in range(n):
-                off = i * rec
-                key = struct.unpack_from("<Q", body, off)[0]
-                vec = np.frombuffer(body, dtype=np.float32, count=self.dim, offset=off + 8)
-                self.mem[key] = vec.copy()
-
-            if n:
-                print(
-                    f"[PHRASE-CACHE] 복원 {n}구 "
-                    f"({len(raw) / 1e6:.1f} MB) | {self.path.name}"
-                )
+        self.store.ensure_loaded()
 
     def get(self, phrase: str) -> Optional[np.ndarray]:
-        self.ensure_loaded()
+        v = self.store.get(phrase)
         with self._lock:
-            v = self.mem.get(_key_of(phrase))
             if v is None:
                 self.misses += 1
-                return None
-            self.hits += 1
-            return v
+            else:
+                self.hits += 1
+        return v
 
     def get_many(self, phrases: Sequence[str]) -> Dict[str, np.ndarray]:
-        self.ensure_loaded()
-        out: Dict[str, np.ndarray] = {}
+        found = self.store.get_many(list(phrases))
         with self._lock:
-            for p in phrases:
-                v = self.mem.get(_key_of(p))
-                if v is None:
-                    self.misses += 1
-                else:
-                    self.hits += 1
-                    out[p] = v
-        return out
+            self.hits += len(found)
+            self.misses += max(0, len(list(phrases)) - len(found))
+        return found
 
     def all_cached(self, phrases: Sequence[str]) -> bool:
-        self.ensure_loaded()
-        with self._lock:
-            return all(_key_of(p) in self.mem for p in phrases)
+        found = self.store.get_many(list(phrases))
+        return len(found) == len(set(phrases))
 
     def put_batch(self, items: Sequence) -> int:
-        self.ensure_loaded()
-        fresh: List = []
-
-        with self._lock:
-            if len(self.mem) >= MAX_RECORDS:
-                return 0
-            for phrase, vec in items:
-                v = np.asarray(vec, dtype=np.float32).reshape(-1)
-                if v.shape[0] != self.dim:
-                    continue
-                key = _key_of(phrase)
-                if key in self.mem:
-                    continue
-                self.mem[key] = v
-                fresh.append((key, v))
-
-        if not fresh:
+        payload = []
+        for phrase, vec in items:
+            payload.append((str(phrase), vec, {"kind": "anchor"}))
+        if not payload:
             return 0
-
-        try:
-            self.root.mkdir(parents=True, exist_ok=True)
-            is_new = not self.path.exists()
-            with open(self.path, "ab") as f:
-                if is_new:
-                    f.write(struct.pack("<IIII", CACHE_MAGIC, CACHE_VERSION, self.dim, 0))
-                for key, v in fresh:
-                    f.write(struct.pack("<Q", key))
-                    f.write(v.astype(np.float32).tobytes())
-        except Exception as e:
-            print(f"[PHRASE-CACHE] 디스크 기록 실패(메모리는 유지): {e}")
-
-        return len(fresh)
+        return self.store.upsert_many(payload)
 
     def stats(self) -> dict:
-        return {
-            "recipe": self.recipe,
-            "dim": self.dim,
-            "path": str(self.path),
-            "entries": len(self.mem),
-            "hits": self.hits,
-            "misses": self.misses,
-        }
+        out = self.store.stats()
+        out["hits"] = self.hits
+        out["misses"] = self.misses
+        return out
 
     def clear(self) -> None:
+        self.store.purge()
         with self._lock:
-            self.mem.clear()
             self.hits = 0
             self.misses = 0
-            try:
-                if self.path.exists():
-                    self.path.unlink()
-            except Exception:
-                pass
 
 
 class CachedEmbedder:

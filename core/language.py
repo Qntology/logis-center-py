@@ -24,7 +24,11 @@ from .lang_codes import (
     reference_language_of,
     script_histogram,
 )
-from .nms import gumbel_expected_z
+from .nms import (
+    bank_internal_cohesion,
+    decisive_margin,
+    prejudice_dominates,
+)
 
 WORD_SPLIT_RE = re.compile(r"[^\w\u00C0-\uFFFF]+", re.UNICODE)
 
@@ -136,7 +140,11 @@ class TextEvidence:
         self.ref_cos: float = 0.0
         self.noise_cos: float = 0.0
         self.quality: float = 0.0
+        self.best_abs: float = 0.0
+        self.cohesion: float = 0.0
+        self.noise_dominant: bool = False
         self.absolute: Dict[str, float] = {}
+        self.neutral: Dict[str, float] = {}
         self.relative: Dict[str, float] = {}
         self.ranked: List[Tuple[str, float]] = []
         self.usable: bool = False
@@ -149,10 +157,13 @@ class TextEvidence:
             "reference": self.reference,
             "ref_cos": round(self.ref_cos, 4),
             "noise_cos": round(self.noise_cos, 4),
+            "best_abs": round(self.best_abs, 4),
+            "cohesion": round(self.cohesion, 4),
+            "noise_dominant": self.noise_dominant,
             "quality": round(self.quality, 4),
             "usable": self.usable,
             "ranked": [
-                {"code": c, "relative": round(v, 4)} for c, v in self.ranked[:8]
+                {"code": c, "neutral": round(v, 4)} for c, v in self.ranked[:8]
             ],
         }
 
@@ -170,6 +181,7 @@ class LanguageDetector:
         reference_margin: float = REFERENCE_DECISION_MARGIN,
         peer_margin: float = PEER_DECISION_MARGIN,
         noise_floor: float = NOISE_QUALITY_FLOOR,
+        served_codes: Optional[Sequence[str]] = None,
     ):
         self.ocr = ocr
         self.embed_fn = embed_fn
@@ -181,6 +193,9 @@ class LanguageDetector:
         self.reference_margin = float(reference_margin)
         self.peer_margin = float(peer_margin)
         self.noise_floor = float(noise_floor)
+        self.served_codes = {
+            normalize_lang_code(c) for c in (served_codes or []) if c
+        }
         self._anchor_cache: Dict[str, np.ndarray] = {}
         self._text_cache: Dict[str, np.ndarray] = {}
         self._text_dim: int = 0
@@ -391,44 +406,54 @@ class LanguageDetector:
         if patches is None or patches.size == 0:
             return {}
 
-        chrome_vecs = []
+        pmat = np.asarray(patches, dtype=np.float32)
+        if pmat.ndim == 1:
+            pmat = pmat.reshape(1, -1)
+        pmat = pmat / np.maximum(
+            np.linalg.norm(pmat, axis=1, keepdims=True), 1e-8
+        )
+        dim = int(pmat.shape[-1])
+
+        chrome_rows: List[np.ndarray] = []
         for ph in SCRIPT_CHROME_ANCHORS:
             v = self._anchor_vec(ph)
-            if v is not None:
-                chrome_vecs.append(v)
+            if v is None or int(np.asarray(v).reshape(-1).shape[-1]) != dim:
+                continue
+            chrome_rows.append(pmat @ np.asarray(v, dtype=np.float32).reshape(-1))
 
-        raw: Dict[str, float] = {}
+        keys: List[str] = []
+        rows: List[np.ndarray] = []
         for script, phrase in SCRIPT_ANCHORS.items():
             av = self._anchor_vec(phrase)
-            if av is None:
+            if av is None or int(np.asarray(av).reshape(-1).shape[-1]) != dim:
                 continue
-            best = -1.0
-            for i in range(patches.shape[0]):
-                s = _cos(patches[i], av)
-                if s > best:
-                    best = s
-            prej = 0.0
-            for cv in chrome_vecs:
-                pbest = -1.0
-                for i in range(patches.shape[0]):
-                    s = _cos(patches[i], cv)
-                    if s > pbest:
-                        pbest = s
-                if pbest > prej:
-                    prej = pbest
-            raw[script] = best - prej
+            keys.append(script)
+            rows.append(pmat @ np.asarray(av, dtype=np.float32).reshape(-1))
 
-        if not raw:
+        if not rows:
             return {}
 
-        keys = list(raw.keys())
-        zs = _z_scores([raw[k] for k in keys])
-        penalty = gumbel_expected_z(len(keys))
-        out = {k: (z - penalty) for k, z in zip(keys, zs)}
+        raw = np.stack(rows).astype(np.float32)
+        mu = raw.mean(axis=1, keepdims=True)
+        sd = float(np.sqrt(np.mean((raw - mu) ** 2)))
+        sd = sd if sd > 1e-6 else 1.0
+        net = (raw - mu) / sd
+
+        if chrome_rows:
+            chrome = np.max(np.stack(chrome_rows), axis=0)
+            zc = np.maximum((chrome - float(chrome.mean())) / sd, 0.0)
+            net = net - zc[None, :]
+
+        if net.shape[0] >= 2:
+            net = net - net.mean(axis=0, keepdims=True)
+
+        out = {k: float(net[i].max()) for i, k in enumerate(keys)}
 
         top = sorted(out.items(), key=lambda kv: kv[1], reverse=True)[:4]
         brief = " | ".join(f"{k}={v:+.3f}" for k, v in top)
-        self._log(f"  👁 시각 스크립트 후보: {brief}")
+        self._log(
+            f"  👁 시각 스크립트 후보(패치별 크롬 상쇄 + 열 센터링): {brief}"
+        )
         return out
 
     def _cosine_profile(
@@ -436,50 +461,81 @@ class LanguageDetector:
         doc_vec: np.ndarray,
         codes: Sequence[str],
         keep: int = FINALIST_KEEP,
-    ) -> Tuple[Dict[str, float], float]:
-        base_map: Dict[str, str] = {}
-        for c in codes:
+    ) -> Dict[str, object]:
+        order = [c for c in dict.fromkeys(codes) if c]
+        if not order:
+            return {}
+
+        phrase_grid: Dict[str, List[str]] = {}
+        probe: List[str] = []
+        for c in order:
             phrases = lang_anchor_phrases(c)
-            if phrases:
-                base_map[c] = phrases[0]
+            if not phrases:
+                continue
+            phrase_grid[c] = phrases
+            probe.extend(phrases)
+        probe.extend(NOISE_ANCHORS)
 
-        probe = list(base_map.values()) + list(NOISE_ANCHORS)
         vecs = self._text_anchor_vecs(probe)
-        if not vecs:
-            return {}, 0.0
+        if not vecs or not phrase_grid:
+            return {}
 
-        coarse: Dict[str, float] = {}
-        for c, phrase in base_map.items():
-            v = vecs.get(phrase)
-            if v is not None:
-                coarse[c] = _cos(doc_vec, v)
+        width = max((len(v) for v in phrase_grid.values()), default=0)
+        if width == 0:
+            return {}
 
-        if not coarse:
-            return {}, 0.0
+        langs: List[str] = []
+        rows: List[List[float]] = []
+        for c, phrases in phrase_grid.items():
+            row: List[float] = []
+            for i in range(width):
+                p = phrases[i] if i < len(phrases) else ""
+                v = vecs.get(p)
+                row.append(_cos(doc_vec, v) if v is not None else float("nan"))
+            if not any(not np.isnan(x) for x in row):
+                continue
+            langs.append(c)
+            rows.append(row)
+
+        if not langs:
+            return {}
+
+        grid = np.asarray(rows, dtype=np.float64)
+        mask = ~np.isnan(grid)
+        counts = mask.sum(axis=0, keepdims=True)
+        sums = np.where(mask, grid, 0.0).sum(axis=0, keepdims=True)
+        col_mean = sums / np.maximum(counts, 1)
+        centered = grid - col_mean
+
+        absolute: Dict[str, float] = {}
+        neutral: Dict[str, float] = {}
+        for i, c in enumerate(langs):
+            valid = mask[i]
+            if not valid.any():
+                absolute[c] = 0.0
+                neutral[c] = 0.0
+                continue
+            absolute[c] = float(grid[i][valid].max())
+            neutral[c] = float(centered[i][valid].max())
 
         noise_sims = [_cos(doc_vec, vecs[p]) for p in NOISE_ANCHORS if p in vecs]
-        noise = float(max(noise_sims)) if noise_sims else 0.0
+        noise_abs = float(max(noise_sims)) if noise_sims else 0.0
 
-        ranked = sorted(coarse.items(), key=lambda kv: kv[1], reverse=True)
-        finalists = [c for c, _v in ranked[: max(2, int(keep))]]
-        if REFERENCE_LANGUAGE in coarse and REFERENCE_LANGUAGE not in finalists:
-            finalists.append(REFERENCE_LANGUAGE)
+        bank_vecs = [
+            vecs[p]
+            for phrases in phrase_grid.values()
+            for p in phrases
+            if p in vecs
+        ]
+        cohesion = bank_internal_cohesion(bank_vecs)
 
-        fine_probe: List[str] = []
-        for c in finalists:
-            fine_probe.extend(lang_anchor_phrases(c))
-        fine = self._text_anchor_vecs(fine_probe)
-
-        out: Dict[str, float] = dict(coarse)
-        for c in finalists:
-            sims = [
-                _cos(doc_vec, fine[p])
-                for p in lang_anchor_phrases(c) if p in fine
-            ]
-            if sims:
-                out[c] = float(sum(sims) / len(sims))
-
-        return out, noise
+        return {
+            "absolute": absolute,
+            "neutral": neutral,
+            "noise_abs": noise_abs,
+            "cohesion": cohesion,
+            "templates": int(width),
+        }
 
     def stage_b_text(self, text: str) -> TextEvidence:
         ev = TextEvidence()
@@ -520,33 +576,50 @@ class LanguageDetector:
             if extra and extra not in codes:
                 codes.append(extra)
 
-        absolute, noise = self._cosine_profile(doc_vec, codes)
-        if not absolute:
+        profile = self._cosine_profile(doc_vec, codes)
+        absolute = profile.get("absolute") or {}
+        neutral = profile.get("neutral") or {}
+        if not absolute or not neutral:
             self._log("  ⚠ 언어 앵커 임베딩을 얻지 못했습니다.")
             return ev
 
         base_code = (
-            REFERENCE_LANGUAGE if REFERENCE_LANGUAGE in absolute
+            REFERENCE_LANGUAGE if REFERENCE_LANGUAGE in neutral
             else reference_language_of(script)
         )
-        if base_code not in absolute:
-            base_code = max(absolute.items(), key=lambda kv: kv[1])[0]
+        if base_code not in neutral:
+            base_code = max(neutral.items(), key=lambda kv: kv[1])[0]
 
         ev.absolute = absolute
-        ev.noise_cos = float(noise)
+        ev.neutral = neutral
+        ev.noise_cos = float(profile.get("noise_abs", 0.0))
+        ev.cohesion = float(profile.get("cohesion", 0.0))
         ev.reference = base_code
         ev.ref_cos = float(absolute.get(base_code, 0.0))
-        ev.relative = {c: v - ev.ref_cos for c, v in absolute.items()}
-        ev.ranked = sorted(ev.relative.items(), key=lambda kv: kv[1], reverse=True)
-        ev.quality = float(max(absolute.values()) - noise)
+        ev.best_abs = float(max(absolute.values())) if absolute else 0.0
+        ref_net = float(neutral.get(base_code, 0.0))
+        ev.relative = {c: v - ref_net for c, v in neutral.items()}
+        ev.ranked = sorted(neutral.items(), key=lambda kv: kv[1], reverse=True)
+        ev.noise_dominant = prejudice_dominates(
+            ev.best_abs, ev.noise_cos, ev.cohesion
+        )
+        ev.quality = float(ev.best_abs - ev.noise_cos)
         ev.usable = True
 
         self._log(
-            f"  🧭 기준 언어 '{base_code}' 절대 코사인 {ev.ref_cos:+.4f} "
-            f"| 노이즈 앵커 {noise:+.4f} | 언어 품질 {ev.quality:+.4f}"
+            f"  🧭 언어 앵커 {len(neutral)}개 × 템플릿 "
+            f"{int(profile.get('templates', 0))}종 — 템플릿 축 열 센터링으로 "
+            f"공통 성분 제거 후 Max-Pool"
         )
         self._log(
-            "  📚 영어 기준 상대 코사인: "
+            f"  🧭 기준 언어 '{base_code}' 절대 {ev.ref_cos:+.4f} "
+            f"| 최고 언어 앵커 {ev.best_abs:+.4f} "
+            f"| 노이즈 앵커 {ev.noise_cos:+.4f} "
+            f"| 뱅크 응집도 {ev.cohesion:.4f} "
+            f"→ 노이즈 우세 {'예' if ev.noise_dominant else '아니오'}"
+        )
+        self._log(
+            "  📚 뱅크 중립 점수: "
             + " | ".join(f"{c}={v:+.4f}" for c, v in ev.ranked[:6])
         )
         return ev
@@ -588,63 +661,111 @@ class LanguageDetector:
                 max(ev.quality, 0.0), ranked, "script-exclusive",
             )
 
-        if ev.quality < self.noise_floor:
+        if ev.noise_dominant:
             self._log(
-                f"  🚧 언어 품질 {ev.quality:+.4f} < {self.noise_floor:+.4f} — "
-                f"노이즈 앵커가 더 강해 '{fallback}' 로 보류합니다."
+                f"  🚧 노이즈 앵커 {ev.noise_cos:+.4f} 가 최고 언어 앵커 "
+                f"{ev.best_abs:+.4f} 를 응집도 여유 "
+                f"({min(max(ev.cohesion, 0.0), 0.5):.3f}) 이상으로 앞섭니다 "
+                f"→ '{fallback}' 로 보류합니다."
             )
             return fallback, script, ev.quality, ev.quality, ranked, "noise-fallback"
 
-        best_code, best_rel = ranked[0]
+        best_code, best_net = ranked[0]
         second_code = ranked[1][0] if len(ranked) > 1 else best_code
-        second_rel = ranked[1][1] if len(ranked) > 1 else best_rel
-        peer_margin = best_rel - second_rel
+        second_net = ranked[1][1] if len(ranked) > 1 else best_net
+        ref_net = float(ev.neutral.get(ev.reference, best_net))
+        ref_margin = best_net - ref_net
+
+        m12, noise_band, decisive = decisive_margin([v for _c, v in ranked])
+        if noise_band <= 1e-6:
+            decisive = (
+                m12 >= self.peer_margin and ref_margin >= self.reference_margin
+            )
+
+        self._log(
+            f"  📏 1·2위 격차 {m12:+.4f} | 후보 잡음대 {noise_band:.4f} "
+            f"| 기준 언어 대비 {ref_margin:+.4f} → "
+            f"{'결정적' if decisive else '동률'}"
+        )
+
+        axis_power = float(ev.best_abs - ev.noise_cos)
+        spread = (
+            float(np.std([v for _c, v in ranked], dtype=np.float64))
+            if len(ranked) > 1 else 0.0
+        )
+        self._log(
+            f"  🔬 축 변별력 — 언어성 {axis_power:+.4f} vs 언어 간 산포 "
+            f"{spread:.4f}"
+        )
+
+        if axis_power <= spread:
+            priors = priors_for_script(script)
+            pool = [c for c, _v in ranked]
+            if ev.reference in ev.neutral and ev.reference not in pool:
+                pool.append(ev.reference)
+            if fallback and fallback not in pool:
+                pool.append(fallback)
+            pick = max(
+                pool,
+                key=lambda c: (
+                    1.0 if c in self.served_codes else 0.0,
+                    priors.get(c, 0.0),
+                    float(ev.neutral.get(c, 0.0)),
+                ),
+            )
+            self._log(
+                f"  🚧 언어 앵커가 '언어임'과 '노이즈'조차 구분하지 못합니다 "
+                f"({axis_power:+.4f} ≤ {spread:.4f}) — '{best_code}' 우위는 "
+                f"이름 토큰 치환이 만든 잡음입니다. 문자체계 '{script}' "
+                f"사전분포로 '{pick}' (prior {priors.get(pick, 0.0):.2f}, "
+                f"서비스 {'가능' if pick in self.served_codes else '불가'}) 확정"
+            )
+            return (
+                pick, script, float(ev.neutral.get(pick, best_net)),
+                max(axis_power, 0.0), ranked, "script-prior",
+            )
 
         if best_code == ev.reference:
             self._log(
                 f"  👑 기준 언어 '{ev.reference}' 가 최상위 — "
-                f"동급 격차 {peer_margin:+.4f}"
+                f"동급 격차 {m12:+.4f}"
             )
             return (
-                ev.reference, script, best_rel, max(peer_margin, 0.0),
+                ev.reference, script, best_net, max(m12, 0.0),
                 ranked, "reference-locked",
             )
 
-        if best_rel < self.reference_margin:
+        if decisive:
             self._log(
-                f"  ⚖ '{best_code}' 가 기준 언어 '{ev.reference}' 를 "
-                f"{best_rel:+.4f} 만큼만 앞섭니다 "
-                f"(요구 {self.reference_margin:.3f}) → 기준 언어 유지"
+                f"  👑 '{best_code}' 확정 — 차상위 '{second_code}' 대비 "
+                f"{m12:+.4f} (잡음대 {noise_band:.4f})"
             )
-            return (
-                ev.reference, script, best_rel, best_rel,
-                ranked, "reference-fallback",
-            )
+            return best_code, script, best_net, m12, ranked, "cosine-decided"
 
-        if peer_margin < self.peer_margin:
-            priors = priors_for_script(script)
-            pool = [c for c, _v in ranked[:3] if c != ev.reference]
-            pick = max(pool, key=lambda c: priors.get(c, 0.0)) if pool else fallback
-
-            if best_rel >= STRONG_REFERENCE_MARGIN and script != "Latin":
-                self._log(
-                    f"  🌍 '{best_code}' vs '{second_code}' 격차 {peer_margin:+.4f} "
-                    f"이지만 기준 언어 대비 {best_rel:+.4f} 로 뚜렷 → "
-                    f"문자체계 우선 언어 '{pick}' 확정"
-                )
-                return pick, script, best_rel, peer_margin, ranked, "script-prior"
-
-            self._log(
-                f"  ⚖ '{best_code}' vs '{second_code}' 격차 {peer_margin:+.4f} < "
-                f"{self.peer_margin:.3f} → 기준 언어 '{fallback}' 로 보류"
-            )
-            return fallback, script, best_rel, peer_margin, ranked, "low-margin"
+        priors = priors_for_script(script)
+        pool = [c for c, _v in ranked[:3]]
+        if ev.reference not in pool:
+            pool.append(ev.reference)
+        if fallback and fallback not in pool:
+            pool.append(fallback)
+        pick = max(
+            pool,
+            key=lambda c: (
+                1.0 if c in self.served_codes else 0.0,
+                priors.get(c, 0.0),
+                float(ev.neutral.get(c, 0.0)),
+            ),
+        )
 
         self._log(
-            f"  👑 '{best_code}' 확정 — 기준 언어 대비 {best_rel:+.4f}, "
-            f"차상위 '{second_code}' 대비 {peer_margin:+.4f}"
+            f"  🌍 '{best_code}' vs '{second_code}' 격차 {m12:+.4f} 가 잡음대 "
+            f"{noise_band:.4f} 미만 — 문자체계 사전분포로 '{pick}' "
+            f"(prior {priors.get(pick, 0.0):.2f}) 확정"
         )
-        return best_code, script, best_rel, peer_margin, ranked, "cosine-decided"
+        return (
+            pick, script, float(ev.neutral.get(pick, best_net)),
+            m12, ranked, "script-prior",
+        )
 
     def detect(self, image: Image.Image) -> LanguageVerdict:
         self.logs = []

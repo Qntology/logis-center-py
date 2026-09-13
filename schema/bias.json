@@ -2539,7 +2539,6 @@
       }
     },
     "default": {
-    "default": {
       "layout_list": {
         "semantic": "다중 항목을 나열하는 목록, 표, 리스트 페이지",
         "bias": "{TYPE}목록, {TYPE}리스트, {TYPE}표, {TYPE}일괄, 목록, 리스트, 표, 일괄",
@@ -3719,7 +3718,6 @@
         "prejudice": "identifier, link, address, number, code, work title, title lettering, chapter title, episode count, speech balloon dialogue, spoken line, thought balloon, inner monologue, narration, caption box, sound effect, onomatopoeia, character name, speaker, name tag, author, artist, story by, art by, serialization status, completed, ongoing, page number"
       }
     },
-    "default": {
     "default": {
       "layout_list": {
         "semantic": "List displaying multiple items, table, list page",

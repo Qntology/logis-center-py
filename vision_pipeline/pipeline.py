@@ -24,6 +24,25 @@ from .value_grounding import GroundingClaim, apply_verdicts, verify_claims
 from .vision_nms import CropPlan, plan_crops
 
 
+class _LiveLog(list):
+    def __init__(self, emit: Optional[Callable[[str], None]] = None):
+        super().__init__()
+        self._emit = emit
+
+    def append(self, item):
+        super().append(item)
+        if self._emit is None:
+            return
+        try:
+            self._emit(item)
+        except Exception:
+            pass
+
+    def extend(self, items):
+        for it in items:
+            self.append(it)
+
+
 class VisionPipelineConfig:
     def __init__(
         self,
@@ -35,10 +54,11 @@ class VisionPipelineConfig:
         title_penalty: float = 0.5,
         enable_spatial_residual: bool = True,
         enable_grounding: bool = True,
-        cross_prejudice: bool = True,
+        cross_prejudice: bool = False,
         keep_crop: bool = True,
         prefer_grid: str = "ocr",
         lang_code: str = "",
+        doc_code: str = "",
         enable_gutters: bool = True,
         max_crop_cols: int = 0,
         patch_margin: float = 0.12,
@@ -57,6 +77,7 @@ class VisionPipelineConfig:
         self.keep_crop = bool(keep_crop)
         self.prefer_grid = prefer_grid
         self.lang_code = str(lang_code or "")
+        self.doc_code = str(doc_code or "")
         self.enable_gutters = bool(enable_gutters)
         self.max_crop_cols = int(max_crop_cols)
         self.patch_margin = float(patch_margin)
@@ -112,15 +133,17 @@ class VisionPipeline:
         log: Optional[Callable[[str], None]] = None,
         nlp=None,
         crossover=None,
+        joint=None,
     ):
         self.embed_fn = embed_fn
         self.ocr = ocr
         self.embedder = embedder
+        self.joint = joint
         self.config = config or VisionPipelineConfig()
         self._log_fn = log or (lambda m: None)
         self.nlp = nlp
         self.crossover = crossover
-        self.logs: List[str] = []
+        self.logs: List[str] = _LiveLog(self._log_fn)
 
     def _phase(self, name: str):
         if self.crossover is None:
@@ -144,32 +167,42 @@ class VisionPipeline:
         emb = self.crossover.get("vision")
         if emb is not None:
             self.embedder = emb
+        jnt = self.crossover.get("joint")
+        if jnt is not None:
+            self.joint = jnt
 
     def _log(self, msg: str):
         self.logs.append(msg)
-        try:
-            self._log_fn(msg)
-        except Exception:
-            pass
 
     def classify(
         self,
         image: Image.Image,
         schema_dir,
         grid: Optional[VisionPatchGrid] = None,
+        text_sample: str = "",
+        text_embed_fn: Optional[Callable[[List[str]], np.ndarray]] = None,
     ) -> DocTypeVerdict:
+        self.logs = _LiveLog(self._log_fn)
         if grid is None:
             grid = build_patch_grid(
                 image, embedder=self.embedder, ocr=self.ocr,
-                prefer=self.config.prefer_grid,
+                prefer=self.config.prefer_grid, joint=self.joint,
             )
-        specs, file_map = load_doc_type_specs(schema_dir)
+        self._log(
+            f"  격자 {grid.rows}x{grid.cols}={grid.num_patches} "
+            f"| dim={grid.dim} | src={grid.source}"
+        )
         if self.config.lang_code:
             self._log(f"  🈯 문서 유형 앵커 스코프: {self.config.lang_code}")
+        specs, file_map = load_doc_type_specs(
+            schema_dir, lang_code=self.config.lang_code, log=self.logs
+        )
         return classify_doc_type(
             grid, specs, self.embed_fn, file_map=file_map,
             margin_threshold=self.config.margin_threshold,
             log=self.logs,
+            text_sample=text_sample,
+            text_embed_fn=text_embed_fn,
         )
 
     def run(
@@ -180,7 +213,7 @@ class VisionPipeline:
     ) -> VisionPipelineResult:
         result = VisionPipelineResult()
         started = time.time()
-        self.logs = []
+        self.logs = _LiveLog(self._log_fn)
 
         try:
             self._phase("embedding")
@@ -189,7 +222,7 @@ class VisionPipeline:
             self._log("═══ STEP 1: 패치 임베딩 격자 ═══")
             grid = build_patch_grid(
                 image, embedder=self.embedder, ocr=self.ocr,
-                prefer=self.config.prefer_grid,
+                prefer=self.config.prefer_grid, joint=self.joint,
             )
             result.grid = grid
             self._log(
@@ -203,6 +236,7 @@ class VisionPipeline:
                 cross_prejudice=self.config.cross_prejudice,
                 lang_code=self.config.lang_code,
                 log=self.logs,
+                doc_code=self.config.doc_code or str(schema.get("code") or ""),
             )
             if not heatmaps:
                 result.error = "필드 친화도 맵을 생성하지 못했습니다."
@@ -297,10 +331,18 @@ class VisionPipeline:
 
             if self.config.enable_grounding:
                 self._log("═══ STEP 5: Value Grounding ═══")
-                claims = [
-                    GroundingClaim(f.category, f.category, f.value, f.bbox)
-                    for f in fields if f.value.strip()
-                ]
+                claims = []
+                for f in fields:
+                    if f.field_values:
+                        for key, val in f.field_values.items():
+                            if str(val).strip():
+                                claims.append(
+                                    GroundingClaim(f.category, key, str(val), f.bbox)
+                                )
+                    elif f.value.strip():
+                        claims.append(
+                            GroundingClaim(f.category, f.category, f.value, f.bbox)
+                        )
                 verdicts = verify_claims(
                     claims, grid, self.embed_fn, nlp=self.nlp, log=self.logs
                 )

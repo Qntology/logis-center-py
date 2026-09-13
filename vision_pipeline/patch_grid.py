@@ -140,8 +140,28 @@ def build_patch_grid(
     ocr=None,
     prefer: str = "ocr",
     align_to: Optional[VisionPatchGrid] = None,
+    joint=None,
 ) -> VisionPatchGrid:
     orig_w, orig_h = image.size
+
+    if joint is not None and prefer in ("joint", "siglip", "siglip2"):
+        out = joint.embed_image_patches(image)
+        feats = np.asarray(out["valid_features"], dtype=np.float32)
+        rows = int(out["rows"])
+        cols = int(out["cols"])
+        expected = max(1, rows * cols)
+        if feats.shape[0] != expected:
+            feats = _resample_to_grid(feats, expected)
+        feats = _l2_rows(feats)
+        return VisionPatchGrid(
+            embeddings=feats,
+            rows=rows,
+            cols=cols,
+            orig_width=orig_w,
+            orig_height=orig_h,
+            patch_size=getattr(joint, "patch_size", 16),
+            source="siglip2",
+        )
 
     if prefer == "ocr" and ocr is not None:
         out = ocr.embed_image_patches(image)
@@ -185,7 +205,28 @@ def build_patch_grid(
             grid.num_patches = align_to.num_patches
         return grid
 
-    raise RuntimeError("패치 격자를 만들 수 있는 모델이 없습니다. (embedder / ocr 둘 다 None)")
+    if ocr is not None:
+        out = ocr.embed_image_patches(image)
+        feats = np.asarray(out["valid_features"], dtype=np.float32)
+        rows = int(out["rows"])
+        cols = int(out["cols"])
+        expected = max(1, rows * cols)
+        if feats.shape[0] != expected:
+            feats = _resample_to_grid(feats, expected)
+        feats = _l2_rows(feats)
+        return VisionPatchGrid(
+            embeddings=feats,
+            rows=rows,
+            cols=cols,
+            orig_width=orig_w,
+            orig_height=orig_h,
+            patch_size=getattr(ocr, "patch_size", 16),
+            source="hayai",
+        )
+
+    raise RuntimeError(
+        "패치 격자를 만들 수 있는 모델이 없습니다. (joint / embedder / ocr 전부 None)"
+    )
 
 
 def row_band_profile(image: Image.Image) -> np.ndarray:

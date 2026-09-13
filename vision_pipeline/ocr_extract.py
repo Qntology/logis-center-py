@@ -33,6 +33,7 @@ class ExtractedField:
         self.ocr_raw = ocr_text
         self.lemma = ""
         self.nlp_meta: dict = {}
+        self.field_values: Dict[str, str] = {}
 
     @property
     def value(self) -> str:
@@ -197,12 +198,20 @@ def extract_from_crops(
             )
 
         refined = {}
+        values: Dict[str, str] = {}
         if refine_fn is not None and cleaned.strip():
             try:
                 refined = refine_fn(plan.category, cleaned, crop) or {}
             except Exception as e:
                 if log is not None:
                     log.append(f"    ⚠ 정제 추출 실패: {e}")
+            if isinstance(refined, dict):
+                inner = refined.get("__fields__")
+                if isinstance(inner, dict):
+                    values = {
+                        str(k): str(v) for k, v in inner.items()
+                        if isinstance(v, str) and v.strip()
+                    }
 
         field = ExtractedField(
             category=plan.category,
@@ -219,11 +228,18 @@ def extract_from_crops(
         field.ocr_raw = text
         field.lemma = nlp_meta.get("lemma", "")
         field.nlp_meta = nlp_meta
+        field.field_values = values
         out.append(field)
 
         if log is not None:
-            preview = field.value[:60].replace("\n", " / ")
-            log.append(f"    📝 '{plan.category}' = {preview or '(공백)'}")
+            if values:
+                brief = " | ".join(
+                    f"{k}={str(v)[:24]}" for k, v in list(values.items())[:5]
+                )
+                log.append(f"    📝 [{plan.category}] {brief}")
+            else:
+                preview = field.value[:60].replace("\n", " / ")
+                log.append(f"    📝 '{plan.category}' = {preview or '(공백)'}")
 
     return out
 
@@ -233,9 +249,24 @@ def fields_to_record(
     schema: Optional[dict] = None,
 ) -> Dict[str, object]:
     record: Dict[str, object] = {}
+    schema_fields = set((schema or {}).get("fields", {}) or {})
+
     for f in fields:
+        if f.field_values:
+            for key, val in f.field_values.items():
+                if not val:
+                    continue
+                if schema_fields and key not in schema_fields:
+                    continue
+                if key in record and record[key]:
+                    continue
+                record[key] = val
+            continue
+
         val = f.value
         if not val:
+            continue
+        if schema_fields and f.category not in schema_fields:
             continue
         if f.category in record:
             prev = record[f.category]
@@ -246,7 +277,6 @@ def fields_to_record(
         else:
             record[f.category] = val
 
-    if schema:
-        for name in (schema.get("fields", {}) or {}).keys():
-            record.setdefault(name, None)
+    for name in schema_fields:
+        record.setdefault(name, None)
     return record
