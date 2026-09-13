@@ -226,8 +226,12 @@ if !errorlevel! neq 0 echo   stanza: NOT INSTALLED (NLP gate disabled)
 python -c "import bitsandbytes; print('  bitsandbytes: OK (4-bit available)')" 2>nul
 if !errorlevel! neq 0 echo   bitsandbytes: not installed (offload fallback)
 
-python -c "import fitz; print('  PyMuPDF: OK')" 2>nul
-if !errorlevel! neq 0 echo   PyMuPDF: NOT INSTALLED (PDF input disabled)
+python -c "import pypdfium2; print(f'  pypdfium2: {pypdfium2.V_PYPDFIUM2}')" 2>nul
+if !errorlevel! neq 0 python -c "import pypdfium2; print('  pypdfium2: OK')" 2>nul
+if !errorlevel! neq 0 echo   pypdfium2: NOT INSTALLED (PDF rendering disabled)
+
+python -c "import pypdf; print(f'  pypdf: {pypdf.__version__}')" 2>nul
+if !errorlevel! neq 0 echo   pypdf: NOT INSTALLED (PDF text fallback disabled)
 
 echo.
 echo ============================================================
@@ -263,6 +267,13 @@ echo   Memory
 echo     Usable RAM      : %RAM_GB% GB
 echo     Cap RAM         : --ram-limit 8
 echo     Force load      : --allow-low-ram  (risk of process kill)
+echo   PDF
+echo     Engine          : PDFium via pypdfium2 (BSD-3-Clause)
+echo                       No Poppler, no Ghostscript, no AGPL.
+echo     Resolution      : --pdf-dpi 200
+echo     Page cap        : --pdf-pages 32
+echo     Text layer      : used automatically when present
+echo                       override with --pdf-force-vision
 echo ============================================================
 echo.
 

@@ -87,6 +87,7 @@ nms-ocr/
 │   ├── siglip_joint.py             # SigLIP2 joint vision-text space + self-test
 │   ├── embedding.py                # A.X-VE patch embedder + PatchGrid
 │   ├── ppocr.py                    # PaddleOCRRec + PaddleTextDetector (shared)
+│   ├── pdf_render.py               # PDFium render + text layer, multi-page, backends
 │   ├── line_reader.py              # Line split, read windows, weighted cross-vote
 │   ├── nlp.py                      # Stanza gate (UPOS / DEPREL / lemma)
 │   ├── lang_codes.py               # ISO maps, script ranges, decisive blocks, priors
@@ -474,6 +475,9 @@ python app.py --fetch-all --lang kor           # download everything for Korean
 python app.py img.jpg --line-overlap 0         # strict one-line-per-read
 python app.py img.jpg --no-refine              # OCR only, skip the VLM
 python app.py img.jpg --ram-limit 8            # cap staging admission at 8 GB
+python app.py doc.pdf --page 3                 # process page 3
+python app.py doc.pdf --pdf-dpi 300            # higher render resolution
+python app.py doc.pdf --pdf-force-vision       # ignore the embedded text layer
 ```
 
 ---
@@ -492,6 +496,11 @@ python app.py img.jpg --ram-limit 8            # cap staging admission at 8 GB
 | `--paddle-mkldnn` / `NMS_PADDLE_MKLDNN=1` | off | Re-enable oneDNN (see note) |
 | `--no-paddle-install` / `NMS_PADDLE_AUTOINSTALL=0` | on | Disable runtime PaddlePaddle installation |
 | `NMS_PADDLE_THREADS` | `min(8, cpu_count)` | PaddleOCR CPU threads |
+| `--pdf-dpi` / `NMS_PDF_DPI` | `200` | PDF render resolution (72–400, auto-capped at 4000 px on the long side) |
+| `--pdf-pages` / `NMS_PDF_MAX_PAGES` | `32` | Maximum pages processed per document |
+| `--pdf-force-vision` / `NMS_PDF_FORCE_VISION=1` | off | Ignore the embedded text layer, use the vision pipeline |
+| `--page` | `1` | Page number to process (1-based) |
+| `NMS_PDF_BACKEND` | auto | Pin the PDF backend (`pypdfium2` / `pypdf` / `pdf2image`) |
 | `NMS_DIAG` | `1` | `0` quiet, `1` summary, `2` per-tensor |
 | `--vram-budget` | auto | Override detected VRAM |
 | `--low-vram` | auto (< 6 GB) | Force quantized / offloaded refiner |
@@ -555,7 +564,9 @@ No model weights are redistributed with this repository. Every checkpoint is fet
 | [PyYAML](https://github.com/yaml/pyyaml) | `inference.yml` charset fallback | MIT |
 | [opencv-python-headless](https://github.com/opencv/opencv-python) | PaddleOCR image preprocessing | Apache-2.0 (OpenCV) · MIT (wrapper) |
 | [psutil](https://github.com/giampaolo/psutil) | Cross-platform RAM probe | BSD-3-Clause |
-| [PyMuPDF](https://github.com/pymupdf/PyMuPDF) | PDF page rasterization | **AGPL-3.0-only** OR commercial |
+| [pypdfium2](https://github.com/pypdfium2-team/pypdfium2) | PDF rasterization + text layer | Apache-2.0 OR BSD-3-Clause |
+| [PDFium](https://pdfium.googlesource.com/pdfium/) | Bundled PDF engine (inside pypdfium2 wheels) | BSD-3-Clause |
+| [pypdf](https://github.com/py-pdf/pypdf) | Pure-Python PDF text fallback | BSD-3-Clause |
 
 ### Optional Dependencies
 
@@ -564,22 +575,28 @@ No model weights are redistributed with this repository. Every checkpoint is fet
 | [paddlepaddle](https://github.com/PaddlePaddle/Paddle) | PP-OCRv5 execution runtime | Apache-2.0 |
 | [paddleocr](https://github.com/PaddlePaddle/PaddleOCR) | `TextRecognition`, `TextDetection` | Apache-2.0 |
 | [bitsandbytes](https://github.com/bitsandbytes-foundation/bitsandbytes) | NF4 4-bit quantization | MIT |
-| [pdf2image](https://github.com/Belval/pdf2image) | PDF fallback when PyMuPDF is absent | MIT |
-| [poppler](https://poppler.freedesktop.org/) | External binary required by pdf2image | GPL-2.0 / GPL-3.0 |
+| [pdf2image](https://github.com/Belval/pdf2image) | Last-resort PDF render path (not installed by default) | MIT |
+| [poppler](https://poppler.freedesktop.org/) | External binary required only by pdf2image | GPL-2.0 / GPL-3.0 |
 
-### ⚠️ PyMuPDF License Notice
+### PDF Handling — Permissive by Default
 
-`PyMuPDF` is distributed under **AGPL-3.0-only**, which is not compatible with redistributing this Apache-2.0 project as a closed-source binary. It is used in a single place — `NMSOcrApp._render_pdf()` — and the code already falls back to `pdf2image` when it is absent:
+PDF support runs on **PDFium**, the engine Chrome uses, via the `pypdfium2` wrapper. PDFium is **BSD-3-Clause**; the wrapper is dual-licensed **Apache-2.0 OR BSD-3-Clause**. The published wheels embed the prebuilt native library, so there is no Poppler, no Ghostscript, and no external binary to install.
 
-```python
-try:
-    import fitz
-    ...
-except ImportError:
-    from pdf2image import convert_from_path
-```
+Earlier revisions used `PyMuPDF` (AGPL-3.0-only), which would have forced source disclosure on any binary distribution of this Apache-2.0 project. It has been removed entirely — `import fitz` no longer appears anywhere in the codebase.
 
-To ship without AGPL obligations, remove `PyMuPDF` from `requirements.txt` and install `pdf2image` with a system Poppler instead. Note that Poppler itself is GPL, so it must stay an **external process**, not a linked library. If neither is installed, PDF input is disabled and image / text input continues to work.
+Backend resolution order in `core/pdf_render.py`:
+
+| Order | Backend | Render | Text | License |
+|-------|---------|--------|------|---------|
+| 1 | `pypdfium2` | ✅ | ✅ | Apache-2.0 / BSD-3-Clause |
+| 2 | `pypdf` | ❌ | ✅ | BSD-3-Clause |
+| 3 | `pdf2image` | ✅ | ❌ | MIT wrapper, **GPL Poppler binary** |
+
+Only the first two are installed by `requirements.txt`. The Poppler path exists purely as a manual escape hatch and logs a license warning when it activates. If no backend is present, PDF input is disabled with an actionable message while image and text input keep working.
+
+### Text Layer Shortcut
+
+Digital PDFs already carry an extractable text layer. When at least half the processed pages qualify (≥40 characters and ≥20 alphanumerics each), the engine skips OCR and the VLM entirely and feeds the embedded text straight into the text pipeline:
 
 ### GPU Notices
 
