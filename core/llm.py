@@ -45,6 +45,44 @@ VISION_PLACEHOLDERS = (
     ("<image>", "", ""),
 )
 
+SCRIPT_OF_LANG: Dict[str, tuple] = {
+    "kor": ("Hangul", "Korean", "한국어 예시: 안녕하세요"),
+    "jpn": ("Kana and Kanji", "Japanese", "日本語の例: こんにちは"),
+    "zho": ("Han", "Chinese", "中文示例: 你好"),
+    "rus": ("Cyrillic", "Russian", "Пример: Привет"),
+    "ukr": ("Cyrillic", "Ukrainian", "Приклад: Привіт"),
+    "ara": ("Arabic", "Arabic", "مثال: مرحبا"),
+    "tha": ("Thai", "Thai", "ตัวอย่าง: สวัสดี"),
+    "hin": ("Devanagari", "Hindi", "उदाहरण: नमस्ते"),
+    "ell": ("Greek", "Greek", "Παράδειγμα: Γειά"),
+    "heb": ("Hebrew", "Hebrew", "דוגמה: שלום"),
+    "tam": ("Tamil", "Tamil", "எடுத்துக்காட்டு: வணக்கம்"),
+    "tel": ("Telugu", "Telugu", "ఉదాహరణ: నమస్కారం"),
+    "eng": ("Latin", "English", ""),
+}
+
+SCRIPT_BY_BLOCK: Dict[str, tuple] = {
+    "Hangul": ("Hangul", "Korean", "한국어 예시: 안녕하세요"),
+    "Kana": ("Kana and Kanji", "Japanese", "日本語の例: こんにちは"),
+    "Han": ("Han", "Chinese", "中文示例: 你好"),
+    "Cyrillic": ("Cyrillic", "Russian", "Пример: Привет"),
+    "Arabic": ("Arabic", "Arabic", "مثال: مرحبا"),
+    "Thai": ("Thai", "Thai", "ตัวอย่าง: สวัสดี"),
+    "Devanagari": ("Devanagari", "Hindi", "उदाहरण: नमस्ते"),
+    "Greek": ("Greek", "Greek", "Παράδειγμα: Γειά"),
+    "Hebrew": ("Hebrew", "Hebrew", "דוגמה: שלום"),
+    "Tamil": ("Tamil", "Tamil", "எடுத்துக்காட்டு: வணக்கம்"),
+    "Telugu": ("Telugu", "Telugu", "ఉదాహరణ: నమస్కారం"),
+    "Latin": ("Latin", "English", ""),
+}
+
+NON_LATIN_SCRIPTS = frozenset({
+    "Hangul", "Kana", "Han", "Cyrillic", "Arabic", "Thai",
+    "Devanagari", "Greek", "Hebrew", "Tamil", "Telugu",
+})
+
+ROMANIZE_RATIO = 0.55
+
 
 def _load_with_dtype(loader, path, dtype, **kwargs):
     try:
@@ -797,6 +835,7 @@ class RefinerLLM:
         image=None,
         primary_hint: str = "",
         lang_code: str = "",
+        script: str = "",
     ) -> List[dict]:
         import json
 
@@ -818,13 +857,15 @@ class RefinerLLM:
 
         lines = [f'    "{k}": <{v or "value"} or null>' for k, v in field_specs.items()]
 
+        directive = self.script_directive(lang_code, script)
+
         if use_vision:
             prompt = (
                 "You read one cropped region of a document or comic image and "
                 "extract every separate occurrence as its own row.\n"
-                "Copy values exactly as printed, in the original script. "
-                "Never translate. Never invent a value.\n"
-                "Printed column headers are NOT values.\n"
+                "Copy values exactly as printed. Never invent a value.\n"
+                + directive
+                + "Printed column headers are NOT values.\n"
                 "If the same field appears several times, emit one object per "
                 "occurrence. Do NOT number the keys.\n"
                 "Every row MUST be wrapped in braces. "
@@ -841,7 +882,8 @@ class RefinerLLM:
                 "You extract repeated table rows from noisy OCR text of one region "
                 "of a business document.\n"
                 "Copy values verbatim from the OCR TEXT. Never invent a value.\n"
-                "Printed column headers are NOT values. Return one object per row.\n"
+                + directive
+                + "Printed column headers are NOT values. Return one object per row.\n"
                 "Return ONLY a JSON array, no markdown, no reasoning.\n\n"
                 f"REGION: {category}\n"
                 + (f"HINT: {hint}\n" if hint else "")
@@ -951,13 +993,19 @@ class RefinerLLM:
         split_rows = 0
         bare_rows = 0
 
+        romanized = 0
+
         def _accept(v) -> str:
+            nonlocal romanized
             if isinstance(v, (int, float)) and not isinstance(v, bool):
                 v = str(v)
             if not isinstance(v, str):
                 return ""
             s = v.strip()
             if not s:
+                return ""
+            if self.looks_romanized(s, lang_code, script):
+                romanized += 1
                 return ""
             cs = self._compact(s)
             if not cs or cs in labels:
@@ -1028,6 +1076,13 @@ class RefinerLLM:
             extra.append(f"인덱스 분리 {split_rows}행")
         if bare_rows:
             extra.append(f"값 나열 승격 {bare_rows}건")
+        if romanized:
+            extra.append(f"음차 폐기 {romanized}건")
+            name, _lang, _s = self.script_profile(lang_code, script)
+            self._log(
+                f"    🔤 [ROMANIZE BLOCK] [{category}] {name or '원문'} 스크립트 "
+                f"대신 로마자로 답한 값 {romanized}건을 폐기했습니다."
+            )
         tail = (" | " + " | ".join(extra)) if extra else ""
 
         self._log(
@@ -1047,6 +1102,7 @@ class RefinerLLM:
         hint: str = "",
         image=None,
         lang_code: str = "",
+        script: str = "",
     ) -> Dict[str, str]:
         import json
 
@@ -1079,12 +1135,15 @@ class RefinerLLM:
                 + "\n\n"
             )
 
+        directive = self.script_directive(lang_code, script)
+
         if use_vision:
             prompt = (
                 "You read one cropped region of a business document image and "
                 "extract structured fields.\n"
                 "Copy values exactly as printed. Never invent a value.\n"
-                "Printed form labels are NOT values. If a field is absent, "
+                + directive
+                + "Printed form labels are NOT values. If a field is absent, "
                 "use null.\n"
                 "Return ONLY a JSON object, no markdown, no reasoning.\n\n"
                 f"REGION: {category}\n"
@@ -1098,7 +1157,8 @@ class RefinerLLM:
                 "You extract structured fields from noisy OCR text of one region "
                 "of a business document.\n"
                 "Copy values verbatim from the OCR TEXT. Never invent a value.\n"
-                "Printed form labels are NOT values. If a field is absent, use null.\n"
+                + directive
+                + "Printed form labels are NOT values. If a field is absent, use null.\n"
                 "Return ONLY a JSON object, no markdown, no reasoning.\n\n"
                 f"REGION: {category}\n"
                 + (f"HINT: {hint}\n" if hint else "")
@@ -1174,6 +1234,7 @@ class RefinerLLM:
         label_echo = 0
         halluc = 0
         dup = 0
+        romanized = 0
 
         for key, val in parsed.items():
             if key not in field_specs:
@@ -1187,6 +1248,13 @@ class RefinerLLM:
                 continue
             if self.is_schema_echo(v, key):
                 echo += 1
+                continue
+            if self.looks_romanized(v, lang_code, script):
+                romanized += 1
+                self._log(
+                    f"    🔤 [ROMANIZE BLOCK] [{category}] '{key}' = "
+                    f"\"{v[:36]}\" 는 로마자 음차입니다 — 폐기합니다."
+                )
                 continue
             cv = self._compact(v)
             if not cv:
@@ -1229,7 +1297,7 @@ class RefinerLLM:
             f"    ✅ [{category}] 신규 {len(kept)}건 | 스키마 에코 폐기 "
             f"{echo}건 | 설명문 에코 {spec_echo}건 | 라벨 에코 "
             f"{label_echo}건 | 환각 {halluc}건 | 선점 중복 {dup}건 "
-            f"| 자체 중복 {inner_dup}건"
+            f"| 자체 중복 {inner_dup}건 | 음차 폐기 {romanized}건"
         )
         if not kept and echoed_dup:
             self._log(
@@ -1237,6 +1305,78 @@ class RefinerLLM:
                 f"\"{echoed_dup[:30]}\" 만 남깁니다."
             )
         return kept
+
+    @staticmethod
+    def script_profile(
+        lang_code: str = "",
+        script: str = "",
+    ) -> Tuple[str, str, str]:
+        if script and script in SCRIPT_BY_BLOCK:
+            return SCRIPT_BY_BLOCK[script]
+        code = str(lang_code or "").strip().lower()
+        if code in SCRIPT_OF_LANG:
+            return SCRIPT_OF_LANG[code]
+        return "", "", ""
+
+    @classmethod
+    def script_directive(
+        cls,
+        lang_code: str = "",
+        script: str = "",
+    ) -> str:
+        name, lang, sample = cls.script_profile(lang_code, script)
+        if not name:
+            return (
+                "SCRIPT RULE: Reproduce every character exactly as drawn, "
+                "in the writing system shown in the image. "
+                "Do NOT romanize. Do NOT transliterate. Do NOT translate. "
+                "Do NOT append a translation in parentheses.\n"
+            )
+
+        head = (
+            f"SCRIPT RULE: The text in this image is written in the {name} "
+            f"script ({lang}). Every value you return MUST be written in "
+            f"{name} characters, byte for byte as printed.\n"
+            "  - Do NOT romanize. 'annyeonghaseyo' style output is WRONG.\n"
+            "  - Do NOT translate into English.\n"
+            "  - Do NOT append a translation in parentheses.\n"
+            "  - If you cannot read a character, omit it rather than "
+            "guessing a Latin substitute.\n"
+        )
+        if sample:
+            head += f"  - Correct output style — {sample}\n"
+        return head
+
+    @staticmethod
+    def looks_romanized(text: str, lang_code: str = "", script: str = "") -> bool:
+        s = str(text or "").strip()
+        if not s:
+            return False
+
+        expect = script
+        if not expect:
+            expect = {
+                "kor": "Hangul", "jpn": "Kana", "zho": "Han",
+                "rus": "Cyrillic", "ukr": "Cyrillic", "ara": "Arabic",
+                "tha": "Thai", "hin": "Devanagari", "ell": "Greek",
+                "heb": "Hebrew", "tam": "Tamil", "tel": "Telugu",
+            }.get(str(lang_code or "").strip().lower(), "")
+
+        if expect not in NON_LATIN_SCRIPTS:
+            return False
+
+        try:
+            from .lang_codes import block_census
+        except Exception:
+            return False
+
+        census = block_census(s)
+        total = sum(census.values())
+        if total < 4:
+            return False
+
+        latin = int(census.get("Latin", 0))
+        return (latin / float(total)) >= ROMANIZE_RATIO
 
     @staticmethod
     def draft_matches_language(draft: str, lang_code: str) -> Tuple[bool, str]:
@@ -1275,15 +1415,22 @@ class RefinerLLM:
             f"({expect} {ratio:.0%})"
         )
 
-    def read_raw(self, image, hint: str = "", max_chars: int = 400) -> str:
+    def read_raw(
+        self,
+        image,
+        hint: str = "",
+        max_chars: int = 400,
+        lang_code: str = "",
+        script: str = "",
+    ) -> str:
         if not self.vision or image is None:
             return ""
 
         prompt = (
             "Transcribe every piece of text visible in this image.\n"
-            "Write the characters exactly as drawn, in their original script. "
-            "Do NOT translate. Do NOT romanize. Do NOT explain.\n"
-            "Separate distinct text blocks with ' / '.\n"
+            "Write the characters exactly as drawn. Do NOT explain.\n"
+            + self.script_directive(lang_code, script)
+            + "Separate distinct text blocks with ' / '.\n"
             "If there is no text, reply with an empty line."
             + (f"\nCONTEXT: {hint}" if hint else "")
         )
@@ -1317,6 +1464,29 @@ class RefinerLLM:
         low = text.lower().strip(" .!/")
         if low in ("", "no text", "none", "empty", "n/a", "nothing"):
             self._log("    ⏭ [RAW READ] 글자 없음 응답 — 버립니다.")
+            return ""
+
+        if self.looks_romanized(text, lang_code, script):
+            name, _lang, _s = self.script_profile(lang_code, script)
+            self._log(
+                f"    🔤 [RAW READ] 로마자 음차 응답이라 {name or '원문'} "
+                f"스크립트로 재판독합니다: {text[:32]!r}"
+            )
+            retry = (
+                f"The image contains {name or 'non-Latin'} characters.\n"
+                "Output ONLY those characters. A romanized answer is a "
+                "failure. Do not write any Latin letters unless they are "
+                "literally printed in the image.\n"
+                "Transcribe now:"
+            )
+            try:
+                again = self.generate_with_image(retry, image, max_new_tokens=256)
+            except Exception:
+                again = ""
+            again = self._strip_reasoning(again).replace("```", "").strip()
+            if again and not self.looks_romanized(again, lang_code, script):
+                return again[:max_chars].strip()
+            self._log("    ⏭ [RAW READ] 재판독도 음차라 버립니다.")
             return ""
 
         return text
@@ -1619,6 +1789,24 @@ def resolve_refiner_path(
     if _alphaedge_available():
         return str(LLM_PATH), "alphaedge-ai"
     return "", ""
+
+
+def script_of_ocr_lang(lang_code: str) -> str:
+    from .model_manager import paddle_ocr_slug
+    return {
+        "korean": "Hangul",
+        "": "Han",
+        "en": "Latin",
+        "latin": "Latin",
+        "eslav": "Cyrillic",
+        "cyrillic": "Cyrillic",
+        "arabic": "Arabic",
+        "devanagari": "Devanagari",
+        "ta": "Tamil",
+        "te": "Telugu",
+        "el": "Greek",
+        "th": "Thai",
+    }.get(paddle_ocr_slug(lang_code), "")
 
 
 def resolve_joint_path(

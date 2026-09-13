@@ -219,7 +219,7 @@ class LanguageDetector:
             pass
 
     def _anchor_vec(self, phrase: str) -> Optional[np.ndarray]:
-        if self.ocr is None:
+        if self.ocr is None or not hasattr(self.ocr, "embed_text"):
             return None
         if phrase in self._anchor_cache:
             return self._anchor_cache[phrase]
@@ -269,7 +269,7 @@ class LanguageDetector:
             if ok and rows:
                 return np.concatenate(rows, axis=0)
 
-        if self.ocr is None:
+        if self.ocr is None or not hasattr(self.ocr, "embed_text"):
             return None
 
         fallback: List[np.ndarray] = []
@@ -391,7 +391,7 @@ class LanguageDetector:
         return [box for _s, box in scored[: self.max_bands]]
 
     def collect_text(self, image: Image.Image) -> str:
-        if self.ocr is None:
+        if self.ocr is None or not getattr(self.ocr, "available", True):
             return ""
         boxes = self.ink_bands(image)
         self._log(f"  📐 텍스트 후보 밴드 {len(boxes)}개 추출")
@@ -450,7 +450,7 @@ class LanguageDetector:
         return merged
 
     def stage_a_visual(self, image: Image.Image) -> Dict[str, float]:
-        if self.ocr is None:
+        if self.ocr is None or not hasattr(self.ocr, "embed_image_for_scoring"):
             return {}
         try:
             patches = self.ocr.embed_image_for_scoring(image)

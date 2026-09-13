@@ -42,41 +42,42 @@ ROLE_LABELS = {
 STEP_REQUIREMENTS: Dict[str, dict] = {
     "bootstrap": {
         "label": "부트스트랩 임베딩",
-        "base": ["siglip2-naflex", "hayai"],
-        "lang": ["qwen3emb"],
+        "base": [],
+        "lang": ["ppocr", "qwen3emb"],
         "bootstrap_lang": True,
         "stanza": False,
     },
     "patch_grid": {
         "label": "패치 임베딩 격자",
-        "base": ["ax-ve", "hayai", "siglip2-naflex"],
-        "lang": [],
+        "base": ["ax-ve"],
+        "lang": ["siglip2"],
+        "bootstrap_lang": True,
         "stanza": False,
     },
     "doc_type": {
         "label": "문서 유형 분류",
-        "base": ["hayai", "siglip2-naflex"],
-        "lang": ["qwen3emb"],
+        "base": [],
+        "lang": ["siglip2", "qwen3emb"],
         "bootstrap_lang": True,
         "stanza": False,
     },
     "language": {
         "label": "언어 판별",
-        "base": ["hayai", "siglip2-naflex"],
-        "lang": ["qwen3emb"],
+        "base": [],
+        "lang": ["ppocr", "qwen3emb"],
         "bootstrap_lang": True,
         "stanza": False,
     },
     "field_heatmap": {
         "label": "필드 히트맵",
-        "base": ["hayai", "siglip2-naflex"],
-        "lang": ["qwen3emb"],
+        "base": [],
+        "lang": ["siglip2", "qwen3emb"],
         "stanza": False,
     },
     "ocr_extract": {
         "label": "크롭 OCR 추출",
-        "base": ["hayai", "siglip2-naflex"],
-        "lang": [],
+        "base": ["ppocr-det"],
+        "lang": ["ppocr"],
         "stanza": True,
     },
     "refine": {
@@ -87,7 +88,7 @@ STEP_REQUIREMENTS: Dict[str, dict] = {
     },
     "text_pipeline": {
         "label": "텍스트 파이프라인",
-        "base": ["hayai"],
+        "base": [],
         "lang": ["qwen3emb"],
         "stanza": True,
     },
@@ -95,20 +96,22 @@ STEP_REQUIREMENTS: Dict[str, dict] = {
 
 PREREQUISITES: Dict[str, tuple] = {
     "base:siglip2-naflex": (),
-    "base:hayai": ("base:siglip2-naflex",),
     "base:ax-ve": (),
-    "lang:siglip2": ("base:siglip2-naflex",),
-    "lang:qwen3emb": ("base:hayai",),
+    "base:ppocr-det": (),
+    "lang:ppocr": (),
+    "lang:siglip2": (),
+    "lang:qwen3emb": (),
     "lang:qwen35": ("lang:qwen3emb",),
     "stanza": (),
 }
 
 DOWNLOAD_ORDER = (
     "base:siglip2-naflex",
-    "base:hayai",
     "base:ax-ve",
-    "lang:qwen3emb",
+    "base:ppocr-det",
+    "lang:ppocr",
     "lang:siglip2",
+    "lang:qwen3emb",
     "lang:qwen35",
     "stanza",
 )
@@ -712,10 +715,24 @@ class ModelRegistry:
         for key in req.get("base", []):
             if is_manual_only(key):
                 continue
+            if key == "ppocr-det" and not is_model_ready(key):
+                self._log(
+                    "   ↩ PP-OCRv5 검출 모델이 없어 영상처리 폴백 검출로 "
+                    "진행합니다."
+                )
+                continue
             if not is_model_ready(key):
                 return False
 
         for kind in req.get("lang", []):
+            if kind == "ppocr":
+                if any(lang_model_ready(kind, c) for c in codes):
+                    continue
+                self._log(
+                    "   ↩ 요청 언어 PP-OCRv5 rec 는 실패했습니다. "
+                    "OCR 없이 VLM 직접 판독으로 진행합니다."
+                )
+                continue
             if kind != "qwen3emb":
                 continue
             if any(lang_model_ready(kind, c) for c in codes):

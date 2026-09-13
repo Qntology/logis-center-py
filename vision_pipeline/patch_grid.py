@@ -163,7 +163,7 @@ def build_patch_grid(
             source="siglip2",
         )
 
-    if prefer == "ocr" and ocr is not None:
+    if prefer == "ocr" and ocr is not None and hasattr(ocr, "embed_image_patches"):
         out = ocr.embed_image_patches(image)
         feats = np.asarray(out["valid_features"], dtype=np.float32)
         rows = int(out["rows"])
@@ -179,7 +179,7 @@ def build_patch_grid(
             orig_width=orig_w,
             orig_height=orig_h,
             patch_size=getattr(ocr, "patch_size", 16),
-            source="hayai",
+            source="ocr",
         )
 
     if embedder is not None:
@@ -205,7 +205,7 @@ def build_patch_grid(
             grid.num_patches = align_to.num_patches
         return grid
 
-    if ocr is not None:
+    if ocr is not None and hasattr(ocr, "embed_image_patches"):
         out = ocr.embed_image_patches(image)
         feats = np.asarray(out["valid_features"], dtype=np.float32)
         rows = int(out["rows"])
@@ -221,11 +221,15 @@ def build_patch_grid(
             orig_width=orig_w,
             orig_height=orig_h,
             patch_size=getattr(ocr, "patch_size", 16),
-            source="hayai",
+            source="ocr",
         )
 
     raise RuntimeError(
-        "패치 격자를 만들 수 있는 모델이 없습니다. (joint / embedder / ocr 전부 None)"
+        "패치 격자를 만들 수 있는 모델이 없습니다.\n"
+        "  PP-OCRv5 rec 는 텍스트 라인 인식 전용이라 패치 격자를 만들지 "
+        "못합니다.\n"
+        "  SigLIP2 조인트(lang:siglip2) 또는 A.X-VE(base:ax-ve) 중 하나를 "
+        "준비하세요."
     )
 
 

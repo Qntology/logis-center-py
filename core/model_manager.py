@@ -11,7 +11,8 @@ MODELS_DIR = MODELS_ROOT
 
 LLM_PATH = MODELS_ROOT / "alphaedge-ai"
 VISION_ENC_PATH = MODELS_ROOT / "ax-ve"
-OCR_PATH = MODELS_ROOT / "hayai"
+OCR_PATH = MODELS_ROOT / "ppocr"
+PPOCR_DET_PATH = MODELS_ROOT / "PP-OCRv5_mobile_det_safetensors"
 
 SIGLIP2_HUB_REF = "google/siglip2-base-patch16-naflex"
 SIGLIP2_LOCAL_DIR = MODELS_ROOT / "siglip2-base-patch16-naflex"
@@ -61,36 +62,21 @@ MODEL_SPECS: Dict[str, dict] = {
         "required": ("config.json", "model.safetensors"),
         "optional": ("processing_ax_ve.py",),
     },
-    "hayai": {
-        "label": "Hayai OCR v2",
+    "ppocr-det": {
+        "label": "PP-OCRv5 mobile det (텍스트 영역 검출)",
         "role": "ocr",
-        "dir": OCR_PATH,
-        "asset_source": BASE_DIR / "hayai",
-        "min_size": 10_000_000,
-        "repo": "JustANormalTinkerer/hayai-ocr-v2",
+        "dir": PPOCR_DET_PATH,
+        "asset_source": None,
+        "min_size": 1_000_000,
+        "repo": "PaddlePaddle/PP-OCRv5_mobile_det_safetensors",
         "files": (
             "config.json",
+            "inference.yml",
             "model.safetensors",
-            "configuration_hayai.py",
-            "modeling_hayai.py",
-            "tokenizer.json",
-            "tokenizer_config.json",
-            "special_tokens_map.json",
-            "vocab.json",
-            "merges.txt",
-            "tokenizer.model",
-            "spiece.model",
+            "preprocessor_config.json",
         ),
-        "required": ("config.json", "model.safetensors"),
-        "optional": (
-            "tokenizer.json",
-            "tokenizer_config.json",
-            "special_tokens_map.json",
-            "vocab.json",
-            "merges.txt",
-            "tokenizer.model",
-            "spiece.model",
-        ),
+        "required": ("inference.yml", "model.safetensors"),
+        "optional": ("config.json", "preprocessor_config.json"),
     },
     "siglip2-naflex": {
         "label": "SigLIP2 NaFlex (Hayai 비전 설정)",
@@ -113,7 +99,7 @@ MODEL_SPECS: Dict[str, dict] = {
 
 MODEL_KEYS = tuple(MODEL_SPECS.keys())
 
-CORE_MODEL_KEYS = ("ax-ve", "hayai", "siglip2-naflex")
+CORE_MODEL_KEYS = ("ax-ve",)
 
 OPTIONAL_MODEL_KEYS = ("alphaedge-ai",)
 
@@ -208,11 +194,26 @@ BOOTSTRAP_LANGUAGES = ("eng", "kor")
 
 ACTIVE_LANGUAGE_FILE = MODELS_ROOT / ".active_language.json"
 
-LANG_MODEL_KINDS = ("siglip2", "qwen3emb", "qwen35")
+LANG_MODEL_KINDS = ("ppocr", "siglip2", "qwen3emb", "qwen35")
 
-LANG_KIND_PRIORITY = ("qwen3emb", "siglip2", "qwen35")
+LANG_KIND_PRIORITY = ("ppocr", "qwen3emb", "siglip2", "qwen35")
 
 LANG_REPO_TEMPLATES: Dict[str, dict] = {
+    "ppocr": {
+        "label": "PP-OCRv5 mobile rec (텍스트 라인 인식)",
+        "owner": "PaddlePaddle",
+        "repo": "{prefix}PP-OCRv5_mobile_rec_safetensors",
+        "slug": "paddle_rec",
+        "files": (
+            "config.json",
+            "inference.yml",
+            "model.safetensors",
+            "preprocessor_config.json",
+        ),
+        "required": ("inference.yml", "model.safetensors"),
+        "optional": ("config.json", "preprocessor_config.json"),
+        "min_size": 3_000_000,
+    },
     "siglip2": {
         "label": "SigLIP2 Large (언어 텍스트 타워)",
         "owner": "alphaedge-ai",
@@ -272,6 +273,85 @@ LANG_REPO_TEMPLATES: Dict[str, dict] = {
         "min_size": 200_000_000,
     },
 }
+
+
+PADDLE_OCR_DEFAULT_SLUG = "latin"
+
+PADDLE_OCR_REPOS = (
+    "", "korean", "en", "latin", "eslav", "cyrillic",
+    "arabic", "devanagari", "ta", "te", "el", "th",
+)
+
+PADDLE_OCR_SLUG: Dict[str, str] = {
+    "zho": "",
+    "jpn": "",
+    "kor": "korean",
+    "eng": "en",
+    "tha": "th",
+    "ell": "el",
+    "tam": "ta",
+    "tel": "te",
+    "rus": "eslav",
+    "ukr": "eslav",
+    "bel": "eslav",
+    "bul": "cyrillic",
+    "srp": "cyrillic",
+    "mkd": "cyrillic",
+    "kaz": "cyrillic",
+    "mon": "cyrillic",
+    "ara": "arabic",
+    "fas": "arabic",
+    "urd": "arabic",
+    "hin": "devanagari",
+    "mar": "devanagari",
+    "nep": "devanagari",
+    "ben": "devanagari",
+}
+
+PADDLE_OCR_SUBSTITUTED: Dict[str, str] = {
+    "jpn": "PaddleOCR 에 일본어 전용 모델이 없어 한자 공용 모델(중국어)로 대체합니다.",
+    "ben": "벵골 전용 모델이 없어 데바나가리 모델로 대체합니다.",
+    "kan": "칸나다 전용 모델이 없어 라틴 모델로 대체합니다.",
+}
+
+PADDLE_OCR_SCRIPT_HINT: Dict[str, str] = {
+    "": "Han (Chinese / Japanese kanji)",
+    "korean": "Hangul (Korean)",
+    "en": "Latin (English)",
+    "latin": "Latin",
+    "eslav": "Cyrillic (East Slavic)",
+    "cyrillic": "Cyrillic",
+    "arabic": "Arabic",
+    "devanagari": "Devanagari",
+    "ta": "Tamil",
+    "te": "Telugu",
+    "el": "Greek",
+    "th": "Thai",
+}
+
+
+def paddle_ocr_slug(code: str) -> str:
+    c = normalize_lang_code(code)
+    slug = PADDLE_OCR_SLUG.get(c, PADDLE_OCR_DEFAULT_SLUG)
+    return slug if slug in PADDLE_OCR_REPOS else PADDLE_OCR_DEFAULT_SLUG
+
+
+def paddle_ocr_prefix(code: str) -> str:
+    slug = paddle_ocr_slug(code)
+    return f"{slug}_" if slug else ""
+
+
+def paddle_ocr_note(code: str) -> str:
+    return PADDLE_OCR_SUBSTITUTED.get(normalize_lang_code(code), "")
+
+
+def paddle_ocr_script_hint(code: str) -> str:
+    return PADDLE_OCR_SCRIPT_HINT.get(paddle_ocr_slug(code), "Latin")
+
+
+def paddle_ocr_model_name(code: str) -> str:
+    slug = paddle_ocr_slug(code)
+    return f"{slug}_PP-OCRv5_mobile_rec" if slug else "PP-OCRv5_mobile_rec"
 
 
 STANZA_OWNER = "stanfordnlp"
@@ -371,13 +451,30 @@ def _lang_template(kind: str) -> dict:
     return tpl
 
 
+def lang_repo_code(kind: str, code: str) -> str:
+    tpl = _lang_template(kind)
+    if str(tpl.get("slug", "")) == "paddle_rec":
+        return paddle_ocr_slug(code)
+    return str(code)
+
+
+def lang_repo_prefix(kind: str, code: str) -> str:
+    tpl = _lang_template(kind)
+    if str(tpl.get("slug", "")) == "paddle_rec":
+        return paddle_ocr_prefix(code)
+    return f"{code}_"
+
+
 def lang_repo_name(kind: str, code: str) -> str:
-    return _lang_template(kind)["repo"].format(code=code)
+    return _lang_template(kind)["repo"].format(
+        code=lang_repo_code(kind, code),
+        prefix=lang_repo_prefix(kind, code),
+    )
 
 
 def lang_repo_id(kind: str, code: str) -> str:
     tpl = _lang_template(kind)
-    return f"{tpl['owner']}/{tpl['repo'].format(code=code)}"
+    return f"{tpl['owner']}/{lang_repo_name(kind, code)}"
 
 
 def lang_model_dir(kind: str, code: str) -> Path:
@@ -408,6 +505,35 @@ def lang_model_ready(kind: str, code: str) -> bool:
     weights = [p for p in d.iterdir() if p.is_file() and p.suffix in WEIGHT_SUFFIXES]
     total = sum(p.stat().st_size for p in weights)
     return total >= tpl["min_size"]
+
+
+def ppocr_model_dir(code: str) -> Path:
+    return lang_model_dir("ppocr", code)
+
+
+def ppocr_det_dir() -> Path:
+    return PPOCR_DET_PATH
+
+
+def ppocr_det_ready() -> bool:
+    return is_model_ready("ppocr-det")
+
+
+def ppocr_ready(code: str) -> bool:
+    return lang_model_ready("ppocr", code)
+
+
+def ppocr_ready_codes() -> List[str]:
+    out: List[str] = []
+    seen = set()
+    for code in list(BOOTSTRAP_LANGUAGES) + installed_language_codes():
+        c = normalize_lang_code(code)
+        if c in seen:
+            continue
+        seen.add(c)
+        if ppocr_ready(c):
+            out.append(c)
+    return out
 
 
 def lang_models_ready(code: str) -> bool:

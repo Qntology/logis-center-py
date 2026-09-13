@@ -80,23 +80,49 @@ def text_aware_upscale(
     image: Image.Image,
     target_px: float = VISION_PATCH_PX,
     log: Optional[list] = None,
+    text_boxes: Optional[list] = None,
 ) -> Tuple[Image.Image, float, str]:
-    th = estimate_text_height(image)
+    th = None
+    mode = ""
+
+    if text_boxes:
+        from .text_boxes import median_text_height
+        bh = median_text_height(text_boxes)
+        if bh > 2.0:
+            th = float(bh)
+            mode = "det-box"
+            if log is not None:
+                log.append(
+                    f"    📏 검출 박스 {len(text_boxes)}개 중앙 높이 "
+                    f"{th:.1f}px 를 글자 높이로 씁니다."
+                )
+
+    if th is None:
+        th = estimate_text_height(image)
+        if th is not None and th > 0.5:
+            mode = "line-pitch"
+            if log is not None:
+                log.append(
+                    f"    📏 추정 글자 높이 {th:.1f}px "
+                    f"(자기상관) → 배율 계산"
+                )
 
     if th is not None and th > 0.5:
         factor = float(np.clip(target_px / th, 1.0, MAX_UPSCALE))
-        mode = "line-pitch"
         if log is not None:
             log.append(
-                f"    📏 추정 글자 높이 {th:.1f}px → 배율 {factor:.2f}x "
-                f"(목표 {int(target_px)}px)"
+                f"    📏 배율 {factor:.2f}x (목표 {int(target_px)}px / "
+                f"모드 {mode})"
             )
     else:
         short = float(min(image.width, image.height))
-        factor = float(np.clip(target_px * 4.0 / max(1.0, short), 1.0, MAX_UPSCALE_SPARSE))
-        mode = "conservative"
+        factor = float(np.clip(target_px * 6.0 / max(1.0, short), 1.4, MAX_UPSCALE_SPARSE))
+        mode = "floor"
         if log is not None:
-            log.append(f"    📏 라인 주기 미검출 → 보수적 배율 {factor:.2f}x")
+            log.append(
+                f"    📏 글자 높이를 못 구해 최소 배율 {factor:.2f}x 를 "
+                f"강제합니다 (1.0x 로 두면 저해상도 그대로 전달됩니다)."
+            )
 
     if factor <= 1.01:
         return image, 1.0, mode
@@ -111,9 +137,22 @@ def prepare_crop(
     bbox: Tuple[int, int, int, int],
     target_px: float = VISION_PATCH_PX,
     log: Optional[list] = None,
+    text_boxes: Optional[list] = None,
 ) -> Tuple[Image.Image, float, str]:
     cropped = crop_region(image, bbox)
-    return text_aware_upscale(cropped, target_px=target_px, log=log)
+
+    local = None
+    if text_boxes:
+        bx0, by0, bx1, by1 = (int(v) for v in bbox)
+        local = [
+            (b[0] - bx0, b[1] - by0, b[2] - bx0, b[3] - by0)
+            for b in text_boxes
+            if b[0] < bx1 and b[2] > bx0 and b[1] < by1 and b[3] > by0
+        ]
+
+    return text_aware_upscale(
+        cropped, target_px=target_px, log=log, text_boxes=local
+    )
 
 
 def fit_for_vlm(
@@ -182,14 +221,28 @@ def decide_tile_count(
     table_rows: int = 0,
     legible: int = 0,
     patches: int = 0,
+    text_boxes: Optional[list] = None,
 ) -> Tuple[int, str]:
-    if int(table_rows) > 0:
-        tiles = int(np.clip(round(int(table_rows) / 3.0), 1, max_tiles))
-        return tiles, "표행밀도"
-
     x0, y0, x1, y1 = bbox
     height = max(1, y1 - y0)
     width = max(1, x1 - x0)
+
+    if text_boxes:
+        inside = [
+            b for b in text_boxes
+            if b[0] < x1 and b[2] > x0 and b[1] < y1 and b[3] > y0
+        ]
+        rows = set()
+        for b in inside:
+            rows.add(int((b[1] + b[3]) * 0.5) // max(8, height // 12))
+        if len(rows) >= 4:
+            return int(np.clip(round(len(rows) / 3.0), 1, max_tiles)), "검출행밀도"
+        if inside:
+            return 1, "검출박스 소수"
+
+    if int(table_rows) > 0:
+        tiles = int(np.clip(round(int(table_rows) / 3.0), 1, max_tiles))
+        return tiles, "표행밀도"
 
     if patches > 0 and legible * 4 < patches:
         return 1, "내용희소"
