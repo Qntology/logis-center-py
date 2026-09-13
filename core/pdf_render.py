@@ -20,7 +20,6 @@ ENV_FORCE_VISION = "NMS_PDF_FORCE_VISION"
 
 BACKEND_PDFIUM = "pypdfium2"
 BACKEND_PYPDF = "pypdf"
-BACKEND_POPPLER = "pdf2image"
 
 
 class PdfPage:
@@ -157,19 +156,16 @@ def available_backends() -> List[str]:
         out.append(BACKEND_PDFIUM)
     if has_module("pypdf"):
         out.append(BACKEND_PYPDF)
-    if has_module("pdf2image"):
-        out.append(BACKEND_POPPLER)
     return out
 
 
 def preferred_backend() -> str:
     forced = str(os.environ.get(ENV_BACKEND, "") or "").strip()
-    if forced and has_module(forced.replace("-", "_")):
+    if forced in (BACKEND_PDFIUM, BACKEND_PYPDF) and has_module(forced):
         return forced
 
-    for name in (BACKEND_PDFIUM, BACKEND_PYPDF, BACKEND_POPPLER):
-        mod = name.replace("-", "_")
-        if has_module(mod):
+    for name in (BACKEND_PDFIUM, BACKEND_PYPDF):
+        if has_module(name):
             return name
     return ""
 
@@ -399,38 +395,6 @@ def _render_pypdf(
     return doc
 
 
-def _render_poppler(
-    path: Path,
-    dpi: int,
-    max_pages: int,
-    log: Optional[Callable[[str], None]],
-) -> PdfDocument:
-    from pdf2image import convert_from_path
-
-    doc = PdfDocument(str(path), BACKEND_POPPLER)
-
-    _log_to(
-        log,
-        "  ⚠ [PDF] Poppler 경로를 사용합니다. Poppler 는 GPL 이므로 별도 "
-        "프로세스로만 호출해야 하며, 배포 시 라이선스를 확인하세요.",
-    )
-
-    try:
-        images = convert_from_path(
-            str(path), first_page=1, last_page=int(max_pages), dpi=int(dpi)
-        )
-    except Exception as e:
-        doc.error = f"{type(e).__name__}: {e}"
-        return doc
-
-    doc.total_pages = len(images)
-    for i, img in enumerate(images):
-        doc.pages.append(
-            PdfPage(index=i, image=img.convert("RGB"), text="", dpi=int(dpi))
-        )
-    return doc
-
-
 def render_pdf(
     path,
     dpi: Optional[int] = None,
@@ -447,8 +411,9 @@ def render_pdf(
         doc = PdfDocument(str(p), "")
         doc.error = (
             "PDF 백엔드가 없습니다.\n"
-            "  pip install pypdfium2\n"
-            "  (PDFium 은 BSD-3-Clause 이며 외부 바이너리가 필요 없습니다)"
+            "  pip install pypdfium2 pypdf\n"
+            "  PDFium 은 BSD-3-Clause 이며 휠에 네이티브 라이브러리가\n"
+            "  포함되어 외부 바이너리 설치가 필요 없습니다."
         )
         return doc
 
@@ -466,20 +431,18 @@ def render_pdf(
         if doc.ok:
             _log_to(
                 log,
-                "  ⚠ [PDF] pypdf 는 텍스트만 추출합니다. 이미지 렌더가 "
-                "필요하면 pip install pypdfium2 를 실행하세요.",
+                "  ⚠ [PDF] pypdf 는 텍스트만 추출합니다. 스캔 PDF 는 "
+                "처리할 수 없으므로 pip install pypdfium2 를 실행하세요.",
             )
             _describe(doc, log)
             return doc
 
-    if has_module("pdf2image"):
-        doc = _render_poppler(p, use_dpi, budget, log)
-        if doc.ok:
-            _describe(doc, log)
-            return doc
-
     out = PdfDocument(str(p), backend)
-    out.error = "모든 PDF 백엔드가 실패했습니다."
+    out.error = (
+        "모든 PDF 백엔드가 실패했습니다.\n"
+        "  pip install pypdfium2 pypdf\n"
+        "  (둘 다 BSD-3-Clause 이며 외부 바이너리가 필요 없습니다)"
+    )
     return out
 
 
@@ -525,23 +488,18 @@ def report_lines() -> List[str]:
     backends = available_backends()
     if not backends:
         return [
-            "  [MISS] PDF 백엔드 없음 — pip install pypdfium2 "
-            "(BSD-3-Clause, 외부 바이너리 불필요)"
+            "  [MISS] PDF 백엔드 없음 — pip install pypdfium2 pypdf "
+            "(모두 BSD-3-Clause, 외부 바이너리 불필요)"
         ]
 
     out = [
         f"  [OK ] PDF 백엔드 {', '.join(backends)} "
         f"| 활성 '{preferred_backend()}' | {target_dpi()} DPI "
-        f"| 최대 {page_budget()}쪽"
+        f"| 최대 {page_budget()}쪽 | 전 경로 BSD-3-Clause"
     ]
     if BACKEND_PDFIUM not in backends:
         out.append(
-            "         pypdfium2 가 없어 렌더 품질이나 라이선스가 "
-            "제한될 수 있습니다."
-        )
-    if BACKEND_POPPLER in backends and BACKEND_PDFIUM not in backends:
-        out.append(
-            "         ⚠ Poppler(GPL) 경로만 사용 가능합니다. 배포 시 "
-            "라이선스를 확인하세요."
+            "         pypdfium2 가 없어 스캔 PDF 를 렌더할 수 없습니다. "
+            "텍스트 레이어가 있는 PDF 만 처리됩니다."
         )
     return out

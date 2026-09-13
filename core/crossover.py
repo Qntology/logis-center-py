@@ -252,6 +252,32 @@ class CrossoverSwitch:
                     "ram_need_gb": round(ram_need, 2),
                 })
 
+        if _ram_free_gb() > 0.0 and _ram_free_gb() < ram_need:
+            try:
+                from .memory import make_room
+
+                def _step() -> bool:
+                    dropped = self.release_next(protect=protect_set)
+                    if dropped:
+                        evicted.append(dropped)
+                        self.evictions.append({
+                            "for": name,
+                            "evicted": dropped,
+                            "need_gb": round(need, 2),
+                            "ram_need_gb": round(ram_need, 2),
+                            "staged": True,
+                        })
+                    return bool(dropped)
+
+                make_room(
+                    ram_need,
+                    release_fn=_step,
+                    log=self._log,
+                    label=f"'{slot.label}' 적재",
+                )
+            except Exception as e:
+                self._log(f"  ⏭ 단계적 RAM 확보 생략 ({e})")
+
         after = _vram_free_gb()
         ram_after = _ram_free_gb()
 
@@ -318,24 +344,60 @@ class CrossoverSwitch:
                 self._log(f"  📥 [{slot.label}] 로드")
             return obj
 
+    def release_next(self, protect: Sequence[str] = ()) -> str:
+        with self._lock:
+            protect_set = set(protect or ())
+            pool = [
+                s for s in self.slots.values()
+                if s.loaded and s.name not in protect_set and s.est_gb > 0.0
+            ]
+            if not pool:
+                return ""
+            pool.sort(
+                key=lambda s: (
+                    1 if s.name in self.EVICT_LAST else 0,
+                    -s.est_gb,
+                )
+            )
+            target = pool[0]
+        return target.name if self.release(target.name) else ""
+
     def release(self, name: str) -> bool:
         with self._lock:
             slot = self.slots.get(name)
             if slot is None or not slot.loaded:
                 return False
             before = _vram_free_gb()
+            ram_before = _ram_free_gb()
             ok = slot.release()
-            after = _vram_free_gb()
-            if ok:
-                if before > 0.0:
-                    self._log(
-                        f"  ♻️ [{slot.label}] 반납 "
-                        f"(VRAM {before:.2f} → {after:.2f} GB, "
-                        f"+{max(0.0, after - before):.2f} GB 확보)"
-                    )
-                else:
-                    self._log(f"  ♻️ [{slot.label}] 반납")
-            return ok
+
+        if not ok:
+            return False
+
+        try:
+            from .memory import reclaim
+            reclaim(rounds=2, aggressive=True)
+        except Exception:
+            pass
+
+        after = _vram_free_gb()
+        ram_after = _ram_free_gb()
+
+        if before > 0.0:
+            tail = ""
+            if ram_before > 0.0:
+                tail = (
+                    f" | RAM {ram_before:.1f} → {ram_after:.1f} GB "
+                    f"(+{max(0.0, ram_after - ram_before):.1f} GB)"
+                )
+            self._log(
+                f"  ♻️ [{slot.label}] 반납 "
+                f"(VRAM {before:.2f} → {after:.2f} GB, "
+                f"+{max(0.0, after - before):.2f} GB 확보){tail}"
+            )
+        else:
+            self._log(f"  ♻️ [{slot.label}] 반납")
+        return True
 
     def transition(self, phase: str, force: bool = False) -> dict:
         with self._lock:
