@@ -1793,6 +1793,7 @@ class EmbeddingRouter:
         self.active = ""
         self.name = str(name)
         self.space_dim = 0
+        self.last_failed = False
         self.dims: Dict[str, int] = {}
         self._failed: Dict[str, int] = {}
         self._rejected: Dict[str, int] = {}
@@ -1862,6 +1863,7 @@ class EmbeddingRouter:
 
     def encode(self, texts: Sequence[str]) -> np.ndarray:
         items = list(texts)
+        self.last_failed = False
         for _prio, name, fn in self._providers:
             try:
                 mat = fn(items)
@@ -1900,7 +1902,10 @@ class EmbeddingRouter:
             f"(등록 {len(self._providers)}개 / 실패 {sum(self._failed.values())}회 "
             f"/ 공간 거부 {sum(self._rejected.values())}회)"
         )
-        return np.zeros((len(items), max(1, self.space_dim)), dtype=np.float32)
+        self.last_failed = True
+        if self.space_dim > 0:
+            return np.zeros((len(items), self.space_dim), dtype=np.float32)
+        return None
 
     def __call__(self, texts: Sequence[str]) -> np.ndarray:
         return self.encode(texts)

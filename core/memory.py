@@ -151,12 +151,24 @@ def free_disk_gb(path) -> float:
         return 0.0
 
 
+def safety_margin_gb(need_gb: float) -> float:
+    size = float(need_gb)
+    if size <= 0.5:
+        return 0.25
+    if size <= 1.5:
+        return 0.45
+    if size <= 3.0:
+        return 0.80
+    return RAM_SAFETY_GB
+
+
 def can_stage(
     need_gb: float,
     log: Optional[Callable[[str], None]] = None,
     label: str = "",
 ) -> Tuple[bool, str]:
-    need = float(need_gb) * (1.0 + RAM_HEADROOM_RATIO) + RAM_SAFETY_GB
+    margin = safety_margin_gb(need_gb)
+    need = float(need_gb) * (1.0 + RAM_HEADROOM_RATIO) + margin
     usable = usable_ram_gb()
     cap = ram_limit_gb()
 
@@ -173,7 +185,7 @@ def can_stage(
 
     reason = (
         f"가용 RAM {usable:.1f} GB < 필요 {need:.1f} GB "
-        f"(가중치 {float(need_gb):.1f} GB + 여유 {RAM_SAFETY_GB:.1f} GB)"
+        f"(가중치 {float(need_gb):.1f} GB + 여유 {margin:.2f} GB)"
     )
 
     if allow_low_ram():

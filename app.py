@@ -1071,10 +1071,22 @@ class NMSOcrApp:
         probe = self.router(["__dim_probe__"])
         dim = int(probe.shape[-1]) if probe is not None and probe.size else 0
         recipe = f"{self.router.active or 'router'}-{'+'.join(self.active_codes)}"
-        self.cached_router = CachedEmbedder(
-            self.router, recipe=recipe, dim=dim, log=self._log
-        )
-        self._log(f"  💾 앵커 캐시 활성 (recipe={recipe}, dim={dim})")
+
+        if dim < 8:
+            self.cached_router = None
+            self._log(
+                f"  🚯 [ANCHOR CACHE] 임베딩 차원이 {dim} 이라 캐시를 "
+                f"만들지 않습니다. 텍스트 축은 이번 실행에서 비활성입니다."
+            )
+            self._log(
+                "     원인: 임베딩 모델 적재 실패. RAM 을 확보하면 "
+                "문서 유형 판정이 크게 정확해집니다."
+            )
+        else:
+            self.cached_router = CachedEmbedder(
+                self.router, recipe=recipe, dim=dim, log=self._log
+            )
+            self._log(f"  💾 앵커 캐시 활성 (recipe={recipe}, dim={dim})")
 
         self._progress(100, "모든 모델 준비 완료")
         self._log(f"  🔀 임베딩 제공자: {', '.join(self.router.providers())}")

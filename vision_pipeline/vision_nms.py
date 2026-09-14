@@ -874,6 +874,24 @@ def plan_crops(
                 f"가장 가까운 크롭에 편입했습니다."
             )
 
+    seen_boxes: Dict[Tuple[int, int, int, int], str] = {}
+    twins: List[str] = []
+    for w in sorted(winners, key=lambda p: -p.score):
+        owner = seen_boxes.get(w.bbox)
+        if owner is None:
+            seen_boxes[w.bbox] = w.category
+            continue
+        twins.append(w.category)
+        w.source = f"twin-of:{owner}"
+
+    if log is not None and twins:
+        log.append(
+            f"    👯 [TWIN CROP] 좌표가 완전히 같은 크롭 {len(twins)}건 "
+            f"({', '.join(twins)}) — 점수가 낮은 쪽은 배열을 만들지 "
+            f"않습니다. 같은 표에서 두 카테고리가 같은 값을 복제하는 것을 "
+            f"막습니다."
+        )
+
     merged: List[CropPlan] = []
     for w in sorted(winners, key=lambda p: (p.category, -p.area())):
         same = None

@@ -466,7 +466,10 @@ def _text_axis_scores(
         return {}, 0, f"텍스트 임베딩 실패: {e}"
 
     if doc is None or mat is None:
-        return {}, 0, "텍스트 임베딩이 비었습니다."
+        return {}, 0, "텍스트 임베딩이 비었습니다 — 이 축을 제외합니다."
+
+    if not np.any(np.asarray(doc, dtype=np.float32)):
+        return {}, 0, "문서 임베딩이 영벡터입니다 — 이 축을 제외합니다."
 
     doc = np.asarray(doc, dtype=np.float32)
     mat = np.asarray(mat, dtype=np.float32)

@@ -103,10 +103,20 @@ class CachedEmbedder:
         except Exception:
             pass
 
+    MIN_CACHE_DIM = 8
+
     def _ensure_cache(self, dim: int):
-        if self.cache is None and dim > 0:
-            self.dim = dim
-            self.cache = PhraseCache(self.recipe, dim)
+        if self.cache is not None:
+            return
+        if dim < self.MIN_CACHE_DIM:
+            self._log(
+                f"  ⏭ 앵커 캐시 생성 보류 — 임베딩 차원 {dim} 은 유효하지 "
+                f"않습니다 (최소 {self.MIN_CACHE_DIM}). 영벡터를 디스크에 "
+                f"기록하지 않습니다."
+            )
+            return
+        self.dim = dim
+        self.cache = PhraseCache(self.recipe, dim)
 
     def encode(self, texts: Sequence[str]) -> np.ndarray:
         items = [str(t) if t is not None else "" for t in texts]
@@ -121,22 +131,35 @@ class CachedEmbedder:
 
         if missing:
             mat = self.encode_fn(missing)
-            if mat is None:
+            degraded = mat is None
+            if degraded:
                 mat = np.zeros((len(missing), max(1, self.dim)), dtype=np.float32)
             mat = np.asarray(mat, dtype=np.float32)
             if mat.ndim == 1:
                 mat = mat.reshape(1, -1)
 
-            self._ensure_cache(int(mat.shape[-1]))
+            if not degraded:
+                self._ensure_cache(int(mat.shape[-1]))
 
             fresh = []
             for i, t in enumerate(missing):
                 if i >= mat.shape[0]:
                     break
-                cached[t] = mat[i]
-                fresh.append((t, mat[i]))
+                vec = mat[i]
+                cached[t] = vec
+                if degraded:
+                    continue
+                if not np.any(vec):
+                    continue
+                fresh.append((t, vec))
 
-            if self.cache is not None and fresh:
+            if degraded:
+                self._log(
+                    f"  🚯 [ANCHOR CACHE] 임베딩 제공자가 모두 실패해 "
+                    f"{len(missing)}구를 캐시에 기록하지 않습니다. "
+                    f"이 축은 이번 실행에서 무효입니다."
+                )
+            elif self.cache is not None and fresh:
                 n = self.cache.put_batch(fresh)
                 if n:
                     self._log(f"  💾 앵커 캐시 신규 {n}구 기록")

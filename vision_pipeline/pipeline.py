@@ -400,10 +400,11 @@ class VisionPipeline:
                 array_categories=array_cats,
                 text_boxes=tboxes,
                 line_read_fn=reader,
+                schema=schema,
             )
             result.fields = fields
 
-            record = fields_to_record(fields, schema)
+            record = fields_to_record(fields, schema, log=self.logs)
             for name in result.absent_fields:
                 record[name] = None
             if result.absent_fields:

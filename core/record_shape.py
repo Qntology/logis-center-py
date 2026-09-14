@@ -130,15 +130,85 @@ def entity_bcc(mode: str, doc_type: str, digest: str) -> str:
 
 
 IDENT_SHAPE_RE = re.compile(
-    r"\b([A-Z]{1,6}[-/ ]?\d{3,}[A-Z0-9\-/]*|\d{6,})\b"
+    r"\b([A-Z]{1,6}[-/][A-Z0-9]*\d{3,}[A-Z0-9\-/]*"
+    r"|[A-Z]{2,6}\d{4,}[A-Z0-9]*)\b"
 )
 
+IDENT_NUMERIC_RE = re.compile(r"\b(\d{6,})\b")
+
 IDENT_SCAN_CATEGORIES = ("header", "financials", "logistics", "conditions")
+
+IDENT_LABEL_HINTS = (
+    "invoicenumber", "invoiceno", "documentnumber", "docno",
+    "referencenumber", "refno", "bookingnumber",
+)
+
+IDENT_LABEL_NEGATIVE = (
+    "vat", "eori", "tax", "phone", "tel", "fax", "zip", "postal",
+    "account", "iban", "swift", "hscode",
+)
+
+
+def _label_context(raw: str, span_start: int, window: int = 60) -> str:
+    head = raw[max(0, span_start - window): span_start]
+    return "".join(ch for ch in head.lower() if ch.isalnum())
+
+
+def _restore_identity(token: str) -> str:
+    raw = str(token or "").strip()
+    if not raw:
+        return ""
+    if any(ch.isalpha() for ch in raw):
+        return raw
+    return normalize_numeric_homoglyphs(raw)
+
+
+def _scan_identity(raw: str) -> str:
+    text = str(raw or "")
+    upper = text.upper()
+
+    typed: List[Tuple[int, str]] = []
+    for m in IDENT_SHAPE_RE.finditer(upper):
+        ctx = _label_context(upper, m.start())
+        if any(neg in ctx for neg in IDENT_LABEL_NEGATIVE):
+            continue
+        score = 2
+        if any(hint in ctx for hint in IDENT_LABEL_HINTS):
+            score = 0
+        typed.append((score, text[m.start(1): m.end(1)]))
+
+    if typed:
+        typed.sort(key=lambda t: t[0])
+        return _restore_identity(typed[0][1])
+
+    for m in IDENT_NUMERIC_RE.finditer(upper):
+        ctx = _label_context(upper, m.start())
+        if any(neg in ctx for neg in IDENT_LABEL_NEGATIVE):
+            continue
+        if not any(hint in ctx for hint in IDENT_LABEL_HINTS):
+            continue
+        return _restore_identity(text[m.start(1): m.end(1)])
+
+    return ""
 
 
 def _task_id(fallback: str) -> str:
     seed = normalize_identifier(fallback) or str(int(time.time() * 1000))
     return f"task_{_crc32(seed.encode('utf-8')):010d}"
+
+
+IDENT_MAX_LEN = 40
+
+
+def _plausible_identity(value: str) -> bool:
+    s = str(value or "").strip()
+    if not s or len(s) > IDENT_MAX_LEN:
+        return False
+    if "\n" in s or "\r" in s:
+        return False
+    if len(s.split()) > 3:
+        return False
+    return any(ch.isdigit() for ch in s)
 
 
 def resolve_doc_identity(
@@ -147,34 +217,42 @@ def resolve_doc_identity(
     fallback: str = "",
     ocr_pool: Optional[Dict[str, str]] = None,
 ) -> Tuple[str, bool]:
+    rejected: List[str] = []
+
     for key in ("doc_number", "no", "reference_number"):
         v = record.get(key)
-        if isinstance(v, str) and v.strip():
+        if not isinstance(v, str) or not v.strip():
+            continue
+        if _plausible_identity(v):
             return v.strip(), False
+        rejected.append(v.strip()[:30])
 
     for cat in IDENT_SCAN_CATEGORIES:
         node = record.get(cat)
         if isinstance(node, dict):
             for key in ("doc_number", "no", "reference_number"):
                 v = node.get(key)
-                if isinstance(v, str) and v.strip():
+                if not isinstance(v, str) or not v.strip():
+                    continue
+                if _plausible_identity(v):
                     return v.strip(), False
+                rejected.append(v.strip()[:30])
 
     if ocr_pool:
         for cat in IDENT_SCAN_CATEGORIES:
             raw = ocr_pool.get(cat)
             if not isinstance(raw, str) or not raw.strip():
                 continue
-            m = IDENT_SHAPE_RE.search(raw.upper())
-            if m:
-                return normalize_numeric_homoglyphs(m.group(1)), True
+            got = _scan_identity(raw)
+            if got:
+                return got, True
 
         for raw in ocr_pool.values():
             if not isinstance(raw, str) or not raw.strip():
                 continue
-            m = IDENT_SHAPE_RE.search(raw.upper())
-            if m:
-                return normalize_numeric_homoglyphs(m.group(1)), True
+            got = _scan_identity(raw)
+            if got:
+                return got, True
 
     return _task_id(fallback), True
 
