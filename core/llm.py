@@ -5,7 +5,19 @@ import numpy as np
 import torch
 
 from .device import configure_backends, detect_accelerator, select_dtype
-from .memory import can_stage, make_room, model_disk_gb, reclaim, usable_ram_gb
+from .memory import (
+    RamGuardAbort,
+    RamWatchdog,
+    can_stage,
+    commit_free_gb,
+    cpu_share_gb,
+    headroom_gb,
+    make_room,
+    model_disk_gb,
+    reclaim,
+    staging_need_gb,
+    usable_ram_gb,
+)
 from .quant_bootstrap import (
     build_config as build_quant_config,
     capability as quant_capability,
@@ -110,6 +122,30 @@ PROMPT_ECHO_MARKERS = (
 
 PROMPT_ECHO_MIN_HITS = 1
 
+REASONING_OPENERS = (
+    "the user wants",
+    "the user is asking",
+    "the user asks",
+    "i need to",
+    "i should",
+    "let me",
+    "okay,",
+    "first,",
+    "looking at the image",
+    "we need to",
+)
+
+THINK_BUDGET_MULTIPLIER = 3.0
+THINK_BUDGET_FLOOR = 512
+THINK_BUDGET_CEIL = 3072
+
+NO_THINK_TAG = "/no_think"
+JSON_ACTION_OBJECT = "[ACTION] JSON ONLY. NO EXPLANATION. NO COMMENTS IN JSON."
+JSON_ACTION_ARRAY = "[ACTION] RETURN JSON ONLY. NO EXPLANATION. NO COMMENTS IN JSON."
+JSON_PREFILL_OBJECT = "{"
+JSON_PREFILL_ARRAY = "["
+JSON_BALANCE_TAIL_TOKENS = 2
+
 
 VISION_ARCH_MARKERS = (
     "imagetexttotext",
@@ -118,6 +154,31 @@ VISION_ARCH_MARKERS = (
     "vlforconditional",
     "visionencoderdecoder",
 )
+
+PLAN_GPU_DISK = "gpu+disk"
+PLAN_GPU_CPU_DISK = "gpu+cpu+disk"
+PLAN_DISK_HEAVY = "disk-heavy"
+
+LOAD_PLANS = (PLAN_GPU_DISK, PLAN_DISK_HEAVY)
+LOAD_PLANS_WITH_CPU = (PLAN_GPU_CPU_DISK, PLAN_GPU_DISK, PLAN_DISK_HEAVY)
+
+PLAN_GPU_RATIO = {
+    PLAN_GPU_CPU_DISK: 1.00,
+    PLAN_GPU_DISK: 1.00,
+    PLAN_DISK_HEAVY: 0.55,
+}
+
+PLAN_NOTE = {
+    PLAN_GPU_CPU_DISK: (
+        "GPU 우선 + CPU 여유분 + 디스크 오프로드 (RAM 여유가 넉넉할 때)"
+    ),
+    PLAN_GPU_DISK: (
+        "GPU 우선 + 디스크 오프로드 (CPU 몫 0 — 호스트 RAM 을 쓰지 않습니다)"
+    ),
+    PLAN_DISK_HEAVY: (
+        "GPU 절반만 + 나머지 전량 디스크 (가장 느리지만 가장 안전)"
+    ),
+}
 
 
 def _load_with_dtype(loader, path, dtype, **kwargs):
@@ -275,9 +336,14 @@ class RefinerLLM:
         self.low_vram = bool(low_vram)
         self.budget_gb = float(budget_gb or 0.0)
         self.load_mode = "standard"
+        self.load_plan = ""
         self.vision = False
         self.processor = None
         self._vision_marker_logged = False
+        self.thinking = False
+        self._think_probed = False
+        self._no_think_kwarg = None
+        self._json_marker_logged = False
 
         self.device, self.accel_label = detect_accelerator(device)
         self.dtype = select_dtype(self.device)
@@ -293,21 +359,26 @@ class RefinerLLM:
             if quant_ready:
                 self.quant_mode = mode
 
+        ratio = quant_stage_ratio() if quant_ready else 1.0
+        fallback = max(1.5, self.weight_gb * ratio)
+        measured, why = staging_need_gb(self.model_path, fallback_gb=fallback)
+
         if quant_ready:
-            ratio = quant_stage_ratio()
-            self.stage_gb = max(1.5, self.weight_gb * ratio)
+            self.stage_gb = min(fallback, measured)
             self._log(
-                f"  🧮 [{self.label}] {self.quant_mode} 양자화는 샤드 단위로 "
+                f"  🧮 [{self.label}] {self.quant_mode} 양자화는 텐서 단위로 "
                 f"스트리밍되어 전량이 동시에 RAM 에 있지 않습니다. "
-                f"스테이징 추정 {self.stage_gb:.1f} GB "
-                f"(가중치 {self.weight_gb:.1f} GB × {ratio:.2f})"
+                f"스테이징 {self.stage_gb:.1f} GB — {why}"
             )
         else:
-            self.stage_gb = self.weight_gb
+            self.stage_gb = measured if measured > 0.0 else self.weight_gb
+            self._log(
+                f"  🧮 [{self.label}] 스테이징 {self.stage_gb:.1f} GB — {why}"
+            )
             if self.low_vram and self.device.type == "cuda":
                 self._log(
                     f"  ⚠ [{self.label}] 양자화 없이 원본 {self.weight_gb:.1f} GB 를 "
-                    f"그대로 펼쳐야 합니다. 로드가 실패할 가능성이 높습니다."
+                    f"GPU 에 펼쳐야 합니다. VRAM 이 부족하면 실패합니다."
                 )
 
         ok, why = can_stage(self.stage_gb, log=self._log, label=self.label)
@@ -354,92 +425,210 @@ class RefinerLLM:
             self.model_path, trust_remote_code=True
         )
 
-        kwargs = {"trust_remote_code": True, "low_cpu_mem_usage": True}
+        quant = None
+        if self.device.type == "cuda" and self.low_vram:
+            quant = self._try_quant_config()
+            self.load_mode = (
+                (self.quant_mode or "4bit") if quant is not None else "offload"
+            )
 
-        if self.device.type == "cuda":
-            if self.low_vram:
-                quant = self._try_quant_config()
-                if quant is not None:
-                    kwargs["quantization_config"] = quant
-                    kwargs["device_map"] = "auto"
-                    self.load_mode = self.quant_mode or "4bit"
+        offload_dir = ""
+        if self.device.type == "cuda" and self.low_vram:
+            probe = Path(self.model_path).parent / ".offload"
+            try:
+                probe.mkdir(parents=True, exist_ok=True)
+                offload_dir = str(probe)
+            except Exception as e:
+                self._log(f"  ⏭ 오프로드 폴더 준비 실패 ({e})")
+
+        cpu_room = cpu_share_gb()
+        plans = list(
+            LOAD_PLANS_WITH_CPU if cpu_room > 0.0 else LOAD_PLANS
+        )
+        if self.device.type != "cuda" or not self.low_vram:
+            plans = [""]
+
+        if len(plans) > 1:
+            self._log(
+                f"  🪜 [{self.label}] 적재를 {len(plans)}단계로 쪼갭니다 — "
+                f"{' → '.join(plans)} (앞 단계가 실패하면 더 얇은 계획으로 "
+                f"자동 강등합니다)"
+            )
+            if cpu_room <= 0.0:
+                self._log(
+                    f"  🚧 [{self.label}] 커밋 여유 {headroom_gb():.1f} GB 로는 "
+                    f"CPU 배치 몫을 둘 수 없습니다. CPU 상한을 0 으로 두고 "
+                    f"GPU + 디스크로만 나눕니다 — 이 설정이 프로세스 강제 "
+                    f"종료를 막습니다."
+                )
+
+        def _build_kwargs(plan: str) -> dict:
+            kw = {"trust_remote_code": True, "low_cpu_mem_usage": True}
+            if self.device.type != "cuda":
+                return kw
+            if not self.low_vram:
+                kw["device_map"] = "auto"
+                return kw
+
+            if quant is not None:
+                kw["quantization_config"] = quant
+            kw["device_map"] = "auto"
+
+            if self.budget_gb > 0:
+                ratio = float(PLAN_GPU_RATIO.get(plan, 1.0))
+                cap = max(0.6, (self.budget_gb - 0.9) * ratio)
+                limits = {0: f"{cap:.1f}GiB"}
+                if plan == PLAN_GPU_CPU_DISK and cpu_room > 0.0:
+                    limits["cpu"] = f"{cpu_room:.1f}GiB"
                 else:
-                    kwargs["device_map"] = "auto"
-                    self.load_mode = "offload"
+                    limits["cpu"] = "0GiB"
+                kw["max_memory"] = limits
+                self._log(
+                    f"  🧮 [{self.label}] '{plan}' 메모리 상한 — GPU "
+                    f"{cap:.1f} GiB / CPU {limits['cpu']} | "
+                    f"{PLAN_NOTE.get(plan, '')}"
+                )
 
-                if self.budget_gb > 0:
-                    cap = max(1.0, self.budget_gb - 0.9)
-                    room = max(1.0, usable_ram_gb() - 1.2)
-                    kwargs["max_memory"] = {
-                        0: f"{cap:.1f}GiB",
-                        "cpu": f"{room:.1f}GiB",
-                    }
-                    self._log(
-                        f"  🧮 [{self.label}] 메모리 상한 — GPU {cap:.1f} GiB "
-                        f"/ CPU {room:.1f} GiB"
-                    )
-
-                offload = Path(self.model_path).parent / ".offload"
-                try:
-                    offload.mkdir(parents=True, exist_ok=True)
-                    kwargs["offload_folder"] = str(offload)
-                    kwargs["offload_state_dict"] = True
-                    self._log(
-                        f"  💽 [{self.label}] 상한 초과분은 디스크로 "
-                        f"오프로드합니다 — {offload}"
-                    )
-                except Exception as e:
-                    self._log(f"  ⏭ 오프로드 폴더 준비 실패 ({e})")
-            else:
-                kwargs["device_map"] = "auto"
+            if offload_dir:
+                kw["offload_folder"] = offload_dir
+                kw["offload_state_dict"] = True
+                kw["offload_buffers"] = True
+            return kw
 
         meta = _peek_config(self.model_path)
         want_vision, arch = _looks_vision_model(meta)
 
         self.model = None
+        last_error: Optional[BaseException] = None
 
-        if want_vision:
-            import transformers as _tf
-            for loader_name in (
-                "AutoModelForImageTextToText",
-                "AutoModelForVision2Seq",
-            ):
-                loader = getattr(_tf, loader_name, None)
-                if loader is None:
-                    continue
-                try:
-                    self.model = _load_with_dtype(
-                        loader, self.model_path, self.dtype, **kwargs
-                    )
-                    self.vision = True
-                    self._log(
-                        f"  👁 [{self.label}] 비전-언어 모델로 로드했습니다 "
-                        f"({loader_name} | config {arch}) — 크롭 이미지를 "
-                        f"직접 읽습니다."
-                    )
+        for attempt, plan in enumerate(plans, start=1):
+            kwargs = _build_kwargs(plan)
+            tag = plan or "standard"
+
+            if attempt > 1:
+                room = reclaim(
+                    log=self._log,
+                    label=f"{self.label} {attempt}단계 전 회수",
+                    rounds=3,
+                )
+                self._log(
+                    f"  🔁 [{self.label}] {attempt}단계 '{tag}' 재시도 — "
+                    f"커밋 여유 {room:.1f} GB"
+                )
+
+            guard = RamWatchdog(label=f"{self.label}/{tag}", log=self._log)
+            try:
+                with guard:
+                    if want_vision:
+                        import transformers as _tf
+                        for loader_name in (
+                            "AutoModelForImageTextToText",
+                            "AutoModelForVision2Seq",
+                        ):
+                            loader = getattr(_tf, loader_name, None)
+                            if loader is None:
+                                continue
+                            try:
+                                self.model = _load_with_dtype(
+                                    loader, self.model_path, self.dtype,
+                                    **kwargs
+                                )
+                                guard.check()
+                                self.vision = True
+                                self._log(
+                                    f"  👁 [{self.label}] 비전-언어 모델로 "
+                                    f"로드했습니다 ({loader_name} | config "
+                                    f"{arch}) — 크롭 이미지를 직접 읽습니다."
+                                )
+                                break
+                            except RamGuardAbort:
+                                raise
+                            except Exception as e:
+                                self._log(
+                                    f"  ⏭ [{self.label}] {loader_name} 로드 "
+                                    f"불가 ({type(e).__name__}: {str(e)[:90]})"
+                                )
+                                self.model = None
+                                reclaim(
+                                    log=self._log,
+                                    label=f"{self.label} 로더 실패 후",
+                                )
+                    elif attempt == 1:
+                        self._log(
+                            f"  📄 [{self.label}] config 에 비전 아키텍처 "
+                            f"표시가 없어 텍스트 전용 경로로 바로 로드합니다 "
+                            f"— 불필요한 중복 적재를 건너뜁니다."
+                        )
+
+                    if self.model is None:
+                        self.model = _load_with_dtype(
+                            AutoModelForCausalLM, self.model_path,
+                            self.dtype, **kwargs
+                        )
+                        guard.check()
+                        self.vision = False
+                        self._log(
+                            f"  📄 [{self.label}] 텍스트 전용으로 "
+                            f"로드했습니다 — OCR 원문만 정제합니다."
+                        )
+
+                if self.model is not None:
+                    if plan:
+                        self.load_plan = plan
+                        self._log(
+                            f"  ✅ [{self.label}] '{tag}' 계획으로 적재 성공 "
+                            f"({attempt}/{len(plans)}단계)"
+                        )
                     break
-                except Exception as e:
-                    self._log(
-                        f"  ⏭ [{self.label}] {loader_name} 로드 불가 "
-                        f"({type(e).__name__}: {str(e)[:90]})"
-                    )
-                    self.model = None
-                    reclaim(log=self._log, label=f"{self.label} 로더 실패 후")
-        else:
-            self._log(
-                f"  📄 [{self.label}] config 에 비전 아키텍처 표시가 없어 "
-                f"텍스트 전용 경로로 바로 로드합니다 — 불필요한 중복 "
-                f"적재를 건너뜁니다."
-            )
+
+            except RamGuardAbort as e:
+                last_error = e
+                self.model = None
+                self._log(f"  🚨 [{self.label}] {e}")
+                reclaim(
+                    log=self._log,
+                    label=f"{self.label} 중단 후 회수",
+                    rounds=3,
+                )
+            except (MemoryError, OSError) as e:
+                last_error = e
+                self.model = None
+                self._log(
+                    f"  ⚠ [{self.label}] '{tag}' 적재 실패 "
+                    f"({type(e).__name__}: {str(e)[:110]})"
+                )
+                reclaim(
+                    log=self._log,
+                    label=f"{self.label} 실패 후 회수",
+                    rounds=3,
+                )
+            except Exception as e:
+                low = str(e).lower()
+                if "out of memory" not in low and "alloc" not in low:
+                    raise
+                last_error = e
+                self.model = None
+                self._log(
+                    f"  ⚠ [{self.label}] '{tag}' 메모리 부족 "
+                    f"({type(e).__name__}: {str(e)[:110]})"
+                )
+                reclaim(
+                    log=self._log,
+                    label=f"{self.label} 실패 후 회수",
+                    rounds=3,
+                )
 
         if self.model is None:
-            self.model = _load_with_dtype(
-                AutoModelForCausalLM, self.model_path, self.dtype, **kwargs
-            )
-            self.vision = False
-            self._log(
-                f"  📄 [{self.label}] 텍스트 전용으로 로드했습니다 "
-                f"— OCR 원문만 정제합니다."
+            raise MissingModelError(
+                f"[{self.label}] {len(plans)}단계 적재 계획을 모두 시도했지만 "
+                f"메모리가 부족합니다.\n"
+                f"  마지막 오류: {type(last_error).__name__ if last_error else '?'}"
+                f": {str(last_error)[:160]}\n"
+                f"  커밋 여유 {commit_free_gb():.1f} GB\n"
+                f"  해결 방법:\n"
+                f"    · 다른 프로그램을 닫아 RAM 을 확보하세요.\n"
+                f"    · Windows 가상 메모리(페이지 파일)를 늘리세요.\n"
+                f"    · 더 작은 모델을 쓰세요."
             )
 
         reclaim(log=self._log, label=f"{self.label} 로드 후")
@@ -486,14 +675,35 @@ class RefinerLLM:
 
                 got = self.generate_with_image(
                     "Read the printed text and reply with it only.",
-                    probe, max_new_tokens=16,
+                    probe, max_new_tokens=64,
                 )
+
+                if self.looks_reasoning(got):
+                    self.note_thinking(got)
+                    self._log(
+                        f"  🔁 [{self.label}] 사고 단계에서 잘린 응답입니다. "
+                        f"예산을 {self.budget_for(64)}토큰으로 늘려 "
+                        f"재검진합니다."
+                    )
+                    got = self.generate_with_image(
+                        "Read the printed text and reply with it only.",
+                        probe, max_new_tokens=64,
+                    )
+
                 low = str(got or "").strip().lower()
                 bad = low in ("", "user", "assistant", "system")
                 if bad:
                     self._log(
                         f"  ⚠ [{self.label}] 비전 경로 응답이 역할 토큰"
                         f"({got[:24]!r}) — 텍스트 경로를 사용합니다."
+                    )
+                    self.vision = False
+                elif self.looks_reasoning(got):
+                    self._log(
+                        f"  ⚠ [{self.label}] 예산을 늘려도 사고 텍스트만 "
+                        f"나옵니다 ({got[:36]!r}). 비전 판독을 끄고 "
+                        f"PP-OCRv5 결과를 그대로 씁니다 — 쓸모없는 호출로 "
+                        f"수 분을 낭비하지 않습니다."
                     )
                     self.vision = False
                 else:
@@ -520,14 +730,29 @@ class RefinerLLM:
         placement = ""
         dev_map = getattr(self.model, "hf_device_map", None)
         if isinstance(dev_map, dict):
-            devs = sorted(set(str(v) for v in dev_map.values()))
-            placement = " | 배치: " + ", ".join(devs)
-            if any(d in ("cpu", "disk") for d in devs):
-                self._log(f"  ⚠ [{self.label}] 일부 레이어가 CPU/디스크로 오프로드되었습니다.")
+            tally: Dict[str, int] = {}
+            for v in dev_map.values():
+                key = str(v)
+                tally[key] = tally.get(key, 0) + 1
+            placement = " | 배치: " + ", ".join(
+                f"{k}×{n}" for k, n in sorted(tally.items())
+            )
+            if int(tally.get("cpu", 0)) > 0:
+                self._log(
+                    f"  ⚠ [{self.label}] 레이어 {tally['cpu']}개가 CPU 에 "
+                    f"상주합니다. 호스트 RAM 을 계속 점유하므로 다음 "
+                    f"적재에서 압박이 커집니다."
+                )
+            if int(tally.get("disk", 0)) > 0:
+                self._log(
+                    f"  💽 [{self.label}] 레이어 {tally['disk']}개를 디스크에서 "
+                    f"읽습니다. 생성 속도가 느려지지만 RAM 은 쓰지 않습니다."
+                )
 
+        plan_tail = f" | 계획 {self.load_plan}" if self.load_plan else ""
         self._log(
             f"  ✅ [{self.label}] 정제 LLM 로드 "
-            f"({self.load_mode} | {self.dtype}{placement})"
+            f"({self.load_mode} | {self.dtype}{placement}{plan_tail})"
         )
 
         from . import diagnostics as _diag
@@ -590,6 +815,151 @@ class RefinerLLM:
         except Exception:
             pass
 
+    @staticmethod
+    def looks_reasoning(text: str) -> bool:
+        s = str(text or "").strip().lower()
+        if not s:
+            return False
+        if "<think>" in s:
+            return True
+        for opener in REASONING_OPENERS:
+            if s.startswith(opener):
+                return True
+        return False
+
+    def note_thinking(self, sample: str = "") -> None:
+        if self.thinking:
+            return
+        if not self.looks_reasoning(sample):
+            return
+        self.thinking = True
+        self._log(
+            f"  🧠 [{self.label}] 사고형(thinking) 모델로 판정했습니다 "
+            f"(응답이 '{str(sample).strip()[:28]}' 로 시작). 토큰 예산을 "
+            f"{THINK_BUDGET_MULTIPLIER:.0f}배로 늘리고, 가능하면 사고 "
+            f"단계를 끕니다."
+        )
+
+    def budget_for(self, base: int) -> int:
+        n = max(1, int(base))
+        if not self.thinking:
+            return n
+        scaled = int(n * THINK_BUDGET_MULTIPLIER)
+        return int(min(THINK_BUDGET_CEIL, max(THINK_BUDGET_FLOOR, scaled)))
+
+    @staticmethod
+    def json_action(array: bool = False) -> str:
+        head = JSON_ACTION_ARRAY if array else JSON_ACTION_OBJECT
+        return f"\n{head} {NO_THINK_TAG}"
+
+    def _json_stopper(self, opener: str, start_len: int):
+        try:
+            from transformers import StoppingCriteria, StoppingCriteriaList
+        except Exception:
+            return None
+
+        tok = getattr(self.processor, "tokenizer", None) or self.tokenizer
+        if tok is None:
+            return None
+
+        close = "}" if opener == JSON_PREFILL_OBJECT else "]"
+        label = self.label
+
+        class _Balanced(StoppingCriteria):
+            def __init__(self):
+                self.depth = 1
+                self.in_str = False
+                self.esc = False
+                self.seen = start_len
+                self.tail = 0
+
+            def __call__(self, input_ids, scores, **kw):
+                seq = input_ids[0]
+                n = int(seq.shape[-1])
+                if n <= self.seen:
+                    return False
+                try:
+                    piece = tok.decode(
+                        seq[self.seen:n], skip_special_tokens=True
+                    )
+                except Exception:
+                    self.seen = n
+                    return False
+                self.seen = n
+
+                for ch in piece:
+                    if self.in_str:
+                        if self.esc:
+                            self.esc = False
+                        elif ch == "\\":
+                            self.esc = True
+                        elif ch == '"':
+                            self.in_str = False
+                        continue
+                    if ch == '"':
+                        self.in_str = True
+                    elif ch == opener:
+                        self.depth += 1
+                    elif ch == close:
+                        self.depth -= 1
+                        if self.depth <= 0:
+                            return True
+                return False
+
+        return StoppingCriteriaList([_Balanced()])
+
+    def _prefill_ids(self, enc: dict, opener: str):
+        if not opener:
+            return enc, 0
+        tok = getattr(self.processor, "tokenizer", None) or self.tokenizer
+        ids = enc.get("input_ids")
+        if tok is None or ids is None:
+            return enc, 0
+
+        try:
+            import torch as _t
+            seed = tok(opener, add_special_tokens=False, return_tensors="pt")
+            seed_ids = seed["input_ids"].to(ids.device)
+            merged = dict(enc)
+            merged["input_ids"] = _t.cat([ids, seed_ids], dim=-1)
+            mask = enc.get("attention_mask")
+            if mask is not None:
+                pad = _t.ones_like(seed_ids)
+                merged["attention_mask"] = _t.cat(
+                    [mask, pad.to(mask.device)], dim=-1
+                )
+            mm = enc.get("mm_token_type_ids")
+            if mm is not None:
+                zero = _t.zeros_like(seed_ids)
+                merged["mm_token_type_ids"] = _t.cat(
+                    [mm, zero.to(mm.device)], dim=-1
+                )
+            return merged, int(seed_ids.shape[-1])
+        except Exception as e:
+            self._log(
+                f"    ⏭ [{self.label}] JSON 프리필 주입 실패 "
+                f"({type(e).__name__}) — 프롬프트 지시만으로 진행합니다."
+            )
+            return enc, 0
+
+    def _template_kwargs(self) -> dict:
+        if self._no_think_kwarg is not None:
+            return dict(self._no_think_kwarg)
+
+        out: dict = {}
+        tok = getattr(self.processor, "tokenizer", None) or self.tokenizer
+        src = getattr(tok, "chat_template", "") or ""
+        if not src:
+            src = getattr(self.processor, "chat_template", "") or ""
+        if "enable_thinking" in str(src):
+            out["enable_thinking"] = False
+            self._log(
+                f"  🧠 [{self.label}] chat_template 이 enable_thinking 을 "
+                f"지원합니다 — 사고 단계를 끄고 바로 답만 받습니다."
+            )
+        self._no_think_kwarg = dict(out)
+        return dict(out)
+
     def _encode_via_template(self, prompt: str, pil):
         messages = [{
             "role": "user",
@@ -598,6 +968,7 @@ class RefinerLLM:
                 {"type": "text", "text": prompt},
             ],
         }]
+        extra = self._template_kwargs()
         try:
             enc = self.processor.apply_chat_template(
                 messages,
@@ -605,7 +976,24 @@ class RefinerLLM:
                 tokenize=True,
                 return_dict=True,
                 return_tensors="pt",
+                **extra,
             )
+        except TypeError:
+            try:
+                enc = self.processor.apply_chat_template(
+                    messages,
+                    add_generation_prompt=True,
+                    tokenize=True,
+                    return_dict=True,
+                    return_tensors="pt",
+                )
+            except Exception as e:
+                if not self._vision_marker_logged:
+                    self._log(
+                        f"  ⏭ [{self.label}] 프로세서 템플릿 경로 불가 "
+                        f"({type(e).__name__}: {str(e)[:70]}) → 수동 확장"
+                    )
+                return None
         except Exception as e:
             if not self._vision_marker_logged:
                 self._log(
@@ -719,9 +1107,13 @@ class RefinerLLM:
         prompt: str,
         image,
         max_new_tokens: Optional[int] = None,
+        kwargs_json_opener: str = "",
     ) -> str:
         if not self.vision or self.processor is None or image is None:
-            return self.generate(prompt, max_new_tokens=max_new_tokens)
+            return self.generate(
+                prompt, max_new_tokens=max_new_tokens,
+                kwargs_json_opener=kwargs_json_opener,
+            )
 
         pil = image.convert("RGB")
         last = None
@@ -748,10 +1140,27 @@ class RefinerLLM:
             for k, v in enc.items()
         }
 
+        opener = str(kwargs_json_opener or "")
+        base_len = 0
+        ids0 = enc.get("input_ids")
+        if ids0 is not None:
+            base_len = int(ids0.shape[-1])
+
+        seeded = 0
+        if opener:
+            enc, seeded = self._prefill_ids(enc, opener)
+
         gen_kwargs = {
-            "max_new_tokens": int(max_new_tokens or self.max_new_tokens),
+            "max_new_tokens": self.budget_for(
+                int(max_new_tokens or self.max_new_tokens)
+            ),
             "do_sample": False,
         }
+
+        if opener and seeded > 0:
+            stopper = self._json_stopper(opener, base_len + seeded)
+            if stopper is not None:
+                gen_kwargs["stopping_criteria"] = stopper
 
         try:
             out = self.model.generate(**enc, **gen_kwargs)
@@ -775,12 +1184,30 @@ class RefinerLLM:
         start = int(ids.shape[-1]) if ids is not None else 0
         gen = out[0][start:]
         try:
-            return self.processor.decode(gen, skip_special_tokens=True).strip()
+            text = self.processor.decode(gen, skip_special_tokens=True).strip()
         except Exception:
-            return self.tokenizer.decode(gen, skip_special_tokens=True).strip()
+            text = self.tokenizer.decode(gen, skip_special_tokens=True).strip()
+
+        if opener and seeded > 0:
+            text = opener + text
+            if not self._json_marker_logged:
+                self._json_marker_logged = True
+                self._log(
+                    f"    🔒 [JSON FORCE] '{opener}' 를 프리필로 주입해 "
+                    f"모델이 JSON 중간부터 생성하도록 강제했습니다. "
+                    f"사고 서두가 물리적으로 나올 수 없습니다."
+                )
+
+        self.note_thinking(text)
+        return text
 
     @torch.no_grad()
-    def generate(self, prompt: str, max_new_tokens: Optional[int] = None) -> str:
+    def generate(
+        self,
+        prompt: str,
+        max_new_tokens: Optional[int] = None,
+        kwargs_json_opener: str = "",
+    ) -> str:
         messages = [{"role": "user", "content": prompt}]
         try:
             text = self.tokenizer.apply_chat_template(
@@ -789,12 +1216,24 @@ class RefinerLLM:
         except Exception:
             text = prompt
 
+        opener = str(kwargs_json_opener or "")
+        if opener:
+            text = text + opener
+
         enc = self.tokenizer([text], return_tensors="pt").to(self.model.device)
 
         gen_kwargs = {
-            "max_new_tokens": int(max_new_tokens or self.max_new_tokens),
+            "max_new_tokens": self.budget_for(
+                int(max_new_tokens or self.max_new_tokens)
+            ),
             "do_sample": False,
         }
+        if opener:
+            ids0 = enc.get("input_ids")
+            if ids0 is not None:
+                stopper = self._json_stopper(opener, int(ids0.shape[-1]))
+                if stopper is not None:
+                    gen_kwargs["stopping_criteria"] = stopper
         if getattr(self, "fp8_kv", False):
             cache = self._kv_adapter.build()
             if cache is not None:
@@ -814,7 +1253,11 @@ class RefinerLLM:
             raise
 
         gen = out[0][len(enc["input_ids"][0]):]
-        return self.tokenizer.decode(gen, skip_special_tokens=True).strip()
+        text = self.tokenizer.decode(gen, skip_special_tokens=True).strip()
+        if opener:
+            text = opener + text
+        self.note_thinking(text)
+        return text
 
     @staticmethod
     def _strip_reasoning(text: str) -> str:
@@ -826,7 +1269,24 @@ class RefinerLLM:
         idx = s.rfind("<think>")
         if idx >= 0:
             s = s[:idx]
-        return s.strip()
+        s = s.strip()
+
+        if not s:
+            return s
+
+        low = s.lower()
+        if any(low.startswith(o) for o in REASONING_OPENERS):
+            for marker in ("\n{", "\n[", "\n```"):
+                cut = s.find(marker)
+                if cut >= 0:
+                    return s[cut:].strip()
+            for opener in ("{", "["):
+                cut = s.find(opener)
+                if cut > 0:
+                    return s[cut:].strip()
+            return ""
+
+        return s
 
     @staticmethod
     def is_schema_echo(value: str, field_name: str = "") -> bool:
@@ -1043,11 +1503,15 @@ class RefinerLLM:
                 "Every row MUST be wrapped in braces. "
                 'Correct: [{"a": "1"}, {"a": "2"}]  '
                 'Wrong: ["a": "1", "a": "2"]\n'
+                "Count the printed rows before you write. If you see three "
+                "rows, the array has three elements. The example below is a "
+                "shape, not a row count.\n"
                 "Return ONLY a JSON array, no markdown, no reasoning.\n\n"
                 f"REGION: {category}\n"
                 + (f"HINT: {hint}\n" if hint else "")
                 + (f"OCR DRAFT (may be wrong):\n{body}\n\n" if body else "")
                 + "SCHEMA: [\n  {\n" + ",\n".join(lines) + "\n  }\n]"
+                + self.json_action(array=True)
             )
         else:
             prompt = (
@@ -1056,11 +1520,14 @@ class RefinerLLM:
                 "Copy values verbatim from the OCR TEXT. Never invent a value.\n"
                 + directive
                 + "Printed column headers are NOT values. Return one object per row.\n"
+                "Count the printed rows before you write. Never merge two rows "
+                "into one element. Never split one row into two.\n"
                 "Return ONLY a JSON array, no markdown, no reasoning.\n\n"
                 f"REGION: {category}\n"
                 + (f"HINT: {hint}\n" if hint else "")
                 + f"OCR TEXT:\n{body}\n\n"
                 "SCHEMA: [\n  {\n" + ",\n".join(lines) + "\n  }\n]"
+                + self.json_action(array=True)
             )
 
         per_field = 56 if use_vision else 32
@@ -1068,10 +1535,14 @@ class RefinerLLM:
         try:
             if use_vision:
                 out = self.generate_with_image(
-                    prompt, image, max_new_tokens=budget
+                    prompt, image, max_new_tokens=budget,
+                    kwargs_json_opener=JSON_PREFILL_ARRAY,
                 )
             else:
-                out = self.generate(prompt, max_new_tokens=budget)
+                out = self.generate(
+                    prompt, max_new_tokens=budget,
+                    kwargs_json_opener=JSON_PREFILL_ARRAY,
+                )
         except Exception:
             return []
 
@@ -1323,6 +1794,7 @@ class RefinerLLM:
                 + banned
                 + (f"OCR DRAFT (may be wrong):\n{body}\n\n" if body else "")
                 + "SCHEMA: {\n" + ",\n".join(lines) + "\n}"
+                + self.json_action(array=False)
             )
         else:
             prompt = (
@@ -1337,6 +1809,7 @@ class RefinerLLM:
                 + banned
                 + f"OCR TEXT:\n{body}\n\n"
                 "SCHEMA: {\n" + ",\n".join(lines) + "\n}"
+                + self.json_action(array=False)
             )
 
         per_field = 40 if use_vision else 24
@@ -1344,10 +1817,14 @@ class RefinerLLM:
         try:
             if use_vision:
                 out = self.generate_with_image(
-                    prompt, image, max_new_tokens=budget
+                    prompt, image, max_new_tokens=budget,
+                    kwargs_json_opener=JSON_PREFILL_OBJECT,
                 )
             else:
-                out = self.generate(prompt, max_new_tokens=budget)
+                out = self.generate(
+                    prompt, max_new_tokens=budget,
+                    kwargs_json_opener=JSON_PREFILL_OBJECT,
+                )
         except Exception:
             return {}
 
@@ -1618,6 +2095,7 @@ class RefinerLLM:
             + "Separate distinct text blocks with ' / '.\n"
             "If there is no text, reply with an empty line."
             + (f"\nCONTEXT: {hint}" if hint else "")
+            + f"\n{NO_THINK_TAG}"
         )
 
         try:
@@ -1710,10 +2188,14 @@ class RefinerLLM:
             + (f"HINT: {hint}\n" if hint else "")
             + f"OCR TEXT:\n{body}\n\n"
             'SCHEMA: {"value": "<copy from OCR TEXT or empty string>"}'
+            + self.json_action(array=False)
         )
 
         try:
-            out = self.generate(prompt, max_new_tokens=128)
+            out = self.generate(
+                prompt, max_new_tokens=128,
+                kwargs_json_opener=JSON_PREFILL_OBJECT,
+            )
         except Exception:
             return {}
 

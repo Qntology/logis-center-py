@@ -185,6 +185,56 @@ def box_union(
     )
 
 
+def boxes_in_region(
+    boxes: Sequence[Tuple[int, int, int, int]],
+    region: Tuple[int, int, int, int],
+) -> List[Tuple[int, int, int, int]]:
+    rx0, ry0, rx1, ry1 = (int(v) for v in region)
+    out: List[Tuple[int, int, int, int]] = []
+    for (x0, y0, x1, y1) in boxes:
+        cx = (float(x0) + float(x1)) * 0.5
+        cy = (float(y0) + float(y1)) * 0.5
+        if rx0 <= cx <= rx1 and ry0 <= cy <= ry1:
+            out.append((int(x0), int(y0), int(x1), int(y1)))
+    return out
+
+
+def box_tighten(
+    boxes: Sequence[Tuple[int, int, int, int]],
+    region: Tuple[int, int, int, int],
+    pad_x: float = 0.0,
+    pad_y: float = 0.0,
+    bounds: Optional[Tuple[int, int]] = None,
+) -> Optional[Tuple[int, int, int, int]]:
+    hits = boxes_in_region(boxes, region)
+    if not hits:
+        return None
+
+    px = int(round(float(pad_x)))
+    py = int(round(float(pad_y)))
+    rx0, ry0, rx1, ry1 = (int(v) for v in region)
+
+    tx0 = min(b[0] for b in hits) - px
+    ty0 = min(b[1] for b in hits) - py
+    tx1 = max(b[2] for b in hits) + px
+    ty1 = max(b[3] for b in hits) + py
+
+    nx0 = max(rx0 - px, tx0)
+    ny0 = max(ry0 - py, ty0)
+    nx1 = min(rx1 + px, tx1)
+    ny1 = min(ry1 + py, ty1)
+
+    if bounds is not None:
+        nx0 = max(0, nx0)
+        ny0 = max(0, ny0)
+        nx1 = min(int(bounds[0]), nx1)
+        ny1 = min(int(bounds[1]), ny1)
+
+    if nx1 <= nx0 + 1 or ny1 <= ny0 + 1:
+        return None
+    return (int(nx0), int(ny0), int(nx1), int(ny1))
+
+
 def median_text_height(
     boxes: Sequence[Tuple[int, int, int, int]]
 ) -> float:

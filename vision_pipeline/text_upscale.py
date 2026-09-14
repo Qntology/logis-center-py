@@ -11,6 +11,16 @@ MAX_SIDE_PX = 2048
 VLM_MAX_SIDE_PX = 1024
 VLM_MAX_PIXELS = 640_000
 
+OVERLAP_LINE_UNITS = 1.4
+OVERLAP_MIN_PX = 8.0
+OVERLAP_MAX_RATIO = 0.20
+GUTTER_SEARCH_UNITS = 1.2
+GUTTER_INK_QUANTILE = 25.0
+
+TILE_SIDE_BUDGET = float(MAX_SIDE_PX)
+TILE_PIXEL_BUDGET = float(MAX_SIDE_PX) * float(MAX_SIDE_PX)
+TILE_SAFETY = 0.92
+
 
 def crop_region(image: Image.Image, bbox: Tuple[int, int, int, int]) -> Image.Image:
     x0, y0, x1, y1 = bbox
@@ -185,10 +195,89 @@ def fit_for_vlm(
     return image.resize((nw, nh), Image.LANCZOS)
 
 
+def _line_height_for(
+    image: Optional[Image.Image],
+    bbox: Tuple[int, int, int, int],
+    text_boxes: Optional[list] = None,
+) -> Tuple[float, str]:
+    if text_boxes:
+        x0, y0, x1, y1 = (int(v) for v in bbox)
+        inside = [
+            b for b in text_boxes
+            if b[0] < x1 and b[2] > x0 and b[1] < y1 and b[3] > y0
+        ]
+        if inside:
+            try:
+                from .text_boxes import median_text_height
+                bh = float(median_text_height(inside))
+            except Exception:
+                bh = 0.0
+            if bh > 2.0:
+                return bh, "det-box"
+
+    if image is not None:
+        th = estimate_text_height(crop_region(image, bbox))
+        if th is not None and th > 0.5:
+            return float(th) / 0.6, "line-pitch"
+
+    return 0.0, ""
+
+
+def _row_gutters(
+    image: Optional[Image.Image],
+    bbox: Tuple[int, int, int, int],
+) -> Optional[np.ndarray]:
+    if image is None:
+        return None
+    crop = crop_region(image, bbox)
+    if crop.height < 24 or crop.width < 16:
+        return None
+    gray = np.asarray(crop.convert("L"), dtype=np.float32)
+    ink = 255.0 - gray
+    prof = ink.mean(axis=1)
+    if prof.size < 8:
+        return None
+    return prof
+
+
+def _snap_to_gutter(
+    prof: Optional[np.ndarray],
+    y_local: float,
+    unit: float,
+    y_min: float,
+    y_max: float,
+) -> float:
+    if prof is None or unit <= 1.0:
+        return y_local
+
+    span = int(max(2.0, unit * GUTTER_SEARCH_UNITS))
+    lo = int(max(y_min, y_local - span))
+    hi = int(min(y_max, y_local + span))
+    if hi <= lo + 1:
+        return y_local
+
+    seg = prof[lo:hi]
+    if seg.size < 2:
+        return y_local
+
+    gate = float(np.percentile(prof, GUTTER_INK_QUANTILE))
+    quiet = np.nonzero(seg <= gate)[0]
+    if quiet.size == 0:
+        return float(lo + int(np.argmin(seg)))
+
+    target = y_local - lo
+    best = quiet[int(np.argmin(np.abs(quiet - target)))]
+    return float(lo + int(best))
+
+
 def plan_overlap_tiles(
     bbox: Tuple[int, int, int, int],
     tile_count: int,
     overlap_ratio: float = 0.25,
+    image: Optional[Image.Image] = None,
+    text_boxes: Optional[list] = None,
+    log: Optional[list] = None,
+    category: str = "",
 ) -> list:
     x0, y0, x1, y1 = bbox
     if tile_count <= 1 or y1 <= y0:
@@ -196,20 +285,63 @@ def plan_overlap_tiles(
 
     h = float(y1 - y0)
     n = float(tile_count)
-    denom = n - (n - 1.0) * overlap_ratio
+
+    unit, src = _line_height_for(image, bbox, text_boxes)
+
+    if unit > 1.0:
+        overlap_px = max(OVERLAP_MIN_PX, unit * OVERLAP_LINE_UNITS)
+        overlap_px = min(overlap_px, h * OVERLAP_MAX_RATIO)
+        eff_ratio = overlap_px / max(1.0, h / n)
+        eff_ratio = float(np.clip(eff_ratio, 0.0, OVERLAP_MAX_RATIO))
+        mode = f"글자높이 {unit:.0f}px×{OVERLAP_LINE_UNITS:.1f} ({src})"
+    else:
+        eff_ratio = float(max(0.0, min(overlap_ratio, OVERLAP_MAX_RATIO)))
+        overlap_px = (h / n) * eff_ratio
+        mode = "고정 비율 (글자 높이 미검출)"
+
+    denom = n - (n - 1.0) * eff_ratio
     if denom <= 0:
         return [tuple(bbox)]
 
     t = h / denom
-    step = t * (1.0 - overlap_ratio)
+    step = t * (1.0 - eff_ratio)
+
+    prof = _row_gutters(image, bbox) if unit > 1.0 else None
+    snapped = 0
 
     out = []
     for i in range(tile_count):
-        ty0 = y0 + step * i
+        ty0 = float(y0) + step * i
         ty1 = min(ty0 + t, float(y1))
+
+        if prof is not None and i > 0:
+            moved = _snap_to_gutter(
+                prof, ty0 - y0, unit, 0.0, h - 1.0
+            ) + y0
+            if abs(moved - ty0) >= 1.0:
+                snapped += 1
+            ty0 = moved
+        if prof is not None and i + 1 < tile_count:
+            moved = _snap_to_gutter(
+                prof, ty1 - y0, unit, 0.0, h - 1.0
+            ) + y0
+            if abs(moved - ty1) >= 1.0:
+                snapped += 1
+            ty1 = moved
+
         if ty1 <= ty0 + 1.0:
             continue
         out.append((x0, int(ty0), x1, int(ty1)))
+
+    if log is not None:
+        tail = (
+            f" | 경계 {snapped}곳을 행 사이 여백에 스냅"
+            if snapped else ""
+        )
+        log.append(
+            f"    📐 [TILE OVERLAP] '{category}' 겹침 {overlap_px:.0f}px "
+            f"({eff_ratio:.0%}) — {mode}{tail}"
+        )
 
     return out if out else [tuple(bbox)]
 
@@ -227,35 +359,32 @@ def decide_tile_count(
     height = max(1, y1 - y0)
     width = max(1, x1 - x0)
 
-    if text_boxes:
-        inside = [
-            b for b in text_boxes
-            if b[0] < x1 and b[2] > x0 and b[1] < y1 and b[3] > y0
-        ]
-        rows = set()
-        for b in inside:
-            rows.add(int((b[1] + b[3]) * 0.5) // max(8, height // 12))
-        if len(rows) >= 4:
-            return int(np.clip(round(len(rows) / 3.0), 1, max_tiles)), "검출행밀도"
-        if inside:
-            return 1, "검출박스 소수"
+    unit, src = _line_height_for(image, bbox, text_boxes)
+    if unit > 0.5:
+        factor = float(np.clip(VISION_PATCH_PX / unit, 1.0, MAX_UPSCALE))
+        basis = f"글자높이 {unit:.0f}px ({src})"
+    else:
+        short = float(min(width, height))
+        factor = float(np.clip(
+            VISION_PATCH_PX * 6.0 / max(1.0, short), 1.4, MAX_UPSCALE_SPARSE
+        ))
+        basis = "글자높이 미검출"
 
-    if int(table_rows) > 0:
-        tiles = int(np.clip(round(int(table_rows) / 3.0), 1, max_tiles))
-        return tiles, "표행밀도"
+    up_w = float(width) * factor
+    up_h = float(height) * factor
 
-    if patches > 0 and legible * 4 < patches:
-        return 1, "내용희소"
+    side_need = up_h / (TILE_SIDE_BUDGET * TILE_SAFETY)
+    px_need = (up_w * up_h) / (TILE_PIXEL_BUDGET * TILE_SAFETY)
+    need = max(side_need, px_need)
 
-    cropped = crop_region(image, bbox)
-    th = estimate_text_height(cropped)
-    if th is None or th <= 0.5:
-        return 1, "라인 주기 미검출"
+    if need <= 1.0:
+        return 1, (
+            f"업스케일 {factor:.2f}x 후 {int(up_w)}x{int(up_h)} 가 "
+            f"{int(TILE_SIDE_BUDGET)}px 예산 이내 ({basis}) — 나눌 이유 없음"
+        )
 
-    est_lines = height / max(1.0, th / 0.6)
-    if est_lines <= 3.0:
-        return 1, "행수 부족"
-    if height < width:
-        return 1, "가로형 밴드"
-
-    return int(np.clip(round(est_lines / 3.0), 1, max_tiles)), "행수밀도"
+    tiles = int(np.clip(math.ceil(need), 1, max_tiles))
+    return tiles, (
+        f"업스케일 {factor:.2f}x 후 {int(up_w)}x{int(up_h)} 가 예산 초과 "
+        f"(필요 {need:.2f}배 / {basis})"
+    )

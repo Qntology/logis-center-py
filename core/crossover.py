@@ -68,6 +68,11 @@ def _empty_cache():
 
 def _ram_free_gb() -> float:
     try:
+        from .memory import headroom_gb
+        return headroom_gb()
+    except Exception:
+        pass
+    try:
         from .memory import usable_ram_gb
         return usable_ram_gb()
     except Exception:
@@ -82,12 +87,14 @@ class Slot:
         unloader: Optional[Callable[[object], None]] = None,
         label: str = "",
         est_gb: float = 0.0,
+        stage_gb: float = 0.0,
     ):
         self.name = name
         self.loader = loader
         self.unloader = unloader
         self.label = label or SLOT_LABELS.get(name, name)
         self.est_gb = float(est_gb)
+        self.stage_gb = float(stage_gb or 0.0)
         self.instance: Optional[object] = None
         self.load_count = 0
         self.release_count = 0
@@ -164,9 +171,10 @@ class CrossoverSwitch:
         unloader: Optional[Callable[[object], None]] = None,
         label: str = "",
         est_gb: float = 0.0,
+        stage_gb: float = 0.0,
     ) -> Slot:
         with self._lock:
-            slot = Slot(name, loader, unloader, label, est_gb)
+            slot = Slot(name, loader, unloader, label, est_gb, stage_gb)
             self.slots[name] = slot
             return slot
 
@@ -187,7 +195,11 @@ class CrossoverSwitch:
             return []
 
         need = slot.est_gb + self.headroom_gb
-        ram_need = slot.est_gb * self.RAM_STAGE_RATIO + self.RAM_STAGE_FLOOR
+        declared = float(getattr(slot, "stage_gb", 0.0) or 0.0)
+        if declared > 0.0:
+            ram_need = declared
+        else:
+            ram_need = slot.est_gb * self.RAM_STAGE_RATIO + self.RAM_STAGE_FLOOR
 
         free = _vram_free_gb()
         ram = _ram_free_gb()
@@ -318,14 +330,65 @@ class CrossoverSwitch:
 
             before = _vram_free_gb()
             ram_before = _ram_free_gb()
+
+            def _guarded():
+                try:
+                    from .memory import RamWatchdog
+                except Exception:
+                    return slot.acquire()
+                with RamWatchdog(label=slot.label, log=self._log) as g:
+                    got = slot.acquire()
+                    if got is None:
+                        g.check(settled=True)
+                        return None
+                    if g.tripped:
+                        self._log(
+                            f"  🩺 [RAM GUARD] {slot.label} 적재는 끝났습니다. "
+                            f"회수 후 커밋 여유를 다시 재어 실제로 위험한지 "
+                            f"판정합니다."
+                        )
+                        _empty_cache()
+                        g.check(settled=True)
+                    return got
+
             try:
-                obj = slot.acquire()
+                obj = _guarded()
                 slot.last_error = ""
             except Exception as e:
                 slot.last_error = str(e)
-                self._log(f"  ❌ [{slot.label}] 로드 실패: {e}")
                 slot.instance = None
                 _empty_cache()
+
+                purged: List[str] = []
+                while True:
+                    dropped = self.release_next(protect=[name])
+                    if not dropped:
+                        break
+                    purged.append(dropped)
+
+                if purged:
+                    self._log(
+                        f"  🔁 [{slot.label}] 1차 적재 실패 — 상주 슬롯 "
+                        f"{len(purged)}개({', '.join(purged)})를 전부 비우고 "
+                        f"한 번 더 시도합니다."
+                    )
+                    _empty_cache()
+                    try:
+                        obj = _guarded()
+                        slot.last_error = ""
+                        after = _vram_free_gb()
+                        self._log(
+                            f"  📥 [{slot.label}] 재시도 로드 성공 "
+                            f"(VRAM {before:.2f} → {after:.2f} GB)"
+                        )
+                        return obj
+                    except Exception as e2:
+                        slot.last_error = str(e2)
+                        slot.instance = None
+                        _empty_cache()
+                        e = e2
+
+                self._log(f"  ❌ [{slot.label}] 로드 실패: {e}")
                 ram_after = _ram_free_gb()
                 if ram_before > 0.0:
                     self._log(

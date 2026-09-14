@@ -104,6 +104,40 @@ class CachedEmbedder:
             pass
 
     MIN_CACHE_DIM = 8
+    ENTRY_OVERHEAD_BYTES = 96
+    GUARD_CHECK_EVERY = 32
+
+    def _entry_bytes(self) -> int:
+        dim = max(1, int(self.dim or 1))
+        return dim * 4 + self.ENTRY_OVERHEAD_BYTES
+
+    def _guard_ram(self) -> None:
+        if self.cache is None:
+            return
+        try:
+            from .memory import cache_budget_entries
+        except Exception:
+            return
+
+        cap = cache_budget_entries(self._entry_bytes())
+        try:
+            stats = self.cache.stats()
+            entries = int(stats.get("entries", 0) or 0)
+        except Exception:
+            return
+
+        if entries <= cap:
+            return
+
+        self._log(
+            f"  🧹 [ANCHOR CACHE] 엔트리 {entries}개가 RAM 예산을 넘어 "
+            f"({cap}개 상한) 캐시를 비웁니다. 정확도에는 영향이 없고 "
+            f"필요하면 다시 계산합니다."
+        )
+        try:
+            self.cache.clear()
+        except Exception:
+            pass
 
     def _ensure_cache(self, dim: int):
         if self.cache is not None:
@@ -163,6 +197,7 @@ class CachedEmbedder:
                 n = self.cache.put_batch(fresh)
                 if n:
                     self._log(f"  💾 앵커 캐시 신규 {n}구 기록")
+                self._guard_ram()
         elif items:
             self._log(f"  ⚡ 앵커 캐시 전량 히트 ({len(items)}구) — 인코더 호출 생략")
 

@@ -39,6 +39,10 @@ OCR_WEIGHT_FLOOR = 0.30
 VLM_WEIGHT_ALIGNED = 1.0
 VLM_WEIGHT_UNALIGNED = 0.35
 
+OCR_DISTRUST_CONF = 0.60
+OCR_DISTRUST_SCALE = 0.30
+OCR_GARBLE_ALNUM_RATIO = 0.45
+
 CONSENSUS_MARGIN = 0.80
 CONSENSUS_MIN_CANDS = 2
 LEN_TOLERANCE = 2
@@ -46,6 +50,12 @@ LEN_TOLERANCE = 2
 GROUND_MIN_CONF = 0.50
 GROUND_MIN_OVERLAP = 0.25
 GROUND_PENALTY = 0.25
+
+OCR_TRUST_CONF = 0.90
+OCR_TRUST_MIN_LEN = 2
+WINDOW_AUTO_SPAN_ROWS = 12
+WINDOW_AUTO_SPAN_MAX = 6
+ECHO_ABORT_STREAK = 3
 
 
 class TextLine:
@@ -430,6 +440,22 @@ def build_windows(
     stride = max(1, int(stride))
     overlap = max(0, int(overlap))
 
+    if n > WINDOW_AUTO_SPAN_ROWS:
+        grown = int(min(
+            WINDOW_AUTO_SPAN_MAX,
+            max(span, round(n / float(WINDOW_AUTO_SPAN_ROWS)) + 1),
+        ))
+        if grown > span:
+            if log is not None:
+                log.append(
+                    f"    🪟 [WINDOW SCALE] 행이 {n}개라 창당 {span}행 → "
+                    f"{grown}행으로 넓히고 겹침을 끕니다. VLM 호출 수를 "
+                    f"{n}회 → 약 {max(1, n // grown)}회로 줄입니다."
+                )
+            span = grown
+            stride = grown
+            overlap = 0
+
     width = span + overlap
     out: List[ReadWindow] = []
     seen = set()
@@ -631,6 +657,28 @@ def _align_window(
     ]
 
 
+def _looks_garbled(text: str) -> bool:
+    s = str(text or "").strip()
+    if len(s) < 3:
+        return False
+    body = [c for c in s if not c.isspace()]
+    if not body:
+        return False
+
+    alnum = sum(1 for c in body if c.isalnum())
+    if alnum / float(len(body)) < OCR_GARBLE_ALNUM_RATIO:
+        return True
+
+    letters = [c for c in body if c.isalpha()]
+    if len(letters) >= 4:
+        upper = sum(1 for c in letters if c.isupper())
+        mixed = 0 < upper < len(letters)
+        singles = sum(1 for w in s.split() if len(w) == 1)
+        if mixed and singles >= 2:
+            return True
+    return False
+
+
 def vote_lines(
     lines: Sequence[TextLine],
     windows: Sequence[ReadWindow],
@@ -639,12 +687,26 @@ def vote_lines(
 ) -> Dict[int, str]:
     hint = dict(ocr_votes or {})
     bucket: Dict[int, List[LineVote]] = {}
+    distrusted = 0
 
     for idx, (text, conf) in hint.items():
         if len(normalize_for_match(text)) < VOTE_MIN_LEN:
             continue
         weight = max(OCR_WEIGHT_FLOOR, OCR_WEIGHT_BASE * float(conf))
+
+        if float(conf) < OCR_DISTRUST_CONF or _looks_garbled(text):
+            weight = min(weight, OCR_DISTRUST_SCALE)
+            distrusted += 1
+
         bucket.setdefault(idx, []).append(LineVote(text, weight, "ocr"))
+
+    if log is not None and distrusted:
+        log.append(
+            f"       🪫 [OCR DISTRUST] 확신도 {OCR_DISTRUST_CONF:.2f} 미만이거나 "
+            f"글자가 깨진 행 {distrusted}건의 가중치를 "
+            f"{OCR_DISTRUST_SCALE:.2f} 로 낮췄습니다 — 이 행에서는 VLM 판독이 "
+            f"우선합니다."
+        )
 
     unaligned = 0
     for w in windows:
@@ -669,6 +731,7 @@ def vote_lines(
         )
 
     out: Dict[int, str] = {}
+    overrides: set = set()
     disputes = 0
     consensus_used = 0
 
@@ -702,6 +765,13 @@ def vote_lines(
 
         out[idx] = picked
 
+        ref = hint.get(idx)
+        if ref is not None:
+            if normalize_for_match(picked) != normalize_for_match(ref[0]):
+                overrides.add(idx)
+        elif picked:
+            overrides.add(idx)
+
         if len(ranked) > 1:
             disputes += 1
             if log is not None:
@@ -709,17 +779,22 @@ def vote_lines(
                     f"{rep[k].text[:18]}[{rep[k].source}]({v:.2f})"
                     for k, v in ranked[:3]
                 )
+                mark = " ✏️" if idx in overrides else ""
                 log.append(
                     f"       🗳 행 {idx}: {variants} → '{picked[:24]}' "
-                    f"({mode})"
+                    f"({mode}){mark}"
                 )
 
     if log is not None and disputes:
         log.append(
             f"    🗳 [CROSS VOTE] 겹친 행 {disputes}곳에서 판독이 갈렸습니다. "
             f"OCR 확신도 가중 {disputes - consensus_used}건 / "
-            f"글자별 합의 {consensus_used}건으로 확정했습니다."
+            f"글자별 합의 {consensus_used}건으로 확정했습니다. "
+            f"이 중 {len(overrides & set(hint.keys()))}행이 전용 인식기 "
+            f"결과를 실제로 바꿨습니다."
         )
+
+    vote_lines.last_overrides = set(overrides)
     return out
 
 
@@ -778,11 +853,14 @@ def read_lines(
     overlap: int = WINDOW_OVERLAP,
     target_px: float = TARGET_LINE_PX,
     ocr_fn: Optional[Callable[[List[Image.Image]], List[Tuple[str, float]]]] = None,
+    trust_conf: float = OCR_TRUST_CONF,
     log: Optional[List[str]] = None,
 ) -> Tuple[str, List[TextLine], List[ReadWindow]]:
     lines = split_lines(image, boxes=boxes, log=log)
     if not lines:
         return "", [], []
+
+    gate = float(trust_conf) if trust_conf else OCR_TRUST_CONF
 
     ocr_votes = collect_ocr_votes(
         lines, ocr_fn, target_px=target_px, log=log
@@ -792,7 +870,30 @@ def read_lines(
         lines, span=span, stride=stride, overlap=overlap, log=log
     )
 
+    trusted = {
+        idx for idx, (text, conf) in ocr_votes.items()
+        if float(conf) >= gate
+        and len(normalize_for_match(text)) >= OCR_TRUST_MIN_LEN
+    }
+
+    skipped = 0
+    called = 0
+    echo_streak = 0
+    aborted = False
+
     for w in windows:
+        span_idx = set(range(w.start, w.end))
+        if span_idx and span_idx.issubset(trusted):
+            skipped += 1
+            w.raw = ""
+            w.text = ""
+            continue
+
+        if aborted:
+            w.raw = ""
+            w.text = ""
+            continue
+
         crop = w.crop(image)
         h = max(1, crop.height // max(1, w.span))
         factor = float(
@@ -808,24 +909,72 @@ def read_lines(
             )
         try:
             w.raw = reader(crop, w.start, w.end) or ""
+            called += 1
         except Exception as e:
             if log is not None:
                 log.append(f"       ⚠ 창[{w.start}:{w.end}] 판독 실패 ({e})")
             w.raw = ""
         w.text = w.raw.strip()
 
+        if not w.text:
+            echo_streak += 1
+            if echo_streak >= ECHO_ABORT_STREAK:
+                aborted = True
+                if log is not None:
+                    log.append(
+                        f"       ⛔ [VLM ABORT] 창 {echo_streak}개 연속으로 "
+                        f"빈 판독이 나왔습니다. 남은 창 "
+                        f"{len(windows) - called - skipped}개를 건너뛰고 "
+                        f"전용 인식기 결과만 씁니다 — 무의미한 호출로 "
+                        f"시간을 버리지 않습니다."
+                    )
+        else:
+            echo_streak = 0
+
+    if log is not None and (skipped or aborted):
+        log.append(
+            f"    ⚡ [VLM SKIP] 전용 인식기 확신도 {gate:.3f} 이상인 "
+            f"행만으로 채워진 창 {skipped}개를 건너뛰었습니다. "
+            f"VLM 호출 {called}회 / 전체 창 {len(windows)}개"
+        )
+
     voted = vote_lines(lines, windows, ocr_votes=ocr_votes, log=log)
+    overrides = set(getattr(vote_lines, "last_overrides", set()) or set())
 
     rescued = 0
+    direct = 0
+    changed = 0
     for ln in lines:
+        if ln.index in trusted:
+            ref = ocr_votes.get(ln.index)
+            if ref is not None:
+                ln.text = ref[0]
+                ln.source = "ocr-trusted"
+                direct += 1
+                continue
         if ln.index in voted:
             ln.text = voted[ln.index]
+            if ln.index in overrides:
+                ln.source = "vlm-override"
+                changed += 1
             continue
         ref = ocr_votes.get(ln.index)
         if ref is not None:
             ln.text = ref[0]
             ln.source = "ocr-only"
             rescued += 1
+
+    if log is not None and direct:
+        log.append(
+            f"       ⚡ 전용 인식기가 확신도 {gate:.3f} 이상으로 "
+            f"읽은 행 {direct}개는 VLM 검증 없이 그대로 확정했습니다."
+        )
+
+    if log is not None and changed:
+        log.append(
+            f"       ✏️ VLM 이 전용 인식기 결과를 {changed}행에서 "
+            f"교정했습니다 — 이 호출은 값을 실제로 바꿨습니다."
+        )
 
     if log is not None and rescued:
         log.append(

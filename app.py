@@ -77,6 +77,8 @@ from core.model_manager import (
     format_model_report,
     format_stanza_report,
     installed_language_codes,
+    is_manual_only,
+    is_model_ready,
     lang_model_ready,
     lang_models_ready,
     missing_core_models,
@@ -168,6 +170,8 @@ class NMSOcrApp:
         self.joint_label: str = ""
         self.joint_dim: int = 0
         self.prefer_grid: str = "joint"
+        self.axve_standby: bool = False
+        self.joint_failures: int = 0
 
         self.current_image: Optional[Image.Image] = None
         self.current_path: str = ""
@@ -305,17 +309,44 @@ class NMSOcrApp:
         for line in pdf_render.report_lines():
             self._log(line)
 
-        room = memory_mod.usable_ram_gb()
+        room = memory_mod.headroom_gb()
+        cpu_room = memory_mod.cpu_share_gb()
+
+        self._log(f"  🧠 [RAM] {memory_mod.pressure_summary()}")
+        self._log(
+            "  ℹ️ [RAM] 판정은 커밋 여유 기준입니다. 물리 가용은 mmap 페이지 "
+            "캐시가 먹었다가 바로 돌려주므로 일시적으로 0 에 가까워져도 "
+            "위험 신호가 아닙니다."
+        )
+
         if 0.0 < room < 6.0:
             self._log(
-                f"  ⚠️ 가용 시스템 RAM 이 {room:.1f} GB 뿐입니다. "
-                f"4B 정제 LLM 은 가중치를 RAM 에 먼저 펼치므로 "
-                f"로드가 중단될 수 있습니다."
+                f"  ⚠️ 커밋 여유가 {room:.1f} GB 뿐입니다. 4B 정제 LLM 은 "
+                f"가중치를 RAM 에 먼저 펼치므로 로드가 중단될 수 있습니다."
             )
             self._log(
                 "     다른 프로그램을 닫거나, Windows 가상 메모리를 "
                 "늘리거나, 더 작은 모델을 쓰세요."
             )
+
+        if cpu_room <= 0.0:
+            self._log(
+                f"  🚧 [RAM PLAN] CPU 배치 몫을 0 으로 둡니다. 정제 LLM 은 "
+                f"GPU + 디스크로만 나눠 올립니다 — 느려지지만 프로세스가 "
+                f"강제 종료되지 않습니다."
+            )
+        else:
+            self._log(
+                f"  🧮 [RAM PLAN] CPU 배치 여유 {cpu_room:.1f} GB — "
+                f"GPU + CPU + 디스크 3분할로 시작합니다."
+            )
+
+        self._log(
+            f"  🚨 [RAM GUARD] 적재 중 커밋 여유가 "
+            f"{memory_mod.abort_floor_gb():.2f} GB 아래로 떨어지면 즉시 "
+            f"중단합니다 (임계 변경: set "
+            f"{memory_mod.ENV_ABORT_FLOOR}=0.8)"
+        )
 
         if self.vram_budget <= 0.0:
             self._log("  💻 CPU 모드 — VRAM 프로파일을 적용하지 않습니다.")
@@ -396,6 +427,34 @@ class NMSOcrApp:
         for line in self.registry.report_lines():
             self._log(line)
 
+    AXVE_CODE_FILES = (
+        "configuration_ax_ve.py",
+        "modeling_ax_ve.py",
+        "image_processing_ax_ve.py",
+    )
+
+    def _axve_ready(self) -> Tuple[bool, str]:
+        try:
+            if is_manual_only("ax-ve"):
+                return False, "수동 배치 전용으로 표시되어 있습니다"
+            if not is_model_ready("ax-ve"):
+                return False, "가중치가 없거나 크기가 비정상입니다"
+        except Exception as e:
+            return False, f"상태 확인 실패 ({type(e).__name__}: {e})"
+
+        from core.model_manager import BASE_DIR as _MM_BASE, VISION_ENC_PATH
+
+        for cand in (Path(_MM_BASE) / "ax-ve", Path(VISION_ENC_PATH)):
+            if not cand.is_dir():
+                continue
+            if all((cand / f).exists() for f in self.AXVE_CODE_FILES):
+                return True, str(cand)
+
+        return False, (
+            f"모델 정의 코드({', '.join(self.AXVE_CODE_FILES)})를 "
+            f"찾지 못했습니다"
+        )
+
     def _register_slots(self):
         def _load_vision():
             from core.embedding import AXVEEmbedder
@@ -431,19 +490,65 @@ class NMSOcrApp:
                     f"(언어 {joint_code}) | 패치 격자와 텍스트 앵커를 "
                     f"동일 대조 공간에서 계산합니다."
                 )
+                self._log(
+                    f"  📌 [GRID POLICY] 격자는 언어와 무관하게 SigLIP2 로 "
+                    f"일원화합니다. A.X-VE 는 텍스트 타워가 없어 "
+                    f"(비전 전용 1152차원) 앵커와 같은 공간을 만들지 "
+                    f"못하므로, SigLIP2 를 쓸 수 없을 때만 임시 격자로 "
+                    f"동원합니다."
+                )
+
             if SLOT_VISION in self.crossover.slots:
                 self.crossover.release(SLOT_VISION)
                 self.crossover.slots.pop(SLOT_VISION, None)
-                self._log("  ⏭ A.X-VE 는 SigLIP2 조인트로 대체되어 등록하지 않습니다.")
+
+            ready, why = self._axve_ready()
+            if ready:
+                self.crossover.register(
+                    SLOT_VISION, _load_vision,
+                    label="A.X-VE 비전 인코더 (임시 격자)", est_gb=0.9,
+                )
+                self.axve_standby = True
+                self._log(
+                    "  🅱 [GRID FALLBACK] A.X-VE 를 임시 격자 슬롯으로 "
+                    "등록만 해 둡니다. 평소에는 적재하지 않고, SigLIP2 가 "
+                    "메모리 때문에 오르지 못할 때만 깨웁니다."
+                )
+            else:
+                self.axve_standby = False
+                self._log(
+                    f"  ⏭ [GRID FALLBACK] A.X-VE 임시 격자를 준비하지 "
+                    f"못했습니다 — {why}. SigLIP2 를 적재하지 못하면 "
+                    f"파이프라인이 중단됩니다."
+                )
         else:
             self.prefer_grid = "vision"
-            if SLOT_VISION not in self.crossover.slots:
-                self.crossover.register(SLOT_VISION, _load_vision, est_gb=0.9)
+            ready, why = self._axve_ready()
+            self.axve_standby = bool(ready)
+
+            if ready and SLOT_VISION not in self.crossover.slots:
+                self.crossover.register(
+                    SLOT_VISION, _load_vision,
+                    label="A.X-VE 비전 인코더 (임시 격자)", est_gb=0.9,
+                )
+
             self._log(
                 "  ⚠ SigLIP2 언어 텍스트 타워를 찾지 못해 A.X-VE 격자로 "
                 "내려갑니다. PP-OCRv5 rec 는 인식 전용이라 패치 격자를 "
                 "제공하지 않습니다."
             )
+            if ready:
+                self._log(
+                    "  🚧 [DIM MISMATCH] A.X-VE 격자는 1152차원, 텍스트 "
+                    "앵커는 1024차원입니다. 문서 유형 분류와 필드 히트맵이 "
+                    "차원 불일치로 중단될 수 있습니다."
+                )
+            else:
+                self._log(
+                    f"  ❌ [GRID] A.X-VE 도 쓸 수 없습니다 — {why}. "
+                    f"환경설정 → 모델 관리에서 SigLIP2(lang:siglip2) 를 "
+                    f"내려받아야 파이프라인이 동작합니다."
+                )
 
         self._register_ocr_slot()
 
@@ -656,8 +761,29 @@ class NMSOcrApp:
         for line in self.vision_router.report_lines():
             self._log(line)
 
-    def _demote_joint(self):
+    JOINT_RETRY_LIMIT = 2
+
+    def _demote_joint(self, reason: str = ""):
         label = self.joint_label or "siglip2"
+        self.joint_failures += 1
+
+        if self.joint_failures < self.JOINT_RETRY_LIMIT:
+            self._log(
+                f"  🔁 [GRID POLICY] '{label}' 적재 실패 "
+                f"{self.joint_failures}/{self.JOINT_RETRY_LIMIT}회 — "
+                f"슬롯을 유지한 채 메모리를 비우고 다음 단계에서 다시 "
+                f"시도합니다."
+                + (f" ({reason})" if reason else "")
+            )
+            try:
+                self.crossover.release(SLOT_JOINT)
+            except Exception:
+                pass
+            memory_mod.reclaim(
+                log=self._log, label=f"{label} 재시도 준비", rounds=3
+            )
+            return False
+
         try:
             self.crossover.release(SLOT_JOINT)
         except Exception:
@@ -669,19 +795,32 @@ class NMSOcrApp:
         self.joint_label = ""
         self.joint_dim = 0
         self.prefer_grid = "vision"
+
         if SLOT_VISION not in self.crossover.slots:
             def _load_vision():
                 from core.embedding import AXVEEmbedder
                 return AXVEEmbedder(str(ensure_model_dir("ax-ve")))
-            self.crossover.register(SLOT_VISION, _load_vision, est_gb=0.9)
+            self.crossover.register(
+                SLOT_VISION, _load_vision,
+                label="A.X-VE 비전 인코더 (임시 격자)", est_gb=0.9,
+            )
+
         if "text-router" not in self.vision_router.providers():
             self.vision_router.register(
                 "text-router", lambda texts: self.router(texts), priority=100
             )
+
         self._log(
-            "  ↩ 조인트 슬롯을 내리고 A.X-VE 격자 + 텍스트 앵커로 "
-            "복귀했습니다."
+            f"  ↩ [GRID FALLBACK] '{label}' 을 {self.joint_failures}회 "
+            f"실패해 A.X-VE 임시 격자 + 텍스트 앵커로 전환합니다."
+            + (f" ({reason})" if reason else "")
         )
+        self._log(
+            "  🚧 [DIM MISMATCH] A.X-VE 는 비전 전용이라 텍스트 타워가 "
+            "없습니다. 격자 1152차원 vs 앵커 1024차원 불일치로 문서 유형 "
+            "분류가 중단될 수 있습니다. 이 경로는 임시 수단입니다."
+        )
+        return True
 
     def load_base_models(self) -> dict:
         missing = missing_core_models()
@@ -727,19 +866,27 @@ class NMSOcrApp:
             self._log(line)
 
         if SLOT_JOINT in self.crossover.slots:
-            try:
-                self._log("🔄 SigLIP2 조인트(비전-텍스트) 로드 중...")
-                self._progress(10, "SigLIP2 조인트 로드 중")
-                self.crossover.acquire(SLOT_JOINT)
-                self._progress(30, "SigLIP2 조인트 완료")
-            except Exception as e:
-                self._log(f"⚠ SigLIP2 조인트 로드 실패({e}) → Hayai 공간으로 진행합니다.")
-                from core import diagnostics as _diag
-                if _diag.enabled(2):
-                    import traceback
-                    for line in traceback.format_exc().splitlines()[-8:]:
-                        self._log(f"      {line}")
-                self._demote_joint()
+            self._log("🔄 SigLIP2 조인트(비전-텍스트) 로드 중...")
+            self._progress(10, "SigLIP2 조인트 로드 중")
+
+            for attempt in range(1, self.JOINT_RETRY_LIMIT + 1):
+                try:
+                    self.crossover.acquire(SLOT_JOINT)
+                    self._progress(30, "SigLIP2 조인트 완료")
+                    break
+                except Exception as e:
+                    self._log(
+                        f"⚠ SigLIP2 조인트 로드 실패 "
+                        f"({attempt}/{self.JOINT_RETRY_LIMIT}회): {e}"
+                    )
+                    self._log(f"   메모리 상태 — {memory_mod.pressure_summary()}")
+                    from core import diagnostics as _diag
+                    if _diag.enabled(2):
+                        import traceback
+                        for line in traceback.format_exc().splitlines()[-8:]:
+                            self._log(f"      {line}")
+                    if self._demote_joint(reason=str(e)[:90]):
+                        break
         else:
             try:
                 self._log("🔄 A.X-VE 비전 인코더 로드 중...")
@@ -1029,6 +1176,38 @@ class NMSOcrApp:
             self._joint_registered = False
             self.joint_label = ""
             self.vision_router.lock_space(0)
+
+            holder = self.cached_vision
+            self.cached_vision = None
+            cache = getattr(holder, "cache", None)
+            if cache is not None:
+                try:
+                    cache.clear()
+                except Exception:
+                    pass
+
+            before = memory_mod.commit_free_gb()
+            memory_mod.reclaim(
+                log=self._log, label=f"'{old}' 조인트 파기", rounds=3
+            )
+            after = memory_mod.commit_free_gb()
+            if after >= before:
+                verdict = (
+                    f"커밋 여유 {before:.1f} → {after:.1f} GB 회수"
+                )
+            else:
+                verdict = (
+                    f"커밋 여유 {before:.1f} → {after:.1f} GB — 작업 집합 "
+                    f"트리밍이 물리 페이지를 페이지 파일로 밀어내 커밋이 "
+                    f"오히려 {before - after:.1f} GB 늘었습니다. 물리 RAM 은 "
+                    f"비었지만 커밋 한도는 그대로이므로 정제 LLM 적재 여력은 "
+                    f"줄어듭니다"
+                )
+            self._log(
+                f"  🧹 [LANG SWITCH PURGE] 언어가 '{old}' 에서 '{jl}' 로 "
+                f"바뀌어 이전 조인트와 비전 앵커 캐시를 버렸습니다 — {verdict}."
+            )
+
             self._register_slots()
             self._register_embed_provider()
             self._log(
@@ -1431,6 +1610,28 @@ class NMSOcrApp:
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
+    def _acquire_joint_for_grid(self):
+        if SLOT_JOINT not in self.crossover.slots:
+            return None
+
+        got = self.crossover.get(SLOT_JOINT)
+        if got is not None:
+            return got
+
+        for attempt in range(1, self.JOINT_RETRY_LIMIT + 1):
+            try:
+                return self.crossover.acquire(SLOT_JOINT, protect=[SLOT_OCR])
+            except Exception as e:
+                self._log(
+                    f"  ⚠ 조인트 획득 실패 "
+                    f"({attempt}/{self.JOINT_RETRY_LIMIT}회): {e}"
+                )
+                self._log(f"     메모리 상태 — {memory_mod.pressure_summary()}")
+                if self._demote_joint(reason=str(e)[:90]):
+                    self._register_embed_provider()
+                    return None
+        return None
+
     def classify_document(self, skip_ready: bool = False) -> dict:
         with self.job_slot("문서 유형 분류"):
             return self._classify_document_body(skip_ready=skip_ready)
@@ -1465,25 +1666,30 @@ class NMSOcrApp:
 
         self._log("═══ 문서 유형 분류 (Doc Type NMS) ═══")
 
-        joint_obj = self.joint
-        if joint_obj is None and SLOT_JOINT in self.crossover.slots:
+        joint_obj = self._acquire_joint_for_grid()
+        prefer = self.prefer_grid
+
+        if joint_obj is None and prefer == "vision":
+            if not self.axve_standby:
+                return {
+                    "ok": False,
+                    "error": (
+                        "SigLIP2 조인트를 메모리에 올리지 못했고 A.X-VE 임시 "
+                        "격자도 준비되지 않았습니다.\n"
+                        f"  {memory_mod.pressure_summary()}\n"
+                        "  다른 프로그램을 닫거나 Windows 가상 메모리를 "
+                        "늘린 뒤 다시 실행하세요."
+                    ),
+                }
             try:
-                joint_obj = self.crossover.acquire(
-                    SLOT_JOINT, protect=[SLOT_OCR]
+                self.crossover.acquire(SLOT_VISION, protect=[SLOT_OCR])
+                self._log(
+                    "  🅱 [GRID FALLBACK] A.X-VE 임시 격자를 깨웠습니다. "
+                    "차원 불일치로 분류가 중단되면 SigLIP2 를 쓸 수 있는 "
+                    "메모리를 확보해야 합니다."
                 )
             except Exception as e:
-                self._log(f"  ⚠ 조인트 선획득 실패({e}) → Hayai 격자로 진행")
-                joint_obj = None
-
-        prefer = self.prefer_grid
-        if joint_obj is None and prefer == "joint":
-            self._log(
-                "  🚧 조인트 모델이 메모리에 없어 격자를 A.X-VE 로 되돌립니다. "
-                "앵커 공간도 함께 되돌려 반쪽 폴백을 막습니다."
-            )
-            self._demote_joint()
-            self._register_embed_provider()
-            prefer = self.prefer_grid
+                self._log(f"  ⚠ A.X-VE 임시 격자도 적재 실패({e})")
 
         pipeline = VisionPipeline(
             self.vision_embed_fn, ocr=self.ocr, embedder=self.embedder,
@@ -1544,6 +1750,99 @@ class NMSOcrApp:
             return max(2.0, disk_gb * quant_bootstrap.vram_ratio()), "8bit"
         return max(self.REFINER_EST_GB_FP16, disk_gb * 1.15), "offload"
 
+    COMMIT_COST_PATH = BASE_DIR / "output" / "commit_cost.json"
+
+    def _commit_cost_load(self) -> Dict[str, float]:
+        cache = getattr(self, "_commit_cost", None)
+        if cache is not None:
+            return cache
+        data: Dict[str, float] = {}
+        try:
+            with open(self.COMMIT_COST_PATH, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            if isinstance(raw, dict):
+                for k, v in raw.items():
+                    try:
+                        data[str(k)] = float(v)
+                    except Exception:
+                        continue
+        except Exception:
+            data = {}
+        self._commit_cost = data
+        return data
+
+    def _commit_cost_save(self, label: str, gb: float) -> None:
+        data = self._commit_cost_load()
+        if float(gb) <= float(data.get(label, 0.0)):
+            return
+        data[label] = float(gb)
+        try:
+            self.COMMIT_COST_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.COMMIT_COST_PATH, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+    def _acquire_refiner(self):
+        obj = self.crossover.get(SLOT_REFINER)
+        if obj is not None:
+            return obj
+        if SLOT_REFINER not in self.crossover.slots:
+            return None
+
+        label = getattr(self, "_refiner_label", "") or "정제 LLM"
+        need = float(getattr(self, "_refiner_stage_gb", 0.0))
+        floor = memory_mod.abort_floor_gb()
+
+        memory_mod.reclaim(
+            log=self._log, label=f"{label} 적재 전 커밋 확보", rounds=3
+        )
+        before = memory_mod.commit_free_gb()
+        phys = float(memory_mod.ram_info().get("available_gb", 0.0) or 0.0)
+
+        if need > 0.0 and before < need + floor:
+            self._log(
+                f"  ⛔ [COMMIT GATE] '{label}' 적재를 취소합니다 — 커밋 여유 "
+                f"{before:.2f} GB < 필요 {need:.1f} GB + 종료 임계 "
+                f"{floor:.2f} GB."
+            )
+            self._log(
+                f"     물리 가용은 {phys:.1f} GB 로 남아 있습니다. 작업 "
+                f"관리자의 메모리 그래프에 피크가 보이지 않는 이유가 "
+                f"이것입니다 — 고갈되는 것은 물리 RAM 이 아니라 Windows "
+                f"커밋 한도(물리 RAM + 페이지 파일)입니다. 커밋이 바닥나면 "
+                f"파이썬 예외 없이 프로세스가 즉사합니다."
+            )
+            self._log(
+                f"     확인 방법: 작업 관리자 → 성능 → 메모리 → '커밋됨' "
+                f"항목. 해결: 가상 메모리를 {int(need) + 4} GB 이상으로 "
+                f"늘리거나 다른 프로그램을 닫으십시오. 이번 실행은 OCR "
+                f"원문과 다국어 사전 코사인 경로로만 진행합니다."
+            )
+            self.crossover.slots.pop(SLOT_REFINER, None)
+            return None
+
+        try:
+            obj = self.crossover.acquire(SLOT_REFINER, protect=[SLOT_OCR])
+        except Exception as e:
+            self._log(
+                f"  ⏭ [REFINER SKIP] '{label}' 적재 실패 "
+                f"({type(e).__name__}: {e}) — OCR 원문으로 진행합니다."
+            )
+            self.crossover.slots.pop(SLOT_REFINER, None)
+            return None
+
+        after = memory_mod.commit_free_gb()
+        spent = max(0.0, before - after)
+        if spent > 0.0:
+            self._commit_cost_save(label, spent)
+            self._log(
+                f"  📒 [COMMIT COST] '{label}' 적재에 커밋 {spent:.1f} GB 를 "
+                f"썼습니다 ({before:.1f} → {after:.1f} GB). 다음 실행부터 이 "
+                f"실측값을 사전 점검 기준으로 씁니다."
+            )
+        return obj
+
     def _ensure_refiner_slot(self) -> bool:
         if SLOT_REFINER in self.crossover.slots:
             return True
@@ -1570,15 +1869,43 @@ class NMSOcrApp:
         disk = memory_mod.model_disk_gb(ref_path)
         est, plan = self._refiner_estimate_gb(disk)
 
+        fallback = max(1.5, disk * quant_bootstrap.stage_ratio())
+        stage, why = memory_mod.staging_need_gb(ref_path, fallback_gb=fallback)
+        stage = min(fallback, stage)
+
+        observed = float(self._commit_cost_load().get(ref_label, 0.0))
+        if observed > stage:
+            self._log(
+                f"  📒 [COMMIT COST] '{ref_label}' 는 이전 실행에서 커밋을 "
+                f"{observed:.1f} GB 소모했습니다. mmap 추정치 {stage:.1f} GB "
+                f"대신 실측값을 요구량으로 씁니다 — 4bit 양자화는 텐서마다 "
+                f"새 익명 메모리를 잡고, 익명 메모리는 전부 커밋입니다."
+            )
+            stage = observed
+            why = f"이전 실행 실측 커밋 낙폭 {observed:.1f} GB"
+        elif observed <= 0.0 and disk > stage:
+            self._log(
+                f"  📒 [COMMIT COST] '{ref_label}' 실측 이력이 없습니다. "
+                f"mmap 추정치는 파일 페이지만 세므로 양자화가 만드는 익명 "
+                f"메모리를 놓칩니다. 요구량을 {stage:.1f} → {disk:.1f} GB "
+                f"(가중치 파일 크기)로 올려 보수적으로 잡습니다."
+            )
+            stage = disk
+            why = f"가중치 파일 {disk:.1f} GB 기준 보수 추정(실측 이력 없음)"
+
         self.crossover.register(
-            SLOT_REFINER, _load_refiner, label=ref_label, est_gb=est
+            SLOT_REFINER, _load_refiner, label=ref_label,
+            est_gb=est, stage_gb=stage,
         )
         self._log(
             f"  ⏳ [{ref_label}] 정제 LLM 지연 로드 예약 — 적재 방식 "
             f"'{plan}' | 예상 VRAM {est:.1f} GB | 가중치 {disk:.1f} GB"
         )
+        self._log(f"  🧮 [{ref_label}] RAM 스테이징 {stage:.1f} GB — {why}")
 
-        stage = disk * quant_bootstrap.stage_ratio() + memory_mod.RAM_SAFETY_GB
+        self._refiner_label = ref_label
+        self._refiner_stage_gb = float(stage)
+
         room = memory_mod.usable_ram_gb()
         if room > 0.0 and room < stage:
             self._log(
@@ -1667,9 +1994,7 @@ class NMSOcrApp:
             return top
 
         def _fn(category: str, raw_text: str, crop_image, top_field: str = "") -> dict:
-            obj = self.crossover.get(SLOT_REFINER)
-            if obj is None:
-                obj = self.crossover.acquire(SLOT_REFINER)
+            obj = self._acquire_refiner()
             if obj is None:
                 return {}
             self.refiner = obj
@@ -1745,14 +2070,14 @@ class NMSOcrApp:
         from vision_pipeline.ocr_extract import read_by_lines
 
         lang = self.lang_code if self.language_resolved else ""
-        span = int(os.environ.get("NMS_LINE_SPAN", "1") or 1)
-        stride = int(os.environ.get("NMS_LINE_STRIDE", "1") or 1)
-        overlap = int(os.environ.get("NMS_LINE_OVERLAP", "1") or 1)
+        span = int(os.environ.get("NMS_LINE_SPAN", "3") or 3)
+        stride = int(os.environ.get("NMS_LINE_STRIDE", "0") or 0)
+        overlap = int(os.environ.get("NMS_LINE_OVERLAP", "0") or 0)
+        if stride <= 0:
+            stride = max(1, span)
 
         def _fn(image, bbox, category, text_boxes, ocr, log):
-            obj = self.crossover.get(SLOT_REFINER)
-            if obj is None:
-                obj = self.crossover.acquire(SLOT_REFINER)
+            obj = self._acquire_refiner()
             if obj is None:
                 return "", [], 0
             self.refiner = obj
@@ -1909,21 +2234,12 @@ class NMSOcrApp:
                 self._log("  ⏭ 정제 LLM 슬롯을 등록하지 못해 OCR 원문으로 진행합니다.")
                 use_refiner = False
             else:
-                try:
-                    self.crossover.acquire(SLOT_REFINER, protect=[SLOT_OCR])
-                except MissingModelError as e:
-                    self._log(f"  ⏭ 정제 LLM 적재 불가 — OCR 원문으로 진행합니다.")
-                    for ln in str(e).splitlines():
-                        self._log(f"     {ln}")
-                    self.crossover.slots.pop(SLOT_REFINER, None)
-                    use_refiner = False
-                except Exception as e:
-                    self._log(
-                        f"  ⏭ 정제 LLM 적재 실패({type(e).__name__}: {e}) "
-                        f"→ OCR 원문으로 진행합니다."
-                    )
-                    self.crossover.slots.pop(SLOT_REFINER, None)
-                    use_refiner = False
+                self._log(
+                    "  ⏳ [LAZY REFINER] 정제 LLM 은 슬롯만 예약하고 STEP 4 "
+                    "생성 페이즈에서 처음 쓸 때 적재합니다. 여기서 미리 올리면 "
+                    "바로 다음 줄의 임베딩 페이즈 전환이 SigLIP2 를 위해 즉시 "
+                    "반납시켜, 쓰지도 않은 7.3 GB 를 한 번 더 읽게 됩니다."
+                )
 
         self.crossover.enter_embedding_phase()
         if self.joint is None and self.embedder is None:
@@ -1940,24 +2256,28 @@ class NMSOcrApp:
         self._log("═══ 비전 파이프라인 ═══")
         self._progress(10, "비전 파이프라인 시작")
 
-        joint_obj = self.joint
-        if joint_obj is None and SLOT_JOINT in self.crossover.slots:
+        joint_obj = self._acquire_joint_for_grid()
+        prefer = self.prefer_grid
+
+        if joint_obj is None and prefer == "vision":
+            if not self.axve_standby:
+                return {
+                    "ok": False,
+                    "error": (
+                        "패치 격자를 만들 모델을 적재하지 못했습니다.\n"
+                        f"  {memory_mod.pressure_summary()}\n"
+                        "  SigLIP2(lang:siglip2) 또는 A.X-VE(base:ax-ve) 중 "
+                        "하나가 메모리에 올라와야 합니다."
+                    ),
+                    "log": self.log_lines,
+                }
             try:
-                joint_obj = self.crossover.acquire(
-                    SLOT_JOINT, protect=[SLOT_OCR]
+                self.crossover.acquire(SLOT_VISION, protect=[SLOT_OCR])
+                self._log(
+                    "  🅱 [GRID FALLBACK] A.X-VE 임시 격자로 진행합니다."
                 )
             except Exception as e:
-                self._log(f"  ⚠ 조인트 선획득 실패({e}) → A.X-VE 격자로 진행")
-                joint_obj = None
-
-        prefer = self.prefer_grid
-        if joint_obj is None and prefer == "joint":
-            self._log(
-                "  🚧 조인트 모델이 메모리에 없어 격자를 A.X-VE 로 되돌립니다."
-            )
-            self._demote_joint()
-            self._register_embed_provider()
-            prefer = self.prefer_grid
+                self._log(f"  ⚠ A.X-VE 임시 격자 적재 실패({e})")
 
         for line in memory_mod.report_lines():
             self._log(line)
@@ -1998,6 +2318,8 @@ class NMSOcrApp:
         line_on = str(os.environ.get("NMS_LINE_READ", "1")).strip().lower() \
             not in ("0", "false", "no", "off")
 
+        _span = int(os.environ.get("NMS_LINE_SPAN", "3") or 3)
+        _stride = int(os.environ.get("NMS_LINE_STRIDE", "0") or 0)
         cfg = VisionPipelineConfig(
             iou_threshold=iou_threshold,
             margin_threshold=margin_threshold,
@@ -2006,9 +2328,9 @@ class NMSOcrApp:
             doc_code=str(schema.get("code") or schema.get("doc_type") or ""),
             source_path=self.current_path,
             line_read=line_on,
-            line_span=int(os.environ.get("NMS_LINE_SPAN", "1") or 1),
-            line_stride=int(os.environ.get("NMS_LINE_STRIDE", "1") or 1),
-            line_overlap=int(os.environ.get("NMS_LINE_OVERLAP", "1") or 1),
+            line_span=_span,
+            line_stride=_stride if _stride > 0 else max(1, _span),
+            line_overlap=int(os.environ.get("NMS_LINE_OVERLAP", "0") or 0),
         )
         pipeline = VisionPipeline(
             self.vision_embed_fn, ocr=self.ocr, embedder=self.embedder,
@@ -2027,9 +2349,18 @@ class NMSOcrApp:
                 "음차합니다."
             )
 
+        memory_mod.reclaim(
+            log=self._log, label="생성 페이즈 진입 전 정리", rounds=3
+        )
+        self._log(f"  🧠 [RAM] {memory_mod.pressure_summary()}")
+
         res = pipeline.run(
             self.current_image, schema,
             refine_fn=self._refine_fn(hint, schema) if use_refiner else None,
+        )
+
+        memory_mod.reclaim(
+            log=self._log, label="생성 페이즈 종료 후 정리", rounds=3
         )
 
         self._progress(100, "완료" if res.ok else "실패")
@@ -2376,6 +2707,10 @@ class NMSOcrApp:
             "paddle": paddle_bootstrap.status(),
             "ram": memory_mod.ram_info(),
             "ram_usable_gb": round(memory_mod.usable_ram_gb(), 2),
+            "ram_headroom_gb": round(memory_mod.headroom_gb(), 2),
+            "ram_commit_free_gb": round(memory_mod.commit_free_gb(), 2),
+            "ram_cpu_share_gb": round(memory_mod.cpu_share_gb(), 2),
+            "ram_abort_floor_gb": round(memory_mod.abort_floor_gb(), 2),
             "quant": quant_bootstrap.status(),
             "pdf": {
                 "backends": pdf_render.available_backends(),
@@ -2395,6 +2730,10 @@ class NMSOcrApp:
                 "space_dim": self.vision_router.space_dim,
                 "provider_dims": dict(self.vision_router.dims),
                 "text_provider_dims": dict(self.router.dims),
+                "policy": "siglip2-unified",
+                "axve_standby": self.axve_standby,
+                "joint_failures": self.joint_failures,
+                "retry_limit": self.JOINT_RETRY_LIMIT,
             },
             "devtools": self.devtools_status(),
             "input": {
@@ -2424,6 +2763,16 @@ class NMSOcrApp:
         self.refiner = None
         self.text_embedder = None
         self.nlp = None
+
+        for holder in (self.cached_router, self.cached_vision):
+            cache = getattr(holder, "cache", None)
+            if cache is None:
+                continue
+            try:
+                cache.clear()
+            except Exception:
+                pass
+
         self.cached_router = None
         self.cached_vision = None
         self._ocr_code = ""
@@ -2432,6 +2781,14 @@ class NMSOcrApp:
         self.current_page = 0
         self.base_ready = False
         self.models_ready = False
+
+        room = memory_mod.reclaim(
+            log=self._log, label="전체 반납", rounds=4
+        )
+        self._log(
+            f"  🧹 [DEEP PURGE] 모든 슬롯·캐시를 비우고 작업 집합을 "
+            f"OS 에 반환했습니다 — 커밋 여유 {room:.1f} GB"
+        )
 
 
 def run_cli(args) -> int:
@@ -2447,6 +2804,14 @@ def run_cli(args) -> int:
         os.environ[memory_mod.ENV_RAM_LIMIT] = f"{float(args.ram_limit):.2f}"
     if args.allow_low_ram:
         os.environ[memory_mod.ENV_ALLOW_LOW_RAM] = "1"
+    if args.ram_abort_floor > 0.0:
+        os.environ[memory_mod.ENV_ABORT_FLOOR] = (
+            f"{float(args.ram_abort_floor):.2f}"
+        )
+    if args.cpu_share > 0.0:
+        os.environ[memory_mod.ENV_CPU_SHARE_RATIO] = (
+            f"{float(args.cpu_share):.2f}"
+        )
     if args.pdf_dpi > 0:
         os.environ[pdf_render.ENV_DPI] = str(int(args.pdf_dpi))
     if args.pdf_pages > 0:
@@ -2621,6 +2986,14 @@ def run_ui(args) -> int:
         os.environ[memory_mod.ENV_RAM_LIMIT] = f"{float(args.ram_limit):.2f}"
     if args.allow_low_ram:
         os.environ[memory_mod.ENV_ALLOW_LOW_RAM] = "1"
+    if args.ram_abort_floor > 0.0:
+        os.environ[memory_mod.ENV_ABORT_FLOOR] = (
+            f"{float(args.ram_abort_floor):.2f}"
+        )
+    if args.cpu_share > 0.0:
+        os.environ[memory_mod.ENV_CPU_SHARE_RATIO] = (
+            f"{float(args.cpu_share):.2f}"
+        )
     if args.pdf_dpi > 0:
         os.environ[pdf_render.ENV_DPI] = str(int(args.pdf_dpi))
     if args.pdf_pages > 0:
@@ -2876,14 +3249,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--line-span",
         type=int,
-        default=1,
-        help="행 판독 창 하나에 담을 행 수 (기본 1)",
+        default=3,
+        help="행 판독 창 하나에 담을 행 수 (기본 3). 행이 많으면 자동으로 더 넓힙니다",
     )
     p.add_argument(
         "--line-overlap",
         type=int,
-        default=1,
-        help="창 사이 겹칠 행 수 (기본 1, 0 이면 겹침 없음)",
+        default=0,
+        help="창 사이 겹칠 행 수 (기본 0). 1 이상이면 교차 검증하지만 호출이 2배가 됩니다",
     )
     p.add_argument(
         "--no-line-read",
@@ -2910,6 +3283,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--allow-low-ram",
         action="store_true",
         help="RAM 부족 경고를 무시하고 강행 (프로세스 종료 위험)",
+    )
+    p.add_argument(
+        "--ram-abort-floor",
+        type=float,
+        default=0.0,
+        help="적재 중 커밋 여유가 이 값(GB) 아래로 떨어지면 중단. 0 이면 기본 0.35",
+    )
+    p.add_argument(
+        "--cpu-share",
+        type=float,
+        default=0.0,
+        help="정제 LLM 의 CPU 배치 몫 비율(0~1). 0 이면 기본 0.35",
     )
     p.add_argument(
         "--pdf-dpi",
@@ -2981,6 +3366,12 @@ def preflight() -> int:
         print(line)
     for line in memory_mod.report_lines():
         print(line)
+    print(
+        f"         커밋 여유 {memory_mod.commit_free_gb():.1f} GB "
+        f"| 판정 기준 {memory_mod.headroom_gb():.1f} GB "
+        f"| CPU 배치 몫 {memory_mod.cpu_share_gb():.1f} GB "
+        f"| 중단 임계 {memory_mod.abort_floor_gb():.2f} GB"
+    )
     for line in paddle_bootstrap.report_lines():
         print(line)
 

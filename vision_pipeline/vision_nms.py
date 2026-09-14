@@ -263,6 +263,199 @@ def expand_row_band(
     return (comp.r_min, comp.r_max, c_min, c_max)
 
 
+def band_gutters_from_boxes(
+    text_boxes: Optional[Sequence[Tuple[int, int, int, int]]],
+    grid: VisionPatchGrid,
+    r0: int,
+    r1: int,
+) -> set:
+    if not text_boxes:
+        return set()
+
+    cols = max(1, int(grid.cols))
+    cw = max(1.0, float(grid.cell_width()))
+    ch = max(1.0, float(grid.cell_height()))
+    y0 = float(int(r0)) * ch
+    y1 = float(int(r1) + 1) * ch
+
+    hit = [False] * cols
+    for b in text_boxes:
+        if float(b[3]) <= y0 or float(b[1]) >= y1:
+            continue
+        c0 = int(max(0, min(cols - 1, int(float(b[0]) // cw))))
+        c1 = int(max(0, min(cols - 1, int((float(b[2]) - 1.0) // cw))))
+        for c in range(c0, c1 + 1):
+            hit[c] = True
+
+    return {c for c in range(cols) if not hit[c]}
+
+
+PLINKO_CLIFF_RATIO = 0.97
+PLINKO_BRIDGE_CLIFF_RATIO = 0.80
+PLINKO_FLOOR_RATIO = 0.55
+PLINKO_SEED_MIN = 0.0
+PLINKO_MAX_ROUNDS = 10
+PLINKO_BRIDGE_BONUS = 0.01
+PLINKO_SIDES = ("down", "right", "up", "left")
+PLINKO_ARROW = {"up": "↑", "down": "↓", "left": "←", "right": "→"}
+
+
+def _strip_box(
+    gb: Tuple[int, int, int, int],
+    side: str,
+    rows: int,
+    cols: int,
+) -> Optional[Tuple[int, int, int, int]]:
+    r0, r1, c0, c1 = (int(v) for v in gb)
+    if side == "up":
+        return (r0 - 1, r0 - 1, c0, c1) if r0 > 0 else None
+    if side == "down":
+        return (r1 + 1, r1 + 1, c0, c1) if r1 + 1 < rows else None
+    if side == "left":
+        return (r0, r1, c0 - 1, c0 - 1) if c0 > 0 else None
+    if side == "right":
+        return (r0, r1, c1 + 1, c1 + 1) if c1 + 1 < cols else None
+    return None
+
+
+def _bridge_count(
+    text_boxes: Optional[Sequence[Tuple[int, int, int, int]]],
+    grid: VisionPatchGrid,
+    a: Tuple[int, int, int, int],
+    b: Tuple[int, int, int, int],
+) -> int:
+    if not text_boxes:
+        return 0
+    ax0, ay0, ax1, ay1 = grid.region_bbox(*a)
+    bx0, by0, bx1, by1 = grid.region_bbox(*b)
+    hits = 0
+    for (x0, y0, x1, y1) in text_boxes:
+        in_a = x0 < ax1 and x1 > ax0 and y0 < ay1 and y1 > ay0
+        if not in_a:
+            continue
+        in_b = x0 < bx1 and x1 > bx0 and y0 < by1 and y1 > by0
+        if in_b:
+            hits += 1
+    return hits
+
+
+def plinko_grow_region(
+    gb: Tuple[int, int, int, int],
+    heatmap: CategoryHeatmap,
+    grid: VisionPatchGrid,
+    patch_matrix: np.ndarray,
+    content_ok: np.ndarray,
+    text_boxes: Optional[Sequence[Tuple[int, int, int, int]]] = None,
+    area_cap: int = 0,
+    cliff_ratio: float = PLINKO_CLIFF_RATIO,
+    max_rounds: int = PLINKO_MAX_ROUNDS,
+) -> Tuple[Tuple[int, int, int, int], List[str], str]:
+    rows = max(1, int(grid.rows))
+    cols = max(1, int(grid.cols))
+    total = rows * cols
+
+    dim = int(patch_matrix.shape[-1]) if patch_matrix.ndim == 2 else 0
+    anchor = getattr(heatmap, "anchor", None)
+    if anchor is not None:
+        anchor = np.asarray(anchor, dtype=np.float32).reshape(-1)
+        if dim <= 0 or int(anchor.shape[-1]) != dim:
+            anchor = None
+
+    fallback = np.asarray(
+        getattr(heatmap, "affinity", heatmap.scores), dtype=np.float32
+    )
+    axis = "조인트 코사인" if anchor is not None else "친화도 평균"
+
+    def _score(box: Tuple[int, int, int, int]) -> float:
+        cells = [i for i in _box_patches(box, cols) if i < total]
+        if not cells:
+            return float("-inf")
+        if anchor is not None and int(patch_matrix.shape[0]) >= total:
+            v = patch_matrix[cells].mean(axis=0)
+            norm = float(np.linalg.norm(v))
+            if norm < 1e-8:
+                return float("-inf")
+            return float(np.dot(v / norm, anchor))
+        vals = [
+            float(fallback[i]) for i in cells
+            if i < fallback.size and np.isfinite(fallback[i])
+        ]
+        return float(sum(vals) / len(vals)) if vals else float("-inf")
+
+    cap = int(area_cap) if area_cap and area_cap > 0 else total
+    cur = tuple(int(v) for v in gb)
+    cur_s = _score(cur)
+    seed_s = cur_s
+    trace: List[str] = []
+
+    if not np.isfinite(cur_s):
+        return cur, trace, axis
+    if cur_s <= PLINKO_SEED_MIN:
+        return cur, trace, axis
+
+    floor = seed_s * float(PLINKO_FLOOR_RATIO)
+
+    for _round in range(max(1, int(max_rounds))):
+        best = None
+        for side in PLINKO_SIDES:
+            strip = _strip_box(cur, side, rows, cols)
+            if strip is None:
+                continue
+            cells = [i for i in _box_patches(strip, cols) if i < total]
+            if not cells:
+                continue
+
+            cand = (
+                min(cur[0], strip[0]), max(cur[1], strip[1]),
+                min(cur[2], strip[2]), max(cur[3], strip[3]),
+            )
+            area = (cand[1] - cand[0] + 1) * (cand[3] - cand[2] + 1)
+            if area > cap:
+                continue
+
+            inked = sum(
+                1 for i in cells
+                if i < int(content_ok.size) and bool(content_ok[i])
+            )
+            bridge = _bridge_count(text_boxes, grid, cur, strip)
+            if inked <= 0 and bridge <= 0:
+                continue
+
+            s = _score(cand)
+            if not np.isfinite(s):
+                continue
+            if s <= 0.0:
+                continue
+            if s < floor:
+                continue
+
+            ratio = (
+                float(PLINKO_BRIDGE_CLIFF_RATIO) if bridge > 0
+                else float(cliff_ratio)
+            )
+            if s < cur_s * ratio:
+                continue
+
+            gain = (s - cur_s) + PLINKO_BRIDGE_BONUS * float(bridge)
+            if best is None or gain > best[0]:
+                best = (gain, side, cand, s, bridge, inked)
+
+        if best is None:
+            break
+
+        _gain, side, cand, s, bridge, inked = best
+        why = (
+            f"검출박스 {bridge}개가 경계를 가로지름"
+            if bridge else f"내용 {inked}칸"
+        )
+        trace.append(
+            f"{PLINKO_ARROW[side]} {cur_s:+.4f}→{s:+.4f} ({why})"
+        )
+        cur, cur_s = cand, s
+
+    return cur, trace, axis
+
+
 def compute_iou(a: Tuple[int, int, int, int], b: Tuple[int, int, int, int]) -> float:
     ax0, ay0, ax1, ay1 = a
     bx0, by0, bx1, by1 = b
@@ -328,8 +521,30 @@ def presence_gate(
     return out
 
 
-CROP_PAD_Y_RATIO = 0.055
-CROP_PAD_X_RATIO = 0.14
+CROP_PAD_LINES_Y = 0.55
+CROP_PAD_LINES_X = 1.30
+CROP_PAD_FLOOR_PX = 4.0
+
+MERGE_FILL_DROP = 0.65
+MERGE_PAGE_RATIO = 0.55
+MERGE_ROW_GAP = 1
+MULTI_CROP_LIMIT = 3
+CROP_MERGE_IOU = 0.25
+
+
+def crop_pad_px(
+    grid: Optional[VisionPatchGrid],
+    text_h: float,
+) -> Tuple[float, float]:
+    unit = float(text_h)
+    if unit <= 1.0 and grid is not None:
+        unit = max(1.0, float(grid.cell_height()) * 0.33)
+    if unit <= 1.0:
+        unit = 12.0
+    return (
+        max(CROP_PAD_FLOOR_PX, unit * CROP_PAD_LINES_X),
+        max(CROP_PAD_FLOOR_PX, unit * CROP_PAD_LINES_Y),
+    )
 
 
 def _pad_grid_box(
@@ -337,15 +552,16 @@ def _pad_grid_box(
     rows: int,
     cols: int,
     grid: Optional[VisionPatchGrid] = None,
+    pad_px: Optional[Tuple[float, float]] = None,
 ) -> Tuple[int, int, int, int]:
     r0, r1, c0, c1 = (int(v) for v in gb)
 
-    pr, pc = 1, 2
-    if grid is not None:
+    pr, pc = 0, 0
+    if grid is not None and pad_px is not None:
         ch = max(1.0, float(grid.cell_height()))
         cw = max(1.0, float(grid.cell_width()))
-        pr = max(1, int(round(grid.orig_height * CROP_PAD_Y_RATIO / ch)))
-        pc = max(2, int(round(grid.orig_width * CROP_PAD_X_RATIO / cw)))
+        pr = int(float(pad_px[1]) // ch)
+        pc = int(float(pad_px[0]) // cw)
 
     r0 = max(0, r0 - pr)
     r1 = min(rows - 1, r1 + pr)
@@ -461,11 +677,64 @@ def plan_crops(
     present = presence_gate(heatmaps, n, log=log)
     area_cap = max(4, n // max(1, len(present)))
 
+    text_h = 0.0
+    if text_boxes:
+        from .text_boxes import median_text_height
+        text_h = float(median_text_height(text_boxes))
+    pad_grid = crop_pad_px(grid, text_h)
+
+    pmat = np.asarray(grid.embeddings, dtype=np.float32)
+    if pmat.ndim == 1:
+        pmat = pmat.reshape(1, -1)
+    if pmat.size:
+        pmat = pmat / np.maximum(
+            np.linalg.norm(pmat, axis=1, keepdims=True), 1e-8
+        )
+    anchored = sum(
+        1 for h in heatmaps if getattr(h, "anchor", None) is not None
+    )
+
+    band_gutter_cache: Dict[Tuple[int, int], set] = {}
+
+    def _band_gutters(br0: int, br1: int) -> set:
+        key = (int(br0), int(br1))
+        got = band_gutter_cache.get(key)
+        if got is not None:
+            return got
+        out = band_gutters_from_boxes(text_boxes, grid, br0, br1)
+        band_gutter_cache[key] = out
+        return out
+
+    def _tight(px: Tuple[int, int, int, int]) -> Tuple[int, int, int, int]:
+        if not text_boxes:
+            return px
+        from .text_boxes import box_tighten
+        fitted = box_tighten(
+            text_boxes, px,
+            pad_x=pad_grid[0], pad_y=pad_grid[1],
+            bounds=(grid.orig_width, grid.orig_height),
+        )
+        return fitted if fitted is not None else px
+
     if log is not None:
         log.append(
             f"  📊 [PLAN_CROPS INPUT] 히트맵 {len(heatmaps)}개 "
             f"(존재 판정 통과 {len(present)}개) | 격자 {rows}x{cols}={n} "
             f"| area_cap={area_cap} | content 활성 {int(content_ok.sum())}/{n}"
+        )
+        log.append(
+            f"  🎰 [PLINKO READY] 카테고리 앵커 {anchored}/{len(heatmaps)}개 "
+            f"확보 | 패치 행렬 {tuple(pmat.shape)} — 조각을 아래·오른쪽·위·"
+            f"왼쪽 네 방향으로 한 줄씩 붙여 보고 코사인이 절벽에 닿는 곳에서 "
+            f"멈춥니다. 표의 가로·세로 방향은 이득이 큰 쪽으로 자동 결정됩니다."
+        )
+        log.append(
+            f"  📐 [CROP PAD] 검출 박스 중앙 높이 {text_h:.0f}px 기준 — "
+            f"가로 ±{pad_grid[0]:.0f}px / 세로 ±{pad_grid[1]:.0f}px "
+            f"(격자 한 칸 {grid.cell_width():.0f}x{grid.cell_height():.0f}px "
+            f"→ 격자 패딩 {int(pad_grid[1] // max(1.0, grid.cell_height()))}행"
+            f"/{int(pad_grid[0] // max(1.0, grid.cell_width()))}열, "
+            f"나머지는 픽셀 단계에서 글자 경계에 맞춥니다)"
         )
 
     per_cat: List[Tuple[str, List[Tuple[int, int, int, int]], List[float], List[int]]] = []
@@ -513,6 +782,7 @@ def plan_crops(
         peaks: List[float] = []
         counts: List[int] = []
         band_hits = 0
+        plinko_hits = 0
 
         for comp in comps:
             targets = [comp]
@@ -524,17 +794,40 @@ def plan_crops(
                     targets = subs
 
             for s in targets:
+                local = _band_gutters(s.r_min, s.r_max)
                 gb = expand_row_band(
-                    s, content, content_gate, cols, bc, max_crop_cols
+                    s, content, content_gate, cols,
+                    bc | local, max_crop_cols,
                 )
                 if (gb[2], gb[3]) != (s.c_min, s.c_max):
                     band_hits += 1
                     if log is not None:
+                        wall = (
+                            f" | 밴드 여백 열 {sorted(local)} 에서 멈춤"
+                            if local else ""
+                        )
                         log.append(
                             f"    ↔️ [ROW BAND] '{h.category}' | "
                             f"c{s.c_min}~{s.c_max} → c{gb[2]}~{gb[3]} "
-                            f"(같은 행 밴드의 값 셀 편입)"
+                            f"(같은 행 밴드의 값 셀 편입){wall}"
                         )
+
+                grown, trace, axis = plinko_grow_region(
+                    gb, h, grid, pmat, content_ok,
+                    text_boxes=text_boxes, area_cap=area_cap,
+                )
+                if trace:
+                    plinko_hits += 1
+                    if log is not None:
+                        log.append(
+                            f"    🎰 [PLINKO] '{h.category}' grid{gb} → "
+                            f"grid{grown} | {len(trace)}라운드 | 축 {axis} "
+                            f"— 점수가 절벽에 닿을 때까지만 이어 붙입니다."
+                        )
+                        for step in trace:
+                            log.append(f"       {step}")
+                    gb = grown
+
                 boxes.append(gb)
                 peaks.append(s.peak)
                 counts.append(len(s.indices))
@@ -553,22 +846,11 @@ def plan_crops(
     raw: List[CropPlan] = []
     for category, boxes, peaks, counts in per_cat:
         for gb, peak, cnt in zip(boxes, peaks, counts):
-            padded = _pad_grid_box(gb, rows, cols, grid)
+            padded = _pad_grid_box(gb, rows, cols, grid, pad_grid)
             px = grid.region_bbox(*padded)
             plan = CropPlan(category, px, peak, 0.0, cnt, padded)
             plan.top_field = top_field_of.get(category, category)
             raw.append(plan)
-
-    if log is not None:
-        pr = max(1, int(round(grid.orig_height * CROP_PAD_Y_RATIO
-                              / max(1.0, grid.cell_height()))))
-        pc = max(2, int(round(grid.orig_width * CROP_PAD_X_RATIO
-                              / max(1.0, grid.cell_width()))))
-        log.append(
-            f"    📐 [CROP PAD] 픽셀 기준 패딩 — 세로 ±{pr}행"
-            f"(≈{int(grid.orig_height * CROP_PAD_Y_RATIO)}px) / "
-            f"가로 ±{pc}열(≈{int(grid.orig_width * CROP_PAD_X_RATIO)}px)"
-        )
 
     if log is not None:
         log.append(
@@ -614,24 +896,36 @@ def plan_crops(
     min_w = max(64, int(grid.orig_width * 0.12))
     min_h = max(48, int(grid.orig_height * 0.06))
 
+    cw_px = max(1.0, float(grid.cell_width()))
+    ch_px = max(1.0, float(grid.cell_height()))
+    page_px = float(max(1, grid.orig_width * grid.orig_height))
+
     def _emit(cand: CropPlan, tag: str = "CROP PLAN"):
-        covered = _box_patches(cand.grid_box, cols)
+        x0, y0, x1, y1 = cand.bbox
         act = active_count.get(cand.category, 0)
         hit = 0
         for h in heatmaps:
             if h.category != cand.category:
                 continue
             fin = np.isfinite(h.scores)
-            for i in covered:
-                if i < h.scores.size and fin[i] and h.scores[i] > 0.0:
+            for i in range(min(int(h.scores.size), n)):
+                if not fin[i] or h.scores[i] <= 0.0:
+                    continue
+                r, c = divmod(i, cols)
+                cx = (c + 0.5) * cw_px
+                cy = (r + 0.5) * ch_px
+                if x0 <= cx <= x1 and y0 <= cy <= y1:
                     hit += 1
             break
         cand.coverage = (hit / act) if act else 0.0
         if log is not None:
             pct = int(round(cand.coverage * 100))
+            share = int(round(
+                100.0 * max(0, x1 - x0) * max(0, y1 - y0) / page_px
+            ))
             log.append(
                 f"    📊 [CROP COVERAGE] '{cand.category}' 히트맵 활성 "
-                f"{act}개 중 {hit}개 커버 ({pct}%)"
+                f"{act}개 중 {hit}개 커버 ({pct}%) | 지면 점유 {share}%"
             )
             if act and cand.coverage < 0.5:
                 log.append(
@@ -655,6 +949,8 @@ def plan_crops(
             a.category in tables and b.category in tables
         )
 
+    empty_skipped: Dict[str, int] = {}
+
     for cand in raw:
         if cand.category in taken_categories:
             continue
@@ -665,6 +961,25 @@ def plan_crops(
         cand.bbox = ensure_min_size(
             cand.bbox, grid.orig_width, grid.orig_height, min_w, min_h
         )
+
+        if text_boxes:
+            from .text_boxes import boxes_in_region
+            if not boxes_in_region(text_boxes, cand.bbox):
+                cells = [i for i in _box_patches(cand.grid_box, cols) if i < n]
+                inked = sum(1 for i in cells if bool(content_ok[i]))
+                if inked <= 0:
+                    empty_skipped[cand.category] = (
+                        empty_skipped.get(cand.category, 0) + 1
+                    )
+                    if log is not None:
+                        log.append(
+                            f"    ⛔ [EMPTY REGION SKIP] '{cand.category}' 후보 "
+                            f"grid{cand.grid_box} px{cand.bbox} 안에 검출된 "
+                            f"글자도 잉크 패치도 없습니다. 히트맵 봉우리가 "
+                            f"여백에 찍힌 것이므로 다음 후보 영역으로 "
+                            f"넘어갑니다."
+                        )
+                    continue
 
         hit: Optional[CropPlan] = None
         hit_iou = 0.0
@@ -697,85 +1012,186 @@ def plan_crops(
         taken_categories.add(cand.category)
         _emit(cand)
 
+    if log is not None and empty_skipped:
+        brief = ", ".join(
+            f"{k}({v}건)" for k, v in sorted(empty_skipped.items())
+        )
+        log.append(
+            f"    ⛔ [EMPTY REGION SKIP] 글자가 전혀 없는 후보 영역 "
+            f"{sum(empty_skipped.values())}건을 건너뛰었습니다 — {brief}. "
+            f"해당 카테고리는 다음 후보나 SPLIT/RESCUE 크롭으로 대체되며, "
+            f"끝내 못 찾으면 이 문서에 없는 축입니다."
+        )
+
     by_cat_regions: Dict[str, List[Tuple[int, int, int, int]]] = {}
     for category, boxes, _peaks, _counts in per_cat:
         by_cat_regions[category] = list(boxes)
 
     COVERAGE_FLOOR = 0.70
+    col_gap_tol = max(1, cols // 6)
+    page_cells = float(max(1, rows * cols))
+    extra: List[CropPlan] = []
 
-    for w in winners:
+    def _fill_ratio(gb: Tuple[int, int, int, int]) -> float:
+        cells = _box_patches(gb, cols)
+        if not cells:
+            return 0.0
+        got = sum(1 for i in cells if i < n and bool(content_ok[i]))
+        return got / float(len(cells))
+
+    def _adjacent(a, b) -> bool:
+        ar0, ar1, ac0, ac1 = a
+        br0, br1, bc0, bc1 = b
+        row_gap = max(0, max(ar0, br0) - min(ar1, br1))
+        col_gap = max(0, max(ac0, bc0) - min(ac1, bc1))
+        return row_gap <= MERGE_ROW_GAP and col_gap <= col_gap_tol
+
+    for w in list(winners):
         if w.coverage >= COVERAGE_FLOOR:
             continue
-        regions = by_cat_regions.get(w.category) or []
-        if len(regions) < 2:
+        regions = [
+            _pad_grid_box(gb, rows, cols, grid, pad_grid)
+            for gb in (by_cat_regions.get(w.category) or [])
+        ]
+        regions = [gb for gb in regions if gb != w.grid_box]
+        if not regions:
             continue
 
-        r0, r1, c0, c1 = w.grid_box
-        merged_any = False
-        max_r = max(4, int(round(rows * 0.80)))
-        max_c = max(6, int(round(cols * 0.95)))
+        base_fill = _fill_ratio(w.grid_box)
+        merged_box = w.grid_box
+        joined = 0
+        left: List[Tuple[int, int, int, int]] = []
 
         for gb in sorted(
             regions,
             key=lambda g: abs(((g[0] + g[1]) / 2.0)
                               - ((w.grid_box[0] + w.grid_box[1]) / 2.0)),
         ):
-            gr0, gr1, gc0, gc1 = _pad_grid_box(gb, rows, cols, grid)
-            nr0, nr1 = min(r0, gr0), max(r1, gr1)
-            nc0, nc1 = min(c0, gc0), max(c1, gc1)
-            span_r = nr1 - nr0 + 1
-            span_c = nc1 - nc0 + 1
-            if span_r > max_r or span_c > max_c:
+            if not _adjacent(merged_box, gb):
+                left.append(gb)
                 continue
-            r0, r1, c0, c1 = nr0, nr1, nc0, nc1
-            merged_any = True
-
-        if not merged_any:
-            continue
-        if (r0, r1, c0, c1) == w.grid_box:
-            continue
-
-        w.grid_box = (r0, r1, c0, c1)
-        w.bbox = ensure_min_size(
-            grid.region_bbox(r0, r1, c0, c1),
-            grid.orig_width, grid.orig_height, min_w, min_h,
-        )
-        if log is not None:
-            log.append(
-                f"    🧲 [COVERAGE MERGE] '{w.category}' 커버리지 "
-                f"{int(w.coverage * 100)}% < {int(COVERAGE_FLOOR * 100)}% → "
-                f"같은 카테고리 영역 {len(regions)}개를 "
-                f"grid({r0}, {r1}, {c0}, {c1}) 로 합칩니다."
+            cand = (
+                min(merged_box[0], gb[0]), max(merged_box[1], gb[1]),
+                min(merged_box[2], gb[2]), max(merged_box[3], gb[3]),
             )
-        _emit(w, tag="CROP REPLAN")
+            area = float((cand[1] - cand[0] + 1) * (cand[3] - cand[2] + 1))
+            if area > page_cells * MERGE_PAGE_RATIO:
+                left.append(gb)
+                if log is not None:
+                    log.append(
+                        f"    ⛔ [MERGE SKIP] '{w.category}' 두 영역을 합치면 "
+                        f"지면의 {area / page_cells:.0%} 를 차지합니다. "
+                        f"합치지 않고 별도 크롭으로 남깁니다."
+                    )
+                continue
+            cand_fill = _fill_ratio(cand)
+            if cand_fill < base_fill * MERGE_FILL_DROP:
+                left.append(gb)
+                if log is not None:
+                    log.append(
+                        f"    ⛔ [MERGE SKIP] '{w.category}' 병합 사각형의 "
+                        f"내용 밀도가 {cand_fill:.0%} 로 원본 {base_fill:.0%} "
+                        f"대비 급락합니다. 두 영역 사이가 여백이라는 뜻이므로 "
+                        f"합치지 않습니다."
+                    )
+                continue
+            merged_box = cand
+            joined += 1
 
-    if text_boxes:
-        from .text_boxes import box_union
-        snapped = 0
-        for w in winners:
-            grown = box_union(text_boxes, w.bbox, overlap_ratio=0.20)
-            if grown is None:
-                continue
-            gx0, gy0, gx1, gy1 = grown
-            bx0, by0, bx1, by1 = w.bbox
-            nx0 = max(0, min(bx0, gx0 - 4))
-            ny0 = max(0, min(by0, gy0 - 4))
-            nx1 = min(grid.orig_width, max(bx1, gx1 + 4))
-            ny1 = min(grid.orig_height, max(by1, gy1 + 4))
-            if (nx0, ny0, nx1, ny1) == w.bbox:
-                continue
+        if joined:
+            w.grid_box = merged_box
+            w.bbox = ensure_min_size(
+                grid.region_bbox(*merged_box),
+                grid.orig_width, grid.orig_height, min_w, min_h,
+            )
             if log is not None:
                 log.append(
-                    f"    📐 [TEXT SNAP] '{w.category}' 크롭 경계를 검출 "
-                    f"박스에 맞춰 확장합니다. px{w.bbox} → "
-                    f"px({nx0}, {ny0}, {nx1}, {ny1}) — 글자 잘림 방지"
+                    f"    🧲 [ADJACENT MERGE] '{w.category}' 커버리지 "
+                    f"{int(w.coverage * 100)}% < {int(COVERAGE_FLOOR * 100)}% "
+                    f"→ 행이 겹치고 열 간격 {col_gap_tol}칸 이내인 이웃 영역 "
+                    f"{joined}개만 합쳤습니다. grid{merged_box}"
                 )
-            w.bbox = (nx0, ny0, nx1, ny1)
-            snapped += 1
-        if log is not None and snapped:
+            _emit(w, tag="CROP REPLAN")
+
+        for gb in left[: max(0, MULTI_CROP_LIMIT - 1)]:
+            grown, trace, _axis = plinko_grow_region(
+                gb, next(
+                    (h for h in heatmaps if h.category == w.category),
+                    None,
+                ) or w, grid, pmat, content_ok,
+                text_boxes=text_boxes, area_cap=area_cap,
+            )
+            if trace:
+                gb = grown
+            px = _tight(ensure_min_size(
+                grid.region_bbox(*gb),
+                grid.orig_width, grid.orig_height, min_w, min_h,
+            ))
+
+            inside = 0
+            if text_boxes:
+                from .text_boxes import boxes_in_region
+                inside = len(boxes_in_region(text_boxes, px))
+                if inside <= 0:
+                    if log is not None:
+                        log.append(
+                            f"    ⛔ [SPLIT SKIP] '{w.category}' 잔여 영역 "
+                            f"grid{gb} 안에 검출된 글자가 없습니다. 빈 크롭을 "
+                            f"만들지 않습니다."
+                        )
+                    continue
+
+            if any(
+                compute_iou(px, p.bbox) >= iou_threshold
+                for p in list(winners) + extra
+            ):
+                continue
+            side = CropPlan(
+                w.category, px, w.score, w.margin,
+                len(_box_patches(gb, cols)), gb, source="split",
+            )
+            side.top_field = w.top_field
+            extra.append(side)
+            if log is not None:
+                tail = (
+                    f" | PLINKO {len(trace)}라운드 성장" if trace else ""
+                )
+                log.append(
+                    f"    ➕ [SPLIT CROP] '{w.category}' 는 떨어진 영역이 "
+                    f"남아 있어 하나로 합치는 대신 크롭을 하나 더 만듭니다. "
+                    f"grid{gb} → px{px} (글자 {inside}덩이){tail} — 행 원장이 "
+                    f"있어 같은 줄을 두 번 읽지 않습니다."
+                )
+            _emit(side, tag="CROP PLAN")
+
+    if extra:
+        winners.extend(extra)
+
+    if text_boxes:
+        fitted_n = 0
+        saved_px = 0
+        for w in winners:
+            fitted = _tight(w.bbox)
+            if fitted == w.bbox:
+                continue
+            before_a = max(1, (w.bbox[2] - w.bbox[0]) * (w.bbox[3] - w.bbox[1]))
+            after_a = max(1, (fitted[2] - fitted[0]) * (fitted[3] - fitted[1]))
+            if log is not None:
+                log.append(
+                    f"    📐 [TEXT FIT] '{w.category}' 크롭을 안쪽 글자 "
+                    f"경계에 맞춥니다. px{w.bbox} → px{fitted} "
+                    f"(면적 {after_a / before_a:.0%})"
+                )
+            saved_px += max(0, before_a - after_a)
+            w.bbox = fitted
+            fitted_n += 1
+        if log is not None and fitted_n:
             log.append(
-                f"    📐 [TEXT SNAP] {snapped}건의 크롭이 글자 경계 밖으로 "
-                f"확장되었습니다."
+                f"    📐 [TEXT FIT] {fitted_n}건의 크롭이 글자 경계 안쪽으로 "
+                f"정렬되었습니다 — 여백 {saved_px / 1000.0:.0f}K px² 제거. "
+                f"경계 밖으로는 글자 높이에서 계산한 "
+                f"가로 {pad_grid[0]:.0f}px / 세로 {pad_grid[1]:.0f}px 만 "
+                f"넘어갑니다."
             )
 
     for h in heatmaps:
@@ -785,22 +1201,40 @@ def plan_crops(
         if idx < 0:
             continue
         r, c = divmod(int(idx), cols)
-        gb = _pad_grid_box((r, r, c, c), rows, cols, grid)
+        seed = Component(
+            [int(idx)], r, r, c, c, float(h.top_score), float(h.top_score)
+        )
+        band_box = expand_row_band(
+            seed, content, content_gate, cols,
+            bc | _band_gutters(r, r), max_crop_cols,
+        )
+        band_box, rescue_trace, _axis = plinko_grow_region(
+            band_box, h, grid, pmat, content_ok,
+            text_boxes=text_boxes, area_cap=area_cap,
+        )
+        if rescue_trace and log is not None:
+            log.append(
+                f"    🎰 [PLINKO] '{h.category}' 구제 크롭을 "
+                f"{len(rescue_trace)}라운드 성장시켰습니다 → grid{band_box}"
+            )
+        gb = _pad_grid_box(band_box, rows, cols, grid, pad_grid)
+        px = _tight(ensure_min_size(
+            grid.region_bbox(*gb),
+            grid.orig_width, grid.orig_height, min_w, min_h,
+        ))
         plan = CropPlan(
-            h.category, grid.region_bbox(*gb), float(h.top_score),
+            h.category, px, float(h.top_score),
             float(h.top_score), 1, gb, source="rescue",
         )
         plan.top_field = top_field_of.get(h.category, h.category)
-        plan.bbox = ensure_min_size(
-            plan.bbox, grid.orig_width, grid.orig_height, min_w, min_h
-        )
         winners.append(plan)
         taken_categories.add(h.category)
         if log is not None:
             log.append(
                 f"    🛟 [STARVATION RESCUE] '{h.category}' 는 영역을 "
-                f"선점당했지만 자기 최고 봉우리({h.top_score:+.4f})로 "
-                f"독립 크롭합니다."
+                f"선점당했지만 자기 최고 봉우리({h.top_score:+.4f})가 있는 "
+                f"행 밴드 r{band_box[0]}~{band_box[1]} "
+                f"c{band_box[2]}~{band_box[3]} 만 독립 크롭합니다."
             )
         _emit(plan, tag="CROP PLAN")
 
@@ -815,14 +1249,30 @@ def plan_crops(
         got = len(band_content & covered)
         need = len(band_content)
         if need and got * 2 < need:
-            gb = _pad_grid_box((ib_start, ib_end, 0, cols - 1), rows, cols, grid)
+            ic0, ic1 = cols, 0
+            for rr in range(ib_start, ib_end + 1):
+                for c in range(cols):
+                    i = rr * cols + c
+                    if i < n and bool(content_ok[i]):
+                        ic0 = min(ic0, c)
+                        ic1 = max(ic1, c)
+            if ic0 > ic1:
+                ic0, ic1 = 0, cols - 1
+
+            gb = _pad_grid_box(
+                (ib_start, ib_end, ic0, ic1), rows, cols, grid, pad_grid
+            )
+            px = _tight(ensure_min_size(
+                grid.region_bbox(*gb),
+                grid.orig_width, grid.orig_height, min_w, min_h,
+            ))
             peak = 0.0
             for h in heatmaps:
                 if h.category == ident:
                     peak = float(h.top_score)
                     break
             plan = CropPlan(
-                ident, grid.region_bbox(*gb), peak, peak,
+                ident, px, peak, peak,
                 len(band_content), gb, source="identity-band",
             )
             plan.top_field = top_field_of.get(ident, ident)
@@ -831,7 +1281,7 @@ def plan_crops(
                 log.append(
                     f"    🪪 [IDENTITY BAND GUARANTEE] '{ident}' 가 식별 밴드 "
                     f"내용을 {got}/{need} 밖에 못 담아 전용 크롭을 추가합니다. "
-                    f"r{ib_start}~{ib_end} c0~{cols - 1} → px{plan.bbox} "
+                    f"r{ib_start}~{ib_end} c{ic0}~{ic1} → px{px} "
                     f"| Peak: {peak:+.4f}"
                 )
 
@@ -853,25 +1303,76 @@ def plan_crops(
             )
 
     if missing and winners:
-        for r in missing:
-            gb = _pad_grid_box((r, r, 0, cols - 1), rows, cols, grid)
-            px = grid.region_bbox(*gb)
-            best = min(
-                winners,
-                key=lambda w: abs(((w.grid_box[0] + w.grid_box[1]) / 2.0) - r),
+        bands: List[Tuple[int, int]] = []
+        run = [missing[0], missing[0]]
+        for r in missing[1:]:
+            if r == run[1] + 1:
+                run[1] = r
+                continue
+            bands.append((run[0], run[1]))
+            run = [r, r]
+        bands.append((run[0], run[1]))
+
+        added = 0
+        for br0, br1 in bands:
+            rc0, rc1 = cols, 0
+            for rr in range(br0, br1 + 1):
+                for c in range(cols):
+                    i = rr * cols + c
+                    if i < n and bool(content_ok[i]):
+                        rc0 = min(rc0, c)
+                        rc1 = max(rc1, c)
+            if rc0 > rc1:
+                rc0, rc1 = 0, cols - 1
+
+            owner = ""
+            owner_field = ""
+            best_score = -np.inf
+            for h in heatmaps:
+                fin = np.isfinite(h.scores)
+                for rr in range(br0, br1 + 1):
+                    for c in range(rc0, rc1 + 1):
+                        i = rr * cols + c
+                        if i >= h.scores.size or not fin[i]:
+                            continue
+                        if float(h.scores[i]) > best_score:
+                            best_score = float(h.scores[i])
+                            owner = h.category
+                            owner_field = top_field_of.get(
+                                h.category, h.category
+                            )
+            if not owner:
+                continue
+
+            gb = _pad_grid_box(
+                (br0, br1, rc0, rc1), rows, cols, grid, pad_grid
             )
-            ax0, ay0, ax1, ay1 = best.bbox
-            bx0, by0, bx1, by1 = px
-            best.bbox = (
-                min(ax0, bx0), min(ay0, by0), max(ax1, bx1), max(ay1, by1)
+            px = _tight(ensure_min_size(
+                grid.region_bbox(*gb),
+                grid.orig_width, grid.orig_height, min_w, min_h,
+            ))
+            if any(compute_iou(px, w.bbox) >= iou_threshold for w in winners):
+                continue
+
+            plan = CropPlan(
+                owner, px, best_score, 0.0,
+                (br1 - br0 + 1) * (rc1 - rc0 + 1),
+                gb, source="coverage-rescue",
             )
-            r0 = min(best.grid_box[0], gb[0])
-            r1 = max(best.grid_box[1], gb[1])
-            best.grid_box = (r0, r1, best.grid_box[2], best.grid_box[3])
+            plan.top_field = owner_field
+            winners.append(plan)
+            added += 1
+            if log is not None:
+                log.append(
+                    f"    🩹 [COVERAGE RESCUE] 미커버 행 밴드 r{br0}~{br1} "
+                    f"(c{rc0}~{rc1}) 를 '{owner}' 소유로 전용 크롭합니다. "
+                    f"→ px{px} | Peak: {best_score:+.4f} — 기존 크롭을 "
+                    f"넓히지 않습니다."
+                )
         if log is not None:
             log.append(
-                f"    🩹 [COVERAGE PATCH] 누락 행 {len(missing)}개를 "
-                f"가장 가까운 크롭에 편입했습니다."
+                f"    🩹 [COVERAGE RESCUE] 누락 행 {len(missing)}개를 밴드 "
+                f"{len(bands)}개로 묶어 전용 크롭 {added}건을 추가했습니다."
             )
 
     seen_boxes: Dict[Tuple[int, int, int, int], str] = {}
@@ -900,7 +1401,7 @@ def plan_crops(
                 continue
             if _shares_table(m, w):
                 continue
-            if compute_iou(m.bbox, w.bbox) > 0.0:
+            if compute_iou(m.bbox, w.bbox) >= CROP_MERGE_IOU:
                 same = m
                 break
         if same is None:
@@ -911,6 +1412,18 @@ def plan_crops(
         new_box = (
             min(ax0, bx0), min(ay0, by0), max(ax1, bx1), max(ay1, by1)
         )
+        new_area = float(
+            max(0, new_box[2] - new_box[0]) * max(0, new_box[3] - new_box[1])
+        )
+        if new_area > page_px * MERGE_PAGE_RATIO:
+            if log is not None:
+                log.append(
+                    f"    ⛔ [MERGE SKIP] '{w.category}' 두 크롭을 합치면 "
+                    f"지면의 {new_area / page_px:.0%} 를 차지합니다. "
+                    f"별도 크롭으로 유지합니다."
+                )
+            merged.append(w)
+            continue
         if log is not None:
             log.append(
                 f"    🔗 [CROP MERGE] '{w.category}' 의 겹치는 크롭 2개를 "

@@ -7,10 +7,174 @@ from PIL import Image
 from .text_upscale import crop_region
 
 LINE_READ_MIN_LINES = 2
+LINE_READ_DEAD_CROPS = 2
 
 DEDUP_IOU = 0.35
 DEDUP_CENTER_RATIO = 0.55
 DEDUP_TEXT_SIM = 0.80
+DEDUP_SAME_TEXT_SIM = 0.95
+DEDUP_SAME_TEXT_UNITS = 0.75
+
+LEDGER_QUANT_PX = 6
+LEDGER_REUSE_RATIO = 0.60
+LEDGER_MAX_ROWS = 600
+
+READ_MODE_FORM = "form"
+READ_MODE_PROSE = "prose"
+
+FORM_MIN_ROWS = 6
+FORM_LABEL_DENSITY = 0.22
+PROSE_TRUST_CONF = 0.985
+
+REFINE_DEAD_CROPS = 2
+
+_LINE_READ_DEAD = {"strikes": 0, "off": False, "calls": 0, "changed": 0}
+_REFINE_HEALTH = {"strikes": 0, "off": False, "calls": 0, "gained": 0}
+_READ_MODE = {"mode": READ_MODE_FORM, "density": 0.0, "rows": 0, "decided": False}
+_ROW_LEDGER: Dict[Tuple[int, int, int, int], str] = {}
+
+
+def reset_line_read_health() -> None:
+    _LINE_READ_DEAD["strikes"] = 0
+    _LINE_READ_DEAD["off"] = False
+    _LINE_READ_DEAD["calls"] = 0
+    _LINE_READ_DEAD["changed"] = 0
+    _ROW_LEDGER.clear()
+
+
+def reset_refine_health() -> None:
+    _REFINE_HEALTH["strikes"] = 0
+    _REFINE_HEALTH["off"] = False
+    _REFINE_HEALTH["calls"] = 0
+    _REFINE_HEALTH["gained"] = 0
+
+
+def reset_read_mode() -> None:
+    _READ_MODE["mode"] = READ_MODE_FORM
+    _READ_MODE["density"] = 0.0
+    _READ_MODE["rows"] = 0
+    _READ_MODE["decided"] = False
+
+
+def is_prose_mode() -> bool:
+    return str(_READ_MODE["mode"]) == READ_MODE_PROSE
+
+
+def decide_read_mode(
+    rows: Optional[Sequence[Tuple[str, float, Tuple[int, int, int, int]]]],
+    schema: Optional[dict],
+    log: Optional[List[str]] = None,
+) -> str:
+    if _READ_MODE["decided"]:
+        return str(_READ_MODE["mode"])
+
+    texts = [
+        str(t or "").strip() for t, _s, _b in (rows or [])
+        if str(t or "").strip()
+    ]
+    if len(texts) < FORM_MIN_ROWS:
+        return str(_READ_MODE["mode"])
+
+    index, _bank = build_label_index(schema, category="")
+    if not index:
+        return str(_READ_MODE["mode"])
+
+    hit = 0
+    for t in texts:
+        ranked = rank_label_fields(t, index, top_k=1)
+        if ranked and float(ranked[0][1]) >= LABEL_COSINE_FLOOR:
+            hit += 1
+
+    density = hit / float(len(texts))
+    mode = READ_MODE_FORM if density >= FORM_LABEL_DENSITY else READ_MODE_PROSE
+
+    _READ_MODE["mode"] = mode
+    _READ_MODE["density"] = float(density)
+    _READ_MODE["rows"] = len(texts)
+    _READ_MODE["decided"] = True
+
+    if log is not None:
+        if mode == READ_MODE_FORM:
+            log.append(
+                f"    🧭 [READ MODE] 서식 모드 — OCR 행 {len(texts)}개 중 "
+                f"{hit}개가 다국어 사전 코사인으로 스키마 필드 라벨에 "
+                f"붙었습니다 ({density:.0%} ≥ {FORM_LABEL_DENSITY:.0%}). "
+                f"라벨↔값 경로가 성립하므로 행 단위 VLM 재판독을 "
+                f"최소화합니다."
+            )
+        else:
+            log.append(
+                f"    🧭 [READ MODE] 산문 모드 — OCR 행 {len(texts)}개 중 "
+                f"{hit}개만 사전 코사인으로 라벨에 붙었습니다 "
+                f"({density:.0%} < {FORM_LABEL_DENSITY:.0%}). 인쇄 라벨이 "
+                f"없는 지면이라 행 자체가 값입니다. 행 단위 판독을 유지하고 "
+                f"전용 인식기 신뢰선을 {PROSE_TRUST_CONF:.3f} 로 올립니다."
+            )
+    return mode
+
+
+def _ledger_key(box: Sequence[int]) -> Tuple[int, int, int, int]:
+    q = max(1, int(LEDGER_QUANT_PX))
+    return (
+        int(box[0]) // q, int(box[1]) // q,
+        int(box[2]) // q, int(box[3]) // q,
+    )
+
+
+def _ledger_get(box: Sequence[int]) -> str:
+    return str(_ROW_LEDGER.get(_ledger_key(box)) or "")
+
+
+def _ledger_store(
+    boxes: Sequence[Sequence[int]],
+    texts: Sequence[str],
+) -> int:
+    n = 0
+    for b, t in zip(boxes, texts):
+        s = str(t or "").strip()
+        if not s:
+            continue
+        _ROW_LEDGER[_ledger_key(b)] = s
+        n += 1
+    if len(_ROW_LEDGER) > LEDGER_MAX_ROWS:
+        drop = len(_ROW_LEDGER) - LEDGER_MAX_ROWS
+        for key in list(_ROW_LEDGER.keys())[:drop]:
+            _ROW_LEDGER.pop(key, None)
+    return n
+
+
+def _note_refine(
+    gained: int,
+    category: str,
+    log: Optional[List[str]] = None,
+) -> None:
+    _REFINE_HEALTH["calls"] += 1
+    _REFINE_HEALTH["gained"] += int(gained)
+
+    if int(gained) > 0:
+        _REFINE_HEALTH["strikes"] = 0
+        return
+
+    if is_prose_mode():
+        return
+
+    _REFINE_HEALTH["strikes"] += 1
+    if log is not None:
+        log.append(
+            f"    ⚠ [REFINE IDLE] '{category}' 정제 호출이 필드를 한 건도 "
+            f"만들지 못했습니다 "
+            f"({_REFINE_HEALTH['strikes']}/{REFINE_DEAD_CROPS}회 연속)."
+        )
+    if _REFINE_HEALTH["strikes"] >= REFINE_DEAD_CROPS:
+        _REFINE_HEALTH["off"] = True
+        if log is not None:
+            log.append(
+                f"    ⛔ [REFINE OFF] 누적 정제 호출 "
+                f"{_REFINE_HEALTH['calls']}회 / 신규 필드 "
+                f"{_REFINE_HEALTH['gained']}건. 남은 크롭에서는 정제를 "
+                f"중단하고 다국어 사전 코사인 라벨↔값 경로만 씁니다 — "
+                f"같은 결과를 VLM 없이 뽑습니다."
+            )
 
 from .text_upscale import (
     decide_tile_count,
@@ -123,7 +287,14 @@ LABEL_BANK_SOURCES = ("label", "semantic")
 
 PHRASE_SPLIT_RE = re.compile(r"[,;|\n]+")
 
-_LABEL_INDEX_CACHE: Dict[Tuple[int, str], Tuple["LabelIndex", List[str]]] = {}
+FORMAT_MISMATCH_PENALTY = 0.72
+NUMERIC_CHAR_RE = re.compile(r"\d")
+PURE_NUMERIC_RE = re.compile(r"^[-+]?\d[\d\s,.'\u00A0\u066B\u066C]*$")
+
+IDENTITY_SELF_REF_MIN = 0.35
+IDENTITY_SELF_REF_MARGIN = 0.04
+
+_LABEL_INDEX_CACHE: Dict[Tuple[int, str, str], Tuple["LabelIndex", List[str]]] = {}
 
 
 def _norm_text(text: str) -> str:
@@ -320,9 +491,13 @@ class LabelIndex:
 def build_label_index(
     schema: Optional[dict],
     category: str = "",
+    drop_fields: Optional[Sequence[str]] = None,
 ) -> Tuple[LabelIndex, List[str]]:
     fields = (schema or {}).get("fields", {}) or {}
-    cache_key = (id(schema), str(category or ""))
+    drop = set(str(d) for d in (drop_fields or ()))
+    cache_key = (
+        id(schema), str(category or ""), "|".join(sorted(drop))
+    )
     cached = _LABEL_INDEX_CACHE.get(cache_key)
     if cached is not None:
         return cached
@@ -344,7 +519,8 @@ def build_label_index(
             continue
 
         plain = str(name).replace("_", " ")
-        index.add(str(name), plain, "name")
+        if str(name) not in drop:
+            index.add(str(name), plain, "name")
         _bank(plain)
 
         for key in LABEL_DICT_SOURCES:
@@ -352,7 +528,8 @@ def build_label_index(
             if raw is None:
                 continue
             for piece in _dict_phrases(raw):
-                index.add(str(name), piece, key)
+                if str(name) not in drop:
+                    index.add(str(name), piece, key)
                 if key in LABEL_BANK_SOURCES:
                     _bank(piece)
 
@@ -376,6 +553,98 @@ def _array_field_names(schema: Optional[dict]) -> set:
         if d.get("array") or d.get("table"):
             out.add(str(name))
     return out
+
+
+def _field_format_map(schema: Optional[dict]) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    for name, definition in ((schema or {}).get("fields", {}) or {}).items():
+        d = definition if isinstance(definition, dict) else {}
+        fmt = str(d.get("format") or "").strip().lower()
+        if fmt:
+            out[str(name)] = fmt
+    return out
+
+
+def _format_penalty(fmt: str, value: str) -> float:
+    v = str(value or "").strip()
+    if not v:
+        return 1.0
+    f = str(fmt or "").strip().lower()
+    if f == "numeric":
+        return 1.0 if NUMERIC_CHAR_RE.search(v) else FORMAT_MISMATCH_PENALTY
+    if PURE_NUMERIC_RE.match(v):
+        return FORMAT_MISMATCH_PENALTY
+    return 1.0
+
+
+def _gram_cosine(a: str, b: str) -> float:
+    ga = _label_grams(a)
+    gb = _label_grams(b)
+    if not ga or not gb:
+        return 0.0
+    na = math.sqrt(sum(float(v) * float(v) for v in ga.values()))
+    nb = math.sqrt(sum(float(v) * float(v) for v in gb.values()))
+    if na <= 1e-9 or nb <= 1e-9:
+        return 0.0
+    dot = sum(float(v) * float(gb.get(g, 0)) for g, v in ga.items())
+    return float(dot / (na * nb))
+
+
+def identity_drop_fields(
+    schema: Optional[dict],
+    doc_code: str = "",
+) -> Dict[str, str]:
+    fields = (schema or {}).get("fields", {}) or {}
+    drop: Dict[str, str] = {}
+    if not fields:
+        return drop
+
+    if "doc_type" in fields:
+        drop["doc_type"] = (
+            "STEP 1 비전 NMS 가 이미 확정한 축이라 라벨↔값 배정에서 제외합니다."
+        )
+
+    code = str(doc_code or (schema or {}).get("code") or "").strip().lower()
+    for name in fields.keys():
+        if not str(name).startswith("reference_") or name in drop:
+            continue
+        tail = str(name)[len("reference_"):].replace("_", "")
+        if tail and code and (
+            tail == code or code.endswith(tail) or tail.endswith(code)
+        ):
+            drop[str(name)] = (
+                f"'{doc_code or code}' 문서가 자기 자신을 가리키는 축입니다."
+            )
+
+    own = fields.get("doc_number")
+    own_text = ""
+    if isinstance(own, dict):
+        own_text = str(own.get("semantic") or "")
+    if not own_text:
+        return drop
+
+    sims: List[Tuple[str, float]] = []
+    for name, definition in fields.items():
+        if not str(name).startswith("reference_") or name in drop:
+            continue
+        d = definition if isinstance(definition, dict) else {}
+        sem = str(d.get("semantic") or "")
+        if not sem:
+            continue
+        sims.append((str(name), _gram_cosine(own_text, sem)))
+
+    if len(sims) < 2:
+        return drop
+
+    sims.sort(key=lambda kv: kv[1], reverse=True)
+    top, top_s = sims[0]
+    second_s = sims[1][1]
+    if top_s >= IDENTITY_SELF_REF_MIN and (top_s - second_s) >= IDENTITY_SELF_REF_MARGIN:
+        drop[top] = (
+            f"이 서식의 doc_number 설명과 사전 유사도 {top_s:.2f} "
+            f"(차점 {second_s:.2f}) — 자기 자신을 가리키는 참조 축입니다."
+        )
+    return drop
 
 
 VALUE_MIN_LEN = 2
@@ -571,12 +840,16 @@ def promote_by_labels(
     category: str,
     log: Optional[List[str]] = None,
     rows: Optional[Sequence[Tuple[str, float, Tuple[int, int, int, int]]]] = None,
-) -> Tuple[Dict[str, str], Dict[str, Tuple[str, float]]]:
+    doc_code: str = "",
+) -> Tuple[Dict[str, Tuple[str, float]], Dict[str, Tuple[str, float]]]:
     body = str(text or "").strip()
     if not schema:
         return {}, {}
 
-    all_index, all_bank = build_label_index(schema, category="")
+    drop = identity_drop_fields(schema, doc_code)
+    all_index, all_bank = build_label_index(
+        schema, category="", drop_fields=list(drop.keys())
+    )
     if not all_index:
         return {}, {}
 
@@ -608,11 +881,13 @@ def promote_by_labels(
         return {}, {}
 
     owner = _field_category_map(schema)
+    fmt_map = _field_format_map(schema)
 
     cands: List[Tuple[float, int, str, str]] = []
     noisy = 0
     label_echo = 0
     unmatched = 0
+    fmt_blocked = 0
 
     for idx, (label, raw_value) in enumerate(pairs):
         value = str(raw_value or "").strip()
@@ -627,9 +902,13 @@ def promote_by_labels(
             unmatched += 1
             continue
         for field, score in ranked:
-            cands.append((float(score), idx, str(field), value))
+            adj = float(score) * _format_penalty(fmt_map.get(field, ""), value)
+            if adj < LABEL_COSINE_FLOOR:
+                fmt_blocked += 1
+                continue
+            cands.append((float(adj), idx, str(field), value))
 
-    own: Dict[str, str] = {}
+    own: Dict[str, Tuple[str, float]] = {}
     donated: Dict[str, Tuple[str, float]] = {}
 
     if cands:
@@ -642,20 +921,27 @@ def promote_by_labels(
             used_pairs.add(idx)
             taken.add(field)
             if str(owner.get(field, "")) == str(category):
-                own[field] = value
+                own[field] = (value, float(score))
             else:
                 donated[field] = (value, float(score))
+
+    if log is not None and drop:
+        for dname, why in list(drop.items())[:4]:
+            log.append(f"       🧹 [AXIS DROP] '{dname}' — {why}")
 
     if log is not None and (own or donated or unmatched or noisy or label_echo):
         log.append(
             f"    🏷 [LABEL PAIR] '{category}' 라벨↔값 {len(pairs)}쌍 → "
             f"사전 코사인 배타 배정 {len(own) + len(donated)}건 "
             f"(이 카테고리 {len(own)}건 / 타 카테고리 기부 {len(donated)}건) "
-            f"| 미매칭 {unmatched}건 | 라벨 에코 {label_echo}건 "
-            f"| 잡음값 {noisy}건 폐기"
+            f"| 미매칭 {unmatched}건 | 형식 불일치 {fmt_blocked}건 차단 "
+            f"| 라벨 에코 {label_echo}건 | 잡음값 {noisy}건 폐기"
         )
-        for k, v in list(own.items())[:8]:
-            log.append(f"       · {k} = {v[:40]}")
+        for k, payload in list(own.items())[:8]:
+            log.append(
+                f"       · {k} = {str(payload[0])[:40]} "
+                f"(사전 코사인 {float(payload[1]):.2f})"
+            )
         for k, payload in list(donated.items())[:8]:
             log.append(
                 f"       ↗ {k} = {str(payload[0])[:40]} "
@@ -715,6 +1001,30 @@ def _center_inside(
     return abs(acy - (b[1] + b[3]) * 0.5) <= bh * DEDUP_CENTER_RATIO
 
 
+def _center_gap(
+    a: Tuple[int, int, int, int],
+    b: Tuple[int, int, int, int],
+) -> float:
+    acx = (a[0] + a[2]) * 0.5
+    acy = (a[1] + a[3]) * 0.5
+    bcx = (b[0] + b[2]) * 0.5
+    bcy = (b[1] + b[3]) * 0.5
+    dx = float(acx - bcx)
+    dy = float(acy - bcy)
+    return math.sqrt(dx * dx + dy * dy)
+
+
+def _median_box_height(
+    rows: Sequence[Tuple[str, float, Tuple[int, int, int, int]]]
+) -> float:
+    hs = sorted(
+        float(b[3] - b[1]) for _t, _s, b in rows if float(b[3] - b[1]) > 0.0
+    )
+    if not hs:
+        return 18.0
+    return max(8.0, hs[len(hs) // 2])
+
+
 def dedup_rows(
     rows: Sequence[Tuple[str, float, Tuple[int, int, int, int]]],
     log: Optional[List[str]] = None,
@@ -724,15 +1034,20 @@ def dedup_rows(
     if len(items) <= 1:
         return list(items)
 
+    unit = _median_box_height(items)
+    near_gate = unit * DEDUP_SAME_TEXT_UNITS
+
     items.sort(key=lambda r: (-float(r[1]), r[2][1], r[2][0]))
 
     kept: List[Tuple[str, float, Tuple[int, int, int, int]]] = []
     dropped_geo = 0
     dropped_txt = 0
+    twin_cells = 0
 
     for text, score, box in items:
         hit = -1
         reason = ""
+        far_twin = False
 
         for i, (ktext, _ks, kbox) in enumerate(kept):
             if _box_iou(box, kbox) >= DEDUP_IOU:
@@ -744,12 +1059,16 @@ def dedup_rows(
                     hit = i
                     reason = "geo"
                     break
-            if _text_similarity(text, ktext) >= 0.95:
-                hit = i
-                reason = "txt"
-                break
+            if _text_similarity(text, ktext) >= DEDUP_SAME_TEXT_SIM:
+                if _center_gap(box, kbox) <= near_gate:
+                    hit = i
+                    reason = "txt"
+                    break
+                far_twin = True
 
         if hit < 0:
+            if far_twin:
+                twin_cells += 1
             kept.append((text, score, box))
             continue
 
@@ -768,12 +1087,18 @@ def dedup_rows(
 
     kept.sort(key=lambda r: (r[2][1], r[2][0]))
 
-    if log is not None and (dropped_geo or dropped_txt):
+    if log is not None and (dropped_geo or dropped_txt or twin_cells):
+        tail = (
+            f" | 같은 글자·다른 좌표 {twin_cells}건은 표의 별개 셀로 보고 "
+            f"보존했습니다"
+            if twin_cells else ""
+        )
         log.append(
             f"    🔁 [TILE DEDUP] '{category}' 타일 겹침에서 같은 줄이 "
             f"중복 인식되어 {dropped_geo + dropped_txt}건을 제거했습니다 "
-            f"(좌표 겹침 {dropped_geo} / 문자 동일 {dropped_txt}). "
-            f"{len(items)}줄 → {len(kept)}줄"
+            f"(좌표 겹침 {dropped_geo} / 문자 동일 {dropped_txt} "
+            f"| 근접 기준 {near_gate:.0f}px). "
+            f"{len(items)}줄 → {len(kept)}줄{tail}"
         )
     return kept
 
@@ -791,6 +1116,21 @@ def _ocr_tiles(
     patches: int = 0,
     text_boxes: Optional[List[Tuple[int, int, int, int]]] = None,
 ) -> Tuple[str, float, str, int, Optional[Image.Image]]:
+    tx0, ty0, tx1, ty1 = (int(v) for v in bbox)
+    inside_boxes = [
+        b for b in (text_boxes or [])
+        if b[0] < tx1 and b[2] > tx0 and b[1] < ty1 and b[3] > ty0
+    ]
+
+    if int(patches) > 0 and int(legible) <= 0 and not inside_boxes:
+        if log is not None:
+            log.append(
+                f"    🚫 [EMPTY CROP SKIP] '{category}' 는 판독 가능 패치가 "
+                f"0/{patches} 개이고 검출 박스도 0개입니다. OCR·VLM 호출을 "
+                f"모두 생략합니다."
+            )
+        return "", 1.0, "", 0, None, []
+
     tiles, reason = decide_tile_count(
         image, bbox, max_tiles=max_tiles,
         table_rows=table_rows, legible=legible, patches=patches,
@@ -799,9 +1139,9 @@ def _ocr_tiles(
 
     if log is not None:
         log.append(
-            f"    🧱 [TILE PLAN] '{category}' → {tiles}타일 (겹침 12%) "
+            f"    🧱 [TILE PLAN] '{category}' → {tiles}타일 "
             f"| 사유: {reason} | 표행 {table_rows} "
-            f"| 판독가능 {legible}/{patches}"
+            f"| 판독가능 {legible}/{patches} | 검출박스 {len(inside_boxes)}개"
         )
 
     usable = (
@@ -850,7 +1190,10 @@ def _ocr_tiles(
             factor, mode, 1, crop, list(collected_rows),
         )
 
-    boxes = plan_overlap_tiles(bbox, tiles, overlap_ratio=0.12)
+    boxes = plan_overlap_tiles(
+        bbox, tiles, overlap_ratio=0.12,
+        image=image, text_boxes=text_boxes, log=log, category=category,
+    )
     collected: List[Tuple[str, float, Tuple[int, int, int, int]]] = []
     factor = 1.0
     mode = ""
@@ -897,8 +1240,25 @@ def read_by_lines(
     if refiner is None or not getattr(refiner, "vision", False):
         return "", [], 0
 
+    prose = is_prose_mode()
+
+    if _LINE_READ_DEAD["off"] and not prose:
+        if log is not None:
+            log.append(
+                f"    ⏭ [LINE READ] '{category}' — VLM 행 판독이 연속 "
+                f"{LINE_READ_DEAD_CROPS}개 크롭에서 전용 인식기 결과를 "
+                f"한 글자도 바꾸지 못했습니다. 이 문서에서는 전용 인식기 "
+                f"결과만 씁니다."
+            )
+        return "", [], 0
+
     try:
-        from core.line_reader import read_lines
+        from core.line_reader import (
+            OCR_TRUST_CONF,
+            collect_ocr_votes,
+            read_lines,
+            split_lines,
+        )
     except Exception as e:
         if log is not None:
             log.append(f"    ⏭ 행 판독 모듈 로드 실패 ({e})")
@@ -918,6 +1278,65 @@ def read_by_lines(
             min(cropped.width, b[2] - bx0), min(cropped.height, b[3] - by0),
         ))
 
+    ocr_fn = None
+    if ocr is not None and getattr(ocr, "available", False):
+        if hasattr(ocr, "recognize_lines"):
+            def ocr_fn(crops):
+                return ocr.recognize_lines(crops)
+
+    def _global(lb) -> Tuple[int, int, int, int]:
+        return (
+            bx0 + int(lb[0]), by0 + int(lb[1]),
+            bx0 + int(lb[2]), by0 + int(lb[3]),
+        )
+
+    probe = split_lines(cropped, boxes=local, log=None)
+    total = len(probe)
+    hits: Dict[int, str] = {}
+    for ln in probe:
+        got = _ledger_get(_global(ln.bbox))
+        if got:
+            hits[ln.index] = got
+
+    if total > 0 and len(hits) >= total * LEDGER_REUSE_RATIO:
+        seen = len(hits)
+        gap = [ln for ln in probe if ln.index not in hits]
+        filled = 0
+        if gap and ocr_fn is not None:
+            votes = collect_ocr_votes(gap, ocr_fn, log=None)
+            for ln in gap:
+                got = votes.get(ln.index)
+                if got and str(got[0]).strip():
+                    hits[ln.index] = str(got[0]).strip()
+                    filled += 1
+
+        texts = [hits.get(ln.index, "") for ln in probe]
+        kept = [t for t in texts if t]
+        _ledger_store([_global(ln.bbox) for ln in probe], texts)
+
+        if log is not None:
+            tail = (
+                f" | 남은 {len(gap)}행은 전용 인식기로만 채웠습니다"
+                f"({filled}행 확보)"
+                if gap else ""
+            )
+            log.append(
+                f"    ♻️ [ROW LEDGER] '{category}' 행 {total}개 중 {seen}개가 "
+                f"앞선 크롭에서 이미 확정되었습니다 ({seen / total:.0%} ≥ "
+                f"{LEDGER_REUSE_RATIO:.0%}). VLM 호출 없이 재사용합니다 — "
+                f"같은 행을 두 번 읽지 않습니다{tail}."
+            )
+        return "\n".join(kept), kept, 0
+
+    if prose:
+        eff_span, eff_stride, eff_overlap = 1, 1, max(1, int(overlap))
+        trust = PROSE_TRUST_CONF
+    else:
+        eff_span = max(1, int(span))
+        eff_stride = max(1, int(stride))
+        eff_overlap = max(0, int(overlap))
+        trust = float(OCR_TRUST_CONF)
+
     calls = {"n": 0}
 
     def _reader(win_img: Image.Image, start: int, end: int) -> str:
@@ -936,23 +1355,60 @@ def read_by_lines(
         except Exception:
             return ""
 
-    ocr_fn = None
-    if ocr is not None and getattr(ocr, "available", False):
-        if hasattr(ocr, "recognize_lines"):
-            def ocr_fn(crops):
-                return ocr.recognize_lines(crops)
-
     merged, lines, windows = read_lines(
         cropped, _reader, boxes=local,
-        span=span, stride=stride, overlap=overlap,
-        ocr_fn=ocr_fn, log=log,
+        span=eff_span, stride=eff_stride, overlap=eff_overlap,
+        ocr_fn=ocr_fn, trust_conf=trust, log=log,
     )
+
+    changed = sum(
+        1 for l in lines
+        if str(getattr(l, "source", "")) == "vlm-override"
+    )
+    vlm_rows = sum(
+        1 for l in lines
+        if l.text and str(getattr(l, "source", "")) not in
+        ("ocr-only", "ocr-trusted")
+    )
+
+    _LINE_READ_DEAD["calls"] += int(calls["n"])
+    _LINE_READ_DEAD["changed"] += int(changed)
+
+    stored = _ledger_store(
+        [_global(l.bbox) for l in lines],
+        [l.text for l in lines],
+    )
+
+    if calls["n"] > 0 and changed == 0 and not prose:
+        _LINE_READ_DEAD["strikes"] += 1
+        if log is not None:
+            log.append(
+                f"    ⚠ [LINE READ] '{category}' VLM 호출 {calls['n']}회가 "
+                f"전용 인식기 결과를 한 글자도 바꾸지 못했습니다 "
+                f"({_LINE_READ_DEAD['strikes']}/{LINE_READ_DEAD_CROPS}회 "
+                f"연속)."
+            )
+        if _LINE_READ_DEAD["strikes"] >= LINE_READ_DEAD_CROPS:
+            _LINE_READ_DEAD["off"] = True
+            if log is not None:
+                log.append(
+                    f"    ⛔ [LINE READ OFF] 누적 VLM 호출 "
+                    f"{_LINE_READ_DEAD['calls']}회 / 실제 교정 "
+                    f"{_LINE_READ_DEAD['changed']}행. 남은 크롭에서는 행 "
+                    f"판독을 중단합니다 — 품질 손실 없이 호출을 전량 "
+                    f"절약합니다."
+                )
+    elif changed > 0:
+        _LINE_READ_DEAD["strikes"] = 0
 
     if log is not None:
         src = "VLM + 전용 인식기" if ocr_fn is not None else "VLM 단독"
+        tag = "산문" if prose else "서식"
+        tail = f" | 원장 적재 {stored}행" if stored else ""
         log.append(
             f"    🔁 [LINE READ] '{category}' VLM 호출 {calls['n']}회 "
-            f"({src}) — 한 번에 긴 문장을 읽지 않고 행 단위로 끊었습니다."
+            f"({src} / {tag} 모드) — VLM 참여 {vlm_rows}행 / 실제 교정 "
+            f"{changed}행{tail}"
         )
 
     return merged, [l.text for l in lines if l.text], len(windows)
@@ -963,6 +1419,74 @@ TABLE_COL_TOLERANCE = 0.55
 TABLE_ROW_TOLERANCE = 0.70
 TABLE_HEADER_MERGE_BANDS = 2
 TABLE_HEADER_X_OVERLAP = 0.45
+
+
+def reconcile_claims(
+    fields: Sequence[ExtractedField],
+    proposals: Sequence[Tuple[float, int, str, str, str]],
+    schema: Optional[dict],
+    log: Optional[List[str]] = None,
+) -> None:
+    if not proposals or not fields:
+        return
+
+    owner = _field_category_map(schema)
+    ranked = sorted(proposals, key=lambda p: (-float(p[0]), int(p[1])))
+
+    final: Dict[str, Tuple[str, float, str]] = {}
+    value_owner: Dict[str, Tuple[str, float]] = {}
+    dropped_field = 0
+    dropped_value = 0
+
+    for score, order, category, field, value in ranked:
+        vkey = _norm_text(value)
+        if field in final:
+            dropped_field += 1
+            continue
+        held = value_owner.get(vkey) if vkey else None
+        if held is not None and held[0] != field:
+            dropped_value += 1
+            continue
+        final[str(field)] = (str(value), float(score), str(category))
+        if vkey:
+            value_owner[vkey] = (str(field), float(score))
+
+    by_cat: Dict[str, ExtractedField] = {}
+    for f in fields:
+        by_cat.setdefault(str(f.category), f)
+
+    for f in fields:
+        f.field_values = {}
+        f.donations = {}
+
+    orphan: Dict[str, Tuple[str, float]] = {}
+    for field, payload in final.items():
+        value, score, _cat = payload
+        home = str(owner.get(field, ""))
+        target = by_cat.get(home)
+        if target is not None:
+            target.field_values[field] = value
+            continue
+        orphan[field] = (value, float(score))
+
+    if orphan:
+        fields[0].donations = orphan
+
+    if log is not None:
+        log.append(
+            f"  🧮 [GLOBAL CLAIM] 크롭 {len(fields)}개가 제안한 "
+            f"{len(proposals)}건을 전역 배타 배정했습니다 — 확정 "
+            f"{len(final)}건 | 필드 선점 탈락 {dropped_field}건 "
+            f"| 값 선점 탈락 {dropped_value}건 | 소유 크롭 없음 "
+            f"{len(orphan)}건"
+        )
+        for field, payload in sorted(
+            final.items(), key=lambda kv: -kv[1][1]
+        )[:16]:
+            log.append(
+                f"     · {field} = {str(payload[0])[:36]} "
+                f"(점수 {float(payload[1]):.2f} / 출처 '{payload[2]}')"
+            )
 
 
 def build_table_rows(
@@ -1184,11 +1708,31 @@ def extract_from_crops(
     line_read_fn: Optional[Callable] = None,
     schema: Optional[dict] = None,
 ) -> List[ExtractedField]:
+    OCR_MEMO_MAX = 24
+
     out: List[ExtractedField] = []
     arrays = set(array_categories or ())
     tboxes = list(text_boxes or [])
     ocr_memo: Dict[Tuple[int, int, int, int], Tuple[str, float, str, int]] = {}
-    donation_pool: Dict[str, Tuple[str, float]] = {}
+    proposals: List[Tuple[float, int, str, str, str]] = []
+
+    def _guard_memo() -> None:
+        if len(ocr_memo) <= OCR_MEMO_MAX:
+            return
+        for key in list(ocr_memo.keys())[: len(ocr_memo) - OCR_MEMO_MAX]:
+            ocr_memo.pop(key, None)
+        if log is not None:
+            log.append(
+                f"    🧹 [OCR MEMO] 재사용 캐시를 {OCR_MEMO_MAX}건으로 "
+                f"잘라 RAM 을 되돌립니다. 정확도에는 영향이 없습니다."
+            )
+    doc_code = str(
+        (schema or {}).get("code") or (schema or {}).get("doc_type") or ""
+    )
+    seq = 0
+    reset_line_read_health()
+    reset_refine_health()
+    reset_read_mode()
 
     for plan in plans:
         if log is not None:
@@ -1213,6 +1757,10 @@ def extract_from_crops(
                 text_boxes=tboxes,
             )
             ocr_memo[tuple(plan.bbox)] = (text, factor, mode, tiles, crop_rows)
+            _guard_memo()
+
+        decide_read_mode(crop_rows, schema, log=log)
+        active_refine = None if _REFINE_HEALTH["off"] else refine_fn
 
         cleaned, nlp_meta = nlp_clean_ocr(text, nlp=nlp, log=log)
         if nlp_meta["dropped"] and log is not None:
@@ -1253,7 +1801,7 @@ def extract_from_crops(
         values: Dict[str, str] = {}
         rows_out: List[dict] = []
 
-        if refine_fn is not None:
+        if active_refine is not None:
             vlm_crop = crop
             if vlm_crop is None:
                 vlm_crop = crop_region(image, plan.bbox)
@@ -1262,12 +1810,12 @@ def extract_from_crops(
             except Exception:
                 pass
             try:
-                refined = refine_fn(
+                refined = active_refine(
                     plan.category, cleaned, vlm_crop, plan.top_field
                 ) or {}
             except TypeError:
                 try:
-                    refined = refine_fn(plan.category, cleaned, vlm_crop) or {}
+                    refined = active_refine(plan.category, cleaned, vlm_crop) or {}
                 except Exception as e:
                     if log is not None:
                         log.append(f"    ⚠ 정제 추출 실패: {e}")
@@ -1294,19 +1842,30 @@ def extract_from_crops(
                 if isinstance(rowset, list):
                     rows_out = [r for r in rowset if isinstance(r, dict) and r]
 
+            gained = len(values) + len(rows_out)
+            if isinstance(raw_alt, str) and raw_alt.strip():
+                gained += 1
+            _note_refine(gained, plan.category, log=log)
+
         donated: Dict[str, Tuple[str, float]] = {}
-        if refine_fn is None and not values and not rows_out:
+        if active_refine is None and not values and not rows_out:
             paired, donated = promote_by_labels(
-                cleaned, schema, plan.category, log=log, rows=crop_rows
+                cleaned, schema, plan.category, log=log, rows=crop_rows,
+                doc_code=doc_code,
             )
-            if paired:
-                values.update(paired)
+            for pname, ppayload in paired.items():
+                values[pname] = str(ppayload[0])
+                seq += 1
+                proposals.append((
+                    float(ppayload[1]), seq, str(plan.category),
+                    str(pname), str(ppayload[0]),
+                ))
             for dname, dpayload in donated.items():
-                prev = donation_pool.get(dname)
-                if prev is None or float(dpayload[1]) > float(prev[1]):
-                    donation_pool[dname] = (
-                        str(dpayload[0]), float(dpayload[1])
-                    )
+                seq += 1
+                proposals.append((
+                    float(dpayload[1]), seq, str(plan.category),
+                    str(dname), str(dpayload[0]),
+                ))
 
         is_twin = str(getattr(plan, "source", "")).startswith("twin-of:")
 
@@ -1317,7 +1876,7 @@ def extract_from_crops(
                     f"    ⛔ [TWIN SKIP] '{plan.category}' 는 '{owner}' 와 "
                     f"좌표가 같아 배열을 만들지 않습니다."
                 )
-        elif refine_fn is None and plan.category in arrays and not rows_out:
+        elif active_refine is None and plan.category in arrays and not rows_out:
             table = build_table_rows(
                 crop_rows, schema, plan.category, log=log
             )
@@ -1330,7 +1889,7 @@ def extract_from_crops(
                     f"어느 컬럼인지 알 수 없습니다."
                 )
 
-        if refine_fn is None and plan.category not in arrays and not values:
+        if active_refine is None and plan.category not in arrays and not values:
             if log is not None:
                 log.append(
                     f"    ⚪ [OCR ONLY] '{plan.category}' 에서 라벨↔값 쌍을 "
@@ -1370,19 +1929,8 @@ def extract_from_crops(
                 preview = field.value[:60].replace("\n", " / ")
                 log.append(f"    📝 '{plan.category}' = {preview or '(공백)'}")
 
-    if log is not None and donation_pool:
-        log.append(
-            f"  🎁 [FIELD DONATION] 크롭 경계를 넘어 발견된 필드 "
-            f"{len(donation_pool)}건을 공용 풀에 모았습니다. 소유 카테고리 "
-            f"크롭이 그 값을 못 봤을 때 레코드 조립 단계에서 채웁니다."
-        )
-        for dname, dpayload in sorted(
-            donation_pool.items(), key=lambda kv: -kv[1][1]
-        )[:10]:
-            log.append(
-                f"     · {dname} = {str(dpayload[0])[:36]} "
-                f"(사전 코사인 {float(dpayload[1]):.2f})"
-            )
+    if proposals:
+        reconcile_claims(out, proposals, schema, log=log)
 
     return out
 
