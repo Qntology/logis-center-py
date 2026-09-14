@@ -1751,6 +1751,35 @@ class NMSOcrApp:
         return max(self.REFINER_EST_GB_FP16, disk_gb * 1.15), "offload"
 
     COMMIT_COST_PATH = BASE_DIR / "output" / "commit_cost.json"
+    REFINER_ATTEMPT_PATH = BASE_DIR / "output" / "refiner_attempt.json"
+
+    def _attempt_read(self) -> Dict[str, object]:
+        try:
+            with open(self.REFINER_ATTEMPT_PATH, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            return raw if isinstance(raw, dict) else {}
+        except Exception:
+            return {}
+
+    def _attempt_mark(self, label: str, budget: float, commit: float) -> None:
+        try:
+            self.REFINER_ATTEMPT_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.REFINER_ATTEMPT_PATH, "w", encoding="utf-8") as f:
+                json.dump({
+                    "label": str(label),
+                    "vram_budget_gb": round(float(budget), 2),
+                    "commit_free_gb": round(float(commit), 2),
+                    "at": int(time.time()),
+                }, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+    def _attempt_clear(self) -> None:
+        try:
+            if self.REFINER_ATTEMPT_PATH.exists():
+                self.REFINER_ATTEMPT_PATH.unlink()
+        except Exception:
+            pass
 
     def _commit_cost_load(self) -> Dict[str, float]:
         cache = getattr(self, "_commit_cost", None)
@@ -1794,6 +1823,41 @@ class NMSOcrApp:
         need = float(getattr(self, "_refiner_stage_gb", 0.0))
         floor = memory_mod.abort_floor_gb()
 
+        prev = self._attempt_read()
+        if prev:
+            self._attempt_clear()
+            prev_budget = float(prev.get("vram_budget_gb", 0.0) or 0.0)
+            self._log(
+                f"  💀 [CRASH MARK] 지난 실행에서 '{prev.get('label', label)}' 를 "
+                f"VRAM 상한 {prev_budget:.2f} GB / 커밋 여유 "
+                f"{prev.get('commit_free_gb', '?')} GB 로 적재하다가 프로세스가 "
+                f"파이썬 예외 없이 죽었습니다. 흔적 파일이 지워지지 않은 것이 "
+                f"그 증거입니다 — 예외였다면 트레이스백과 RAM GUARD 종료 줄이 "
+                f"남았을 것입니다."
+            )
+
+            nxt = prev_budget * self.VRAM_CRASH_BACKOFF
+            if prev_budget <= 0.0 or nxt < self.VRAM_GIVEUP_GB:
+                self._log(
+                    f"     한 단계 더 낮추면 {max(0.0, nxt):.2f} GB 로 모델이 "
+                    f"들어갈 수 없는 크기가 됩니다. 이번 실행은 정제 LLM 을 "
+                    f"쓰지 않고 OCR 원문 + 다국어 사전 코사인 경로로만 "
+                    f"진행합니다. 가상 메모리를 늘리거나 VRAM 을 점유한 "
+                    f"프로그램을 닫은 뒤 다시 실행하면 자동으로 복귀합니다 "
+                    f"(흔적 파일: {self.REFINER_ATTEMPT_PATH})."
+                )
+                self.crossover.slots.pop(SLOT_REFINER, None)
+                return None
+
+            self._refiner_vram_ceiling = float(nxt)
+            self._log(
+                f"     같은 상한으로 또 죽지 않도록 이번 실행은 예산을 "
+                f"{prev_budget:.2f} → {nxt:.2f} GB 로 낮춰 한 번 더 시도합니다. "
+                f"이 값으로 모델이 GPU 에 다 안 들어가면 accelerate 가 디스크로 "
+                f"넘기고, 4bit 는 디스크 배치를 지원하지 않아 ValueError 로 "
+                f"깨끗이 실패합니다 — 즉사 대신 잡을 수 있는 예외가 됩니다."
+            )
+
         memory_mod.reclaim(
             log=self._log, label=f"{label} 적재 전 커밋 확보", rounds=3
         )
@@ -1802,35 +1866,90 @@ class NMSOcrApp:
 
         if need > 0.0 and before < need + floor:
             self._log(
-                f"  ⛔ [COMMIT GATE] '{label}' 적재를 취소합니다 — 커밋 여유 "
-                f"{before:.2f} GB < 필요 {need:.1f} GB + 종료 임계 "
-                f"{floor:.2f} GB."
+                f"  ⚠️ [COMMIT GATE] '{label}' 적재에 커밋 여유 "
+                f"{need:.1f} GB + 종료 임계 {floor:.2f} GB 를 권장하는데 "
+                f"현재 {before:.2f} GB 뿐입니다 (물리 가용 {phys:.1f} GB)."
             )
             self._log(
-                f"     물리 가용은 {phys:.1f} GB 로 남아 있습니다. 작업 "
-                f"관리자의 메모리 그래프에 피크가 보이지 않는 이유가 "
-                f"이것입니다 — 고갈되는 것은 물리 RAM 이 아니라 Windows "
-                f"커밋 한도(물리 RAM + 페이지 파일)입니다. 커밋이 바닥나면 "
-                f"파이썬 예외 없이 프로세스가 즉사합니다."
+                f"     고갈되는 것은 물리 RAM 이 아니라 Windows 커밋 "
+                f"한도(물리 RAM + 페이지 파일)입니다. 작업 관리자 → 성능 → "
+                f"메모리 → '커밋됨' 에서 확인할 수 있고, 가상 메모리를 "
+                f"{int(need) + 4} GB 이상으로 늘리면 사라집니다."
+            )
+
+            purged: List[str] = []
+            while True:
+                dropped = self.crossover.release_next(
+                    protect=[SLOT_REFINER, SLOT_OCR]
+                )
+                if not dropped:
+                    break
+                purged.append(dropped)
+
+            if purged:
+                memory_mod.reclaim(
+                    log=self._log, label=f"{label} 적재 전 강제 확보", rounds=3
+                )
+                before = memory_mod.commit_free_gb()
+                self._log(
+                    f"  🧹 [COMMIT GATE] 전용 인식기를 제외한 상주 슬롯 "
+                    f"{len(purged)}개({', '.join(purged)})를 비워 커밋 여유를 "
+                    f"{before:.2f} GB 로 되돌렸습니다."
+                )
+
+            self._log(
+                f"     여기서 포기하지 않고 실제로 한 번 적재해 봅니다 — "
+                f"4bit 양자화는 텐서 단위로 스트리밍되어 요구량이 보수 "
+                f"추정보다 훨씬 작을 수 있고, 커밋이 모자라면 OSError 1455 "
+                f"로 예외가 떠서 아래 재시도 경로가 더 얇은 계획으로 "
+                f"강등시킵니다. 그 재시도까지 실패해야만 OCR 원문 + 다국어 "
+                f"사전 코사인 경로로 내려갑니다."
+            )
+
+        budget = self._live_vram_budget(label)
+        slot = self.crossover.slots.get(SLOT_REFINER)
+        est = float(getattr(slot, "est_gb", 0.0) or 0.0)
+        want = est + self.VRAM_FIT_MARGIN_GB
+
+        if est > 0.0 and budget < want:
+            self._log(
+                f"  ⛔ [VRAM GATE] '{label}' 적재를 취소합니다 — 드라이버 실측 "
+                f"여유 {budget:.2f} GB < 모델 실사용 {est:.1f} GB + 안전 여유 "
+                f"{self.VRAM_FIT_MARGIN_GB:.2f} GB = {want:.2f} GB."
             )
             self._log(
-                f"     확인 방법: 작업 관리자 → 성능 → 메모리 → '커밋됨' "
-                f"항목. 해결: 가상 메모리를 {int(need) + 4} GB 이상으로 "
-                f"늘리거나 다른 프로그램을 닫으십시오. 이번 실행은 OCR "
-                f"원문과 다국어 사전 코사인 경로로만 진행합니다."
+                f"     이 상태로 밀어붙이면 accelerate 가 상한을 "
+                f"{max(0.6, (budget - 0.9)):.1f} GiB 로 잡고 적재를 시작하는데, "
+                f"CUDA 컨텍스트와 양자화 워크스페이스가 더해지는 순간 드라이버 "
+                f"여유를 넘깁니다. WDDM 은 그때 에러를 내지 않고 초과분을 공유 "
+                f"시스템 메모리로 흘리고, 그게 커밋을 먹어 프로세스가 파이썬 "
+                f"예외 없이 즉사합니다 — 실제로 지난 실행이 이 자리에서 "
+                f"'Loading weights 0/723' 를 찍고 죽었습니다."
+            )
+            self._log(
+                f"     VRAM 을 비우려면 브라우저·원격 디버깅 창을 닫고 "
+                f"(--no-devtools 로 실행하면 렌더러가 뜨지 않습니다) 다시 "
+                f"시도하십시오. 이번 실행은 OCR 원문 + 다국어 사전 코사인 "
+                f"경로로 진행합니다."
             )
             self.crossover.slots.pop(SLOT_REFINER, None)
             return None
 
+        self._refiner_budget_gb = float(budget)
+        self._attempt_mark(label, budget, before)
+
         try:
             obj = self.crossover.acquire(SLOT_REFINER, protect=[SLOT_OCR])
         except Exception as e:
+            self._attempt_clear()
             self._log(
                 f"  ⏭ [REFINER SKIP] '{label}' 적재 실패 "
                 f"({type(e).__name__}: {e}) — OCR 원문으로 진행합니다."
             )
             self.crossover.slots.pop(SLOT_REFINER, None)
             return None
+
+        self._attempt_clear()
 
         after = memory_mod.commit_free_gb()
         spent = max(0.0, before - after)
@@ -1843,6 +1962,56 @@ class NMSOcrApp:
             )
         return obj
 
+    VRAM_LIVE_FLOOR_GB = 1.2
+    VRAM_FIT_MARGIN_GB = 0.35
+    VRAM_CRASH_BACKOFF = 0.75
+    VRAM_GIVEUP_GB = 1.7
+
+    def _live_vram_budget(self, label: str = "", quiet: bool = False) -> float:
+        info = get_vram_info()
+        if not info.get("available"):
+            return self.vram_budget
+
+        total = float(info.get("total_gb", 0.0) or 0.0)
+        driver = float(info.get("driver_free_gb", 0.0) or 0.0)
+        torch_free = float(info.get("torch_free_gb", 0.0) or 0.0)
+
+        if driver <= 0.0:
+            if not quiet:
+                self._log(
+                    f"  ⏭ [VRAM LIVE] {label or '정제 LLM'} — 드라이버 실측을 "
+                    f"쓸 수 없어 시작 시 총량 {self.vram_budget:.1f} GB 를 "
+                    f"그대로 씁니다."
+                )
+            return self.vram_budget
+
+        live = max(self.VRAM_LIVE_FLOOR_GB, min(driver, torch_free))
+
+        ceiling = float(getattr(self, "_refiner_vram_ceiling", 0.0) or 0.0)
+        if ceiling > 0.0 and ceiling < live:
+            if not quiet:
+                self._log(
+                    f"  🪫 [VRAM BACKOFF] 지난 실행이 이 모델을 적재하다 "
+                    f"죽었으므로 예산 상한을 {live:.2f} → {ceiling:.2f} GB 로 "
+                    f"낮춥니다. 더 얇게 잡으면 accelerate 가 디스크로 넘기고, "
+                    f"4bit 는 디스크 배치를 지원하지 않아 ValueError 로 "
+                    f"깨끗이 실패합니다 — 네이티브 즉사 대신 잡을 수 있는 "
+                    f"예외로 바뀝니다."
+                )
+            live = ceiling
+
+        if not quiet:
+            self._log(
+                f"  📏 [VRAM LIVE] {label or '정제 LLM'} 예산을 적재 직전 "
+                f"실측으로 다시 잡습니다 — 드라이버 여유 {driver:.2f} GB / "
+                f"torch 관점 {torch_free:.2f} GB → {live:.2f} GB (시작 시 "
+                f"총량 {total:.1f} GB 를 그대로 쓰면 데스크톱과 다른 프로세스가 "
+                f"점유한 VRAM 을 빼지 않아, 상한을 넘긴 만큼 WDDM 이 공유 시스템 "
+                f"메모리로 흘리고 그 순간 커밋이 터져 프로세스가 예외 없이 "
+                f"즉사합니다)"
+            )
+        return live
+
     def _ensure_refiner_slot(self) -> bool:
         if SLOT_REFINER in self.crossover.slots:
             return True
@@ -1854,10 +2023,14 @@ class NMSOcrApp:
             return False
 
         low = self.low_vram
-        budget = self.vram_budget
 
         def _load_refiner():
             memory_mod.reclaim(log=self._log, label="정제 LLM 적재 전")
+            budget = float(getattr(self, "_refiner_budget_gb", 0.0) or 0.0)
+            if budget <= 0.0:
+                budget = self._live_vram_budget(ref_label)
+            else:
+                budget = min(budget, self._live_vram_budget(ref_label, quiet=True))
             return RefinerLLM(
                 ref_path,
                 label=ref_label,
@@ -1895,7 +2068,7 @@ class NMSOcrApp:
 
         self.crossover.register(
             SLOT_REFINER, _load_refiner, label=ref_label,
-            est_gb=est, stage_gb=stage,
+            est_gb=est, stage_gb=stage, lazy=True,
         )
         self._log(
             f"  ⏳ [{ref_label}] 정제 LLM 지연 로드 예약 — 적재 방식 "

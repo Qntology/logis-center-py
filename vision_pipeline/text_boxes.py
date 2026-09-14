@@ -11,6 +11,8 @@ DILATE_Y = 1
 MERGE_GAP_X = 12
 MERGE_GAP_Y = 4
 
+TIGHTEN_PAD_SPAN_RATIO = 0.25
+
 
 def _binarize(image: Image.Image) -> np.ndarray:
     gray = np.asarray(image.convert("L"), dtype=np.float32)
@@ -210,19 +212,39 @@ def box_tighten(
     if not hits:
         return None
 
-    px = int(round(float(pad_x)))
-    py = int(round(float(pad_y)))
     rx0, ry0, rx1, ry1 = (int(v) for v in region)
+    span_x = max(1, rx1 - rx0)
+    span_y = max(1, ry1 - ry0)
 
-    tx0 = min(b[0] for b in hits) - px
-    ty0 = min(b[1] for b in hits) - py
-    tx1 = max(b[2] for b in hits) + px
-    ty1 = max(b[3] for b in hits) + py
+    px = int(round(min(float(pad_x), span_x * TIGHTEN_PAD_SPAN_RATIO)))
+    py = int(round(min(float(pad_y), span_y * TIGHTEN_PAD_SPAN_RATIO)))
 
-    nx0 = max(rx0 - px, tx0)
-    ny0 = max(ry0 - py, ty0)
-    nx1 = min(rx1 + px, tx1)
-    ny1 = min(ry1 + py, ty1)
+    cx0 = min(b[0] for b in hits)
+    cy0 = min(b[1] for b in hits)
+    cx1 = max(b[2] for b in hits)
+    cy1 = max(b[3] for b in hits)
+
+    nx0 = max(rx0 - px, cx0 - px)
+    ny0 = max(ry0 - py, cy0 - py)
+    nx1 = min(rx1 + px, cx1 + px)
+    ny1 = min(ry1 + py, cy1 + py)
+
+    nx0 = min(nx0, cx0)
+    ny0 = min(ny0, cy0)
+    nx1 = max(nx1, cx1)
+    ny1 = max(ny1, cy1)
+
+    ux0 = min(rx0, cx0)
+    uy0 = min(ry0, cy0)
+    ux1 = max(rx1, cx1)
+    uy1 = max(ry1, cy1)
+
+    base_area = float(max(1, ux1 - ux0) * max(1, uy1 - uy0))
+    if float(max(1, nx1 - nx0) * max(1, ny1 - ny0)) > base_area:
+        nx0 = max(nx0, ux0)
+        ny0 = max(ny0, uy0)
+        nx1 = min(nx1, ux1)
+        ny1 = min(ny1, uy1)
 
     if bounds is not None:
         nx0 = max(0, nx0)
@@ -232,6 +254,7 @@ def box_tighten(
 
     if nx1 <= nx0 + 1 or ny1 <= ny0 + 1:
         return None
+
     return (int(nx0), int(ny0), int(nx1), int(ny1))
 
 

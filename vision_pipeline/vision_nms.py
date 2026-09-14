@@ -716,6 +716,52 @@ def plan_crops(
         )
         return fitted if fitted is not None else px
 
+    has_legibility = (
+        legibility is not None and int(getattr(legibility, "size", 0)) == n
+    )
+
+    def _region_ink(
+        gb: Tuple[int, int, int, int],
+        px_box: Tuple[int, int, int, int],
+    ) -> Tuple[int, int, int]:
+        cells = [i for i in _box_patches(gb, cols) if i < n]
+        inked_n = sum(1 for i in cells if bool(content_ok[i]))
+
+        legible_n = -1
+        if has_legibility:
+            legible_n = sum(
+                1 for i in cells if bool(legibility.legible[i])
+            )
+
+        boxed_n = 0
+        if text_boxes:
+            bx0, by0, bx1, by1 = (int(v) for v in px_box)
+            boxed_n = sum(
+                1 for b in text_boxes
+                if b[0] < bx1 and b[2] > bx0 and b[1] < by1 and b[3] > by0
+            )
+        return boxed_n, legible_n, inked_n
+
+    def _region_blank(
+        gb: Tuple[int, int, int, int],
+        px_box: Tuple[int, int, int, int],
+    ) -> Tuple[bool, int, int, int]:
+        boxed_n, legible_n, inked_n = _region_ink(gb, px_box)
+        if boxed_n > 0:
+            return False, boxed_n, legible_n, inked_n
+        if legible_n >= 0:
+            return legible_n <= 0, boxed_n, legible_n, inked_n
+        return inked_n <= 0, boxed_n, legible_n, inked_n
+
+    if log is not None:
+        log.append(
+            f"  🧪 [BLANK GATE] 후보 영역 판정 기준을 STEP 4 의 "
+            f"EMPTY CROP SKIP 과 일치시킵니다 — 교차 검출 박스 0개 이고 "
+            f"{'판독 가능 패치' if has_legibility else '잉크 패치'} 0개면 "
+            f"크롭을 만들지 않습니다. content_ok 는 판독불가 잉크까지 "
+            f"포함하므로 plan 단계에서만 통과시키는 원인이었습니다."
+        )
+
     if log is not None:
         log.append(
             f"  📊 [PLAN_CROPS INPUT] 히트맵 {len(heatmaps)}개 "
@@ -962,24 +1008,24 @@ def plan_crops(
             cand.bbox, grid.orig_width, grid.orig_height, min_w, min_h
         )
 
-        if text_boxes:
-            from .text_boxes import boxes_in_region
-            if not boxes_in_region(text_boxes, cand.bbox):
-                cells = [i for i in _box_patches(cand.grid_box, cols) if i < n]
-                inked = sum(1 for i in cells if bool(content_ok[i]))
-                if inked <= 0:
-                    empty_skipped[cand.category] = (
-                        empty_skipped.get(cand.category, 0) + 1
-                    )
-                    if log is not None:
-                        log.append(
-                            f"    ⛔ [EMPTY REGION SKIP] '{cand.category}' 후보 "
-                            f"grid{cand.grid_box} px{cand.bbox} 안에 검출된 "
-                            f"글자도 잉크 패치도 없습니다. 히트맵 봉우리가 "
-                            f"여백에 찍힌 것이므로 다음 후보 영역으로 "
-                            f"넘어갑니다."
-                        )
-                    continue
+        blank, boxed_n, legible_n, inked_n = _region_blank(
+            cand.grid_box, cand.bbox
+        )
+        if blank:
+            empty_skipped[cand.category] = (
+                empty_skipped.get(cand.category, 0) + 1
+            )
+            if log is not None:
+                log.append(
+                    f"    ⛔ [EMPTY REGION SKIP] '{cand.category}' 후보 "
+                    f"grid{cand.grid_box} px{cand.bbox} — 교차 검출 박스 "
+                    f"{boxed_n}개 / 판독 가능 패치 {max(0, legible_n)}개 "
+                    f"/ 잉크 패치 {inked_n}개. 히트맵 봉우리가 여백이나 "
+                    f"판독불가 얼룩에 찍힌 것이므로 다음 후보 영역으로 "
+                    f"넘어갑니다 — 빈 크롭을 VLM 에 보내면 빈 사고 블록이 "
+                    f"돌아와 남은 전체 크롭의 토큰 예산이 3배로 뜁니다."
+                )
+            continue
 
         hit: Optional[CropPlan] = None
         hit_iou = 0.0
@@ -993,6 +1039,23 @@ def plan_crops(
                 break
 
         if hit is not None:
+            if hit.category != cand.category:
+                cand.source = f"twin-of:{hit.category}"
+                winners.append(cand)
+                taken_categories.add(cand.category)
+                if log is not None:
+                    log.append(
+                        f"  👯 [TWIN KEEP] '{cand.category}' 와 "
+                        f"'{hit.category}' 의 좌표가 IoU {hit_iou:.2f} 로 "
+                        f"겹칩니다. 서로 다른 축이므로 흡수하지 않고 같은 "
+                        f"좌표를 공유한 채 남깁니다 — 흡수하면 스키마 "
+                        f"카테고리 하나가 통째로 사라지고, 뒤이은 SPLIT 이 "
+                        f"거의 같은 자리에 크롭을 다시 만들어 같은 그림을 "
+                        f"두 번 보내게 됩니다."
+                    )
+                _emit(cand)
+                continue
+
             hit.absorbed.append({
                 "category": cand.category,
                 "score": round(cand.score, 4),
@@ -1004,7 +1067,7 @@ def plan_crops(
             if log is not None:
                 log.append(
                     f"  🚫 IoU 억제 '{cand.category}' (IoU={hit_iou:.2f}) "
-                    f"→ '{hit.category}' 에 흡수"
+                    f"→ 같은 카테고리의 '{hit.category}' 영역에 흡수"
                 )
             continue
 
@@ -1222,6 +1285,19 @@ def plan_crops(
             grid.region_bbox(*gb),
             grid.orig_width, grid.orig_height, min_w, min_h,
         ))
+
+        blank, boxed_n, legible_n, inked_n = _region_blank(gb, px)
+        if blank:
+            if log is not None:
+                log.append(
+                    f"    ⛔ [RESCUE SKIP] '{h.category}' 구제 크롭 grid{gb} "
+                    f"px{px} 에도 글자가 없습니다 (검출 박스 {boxed_n} / "
+                    f"판독 가능 {max(0, legible_n)} / 잉크 {inked_n}). "
+                    f"최고 봉우리조차 여백에 찍혔다는 뜻이므로 이 축은 이 "
+                    f"문서에 없는 것으로 두고 빈 크롭을 만들지 않습니다."
+                )
+            continue
+
         plan = CropPlan(
             h.category, px, float(h.top_score),
             float(h.top_score), 1, gb, source="rescue",

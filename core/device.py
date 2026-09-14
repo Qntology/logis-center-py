@@ -60,14 +60,28 @@ def get_vram_info() -> dict:
         mem_total = props.total_memory / (1024 ** 3)
         mem_reserved = torch.cuda.memory_reserved(0) / (1024 ** 3)
         mem_allocated = torch.cuda.memory_allocated(0) / (1024 ** 3)
-        mem_free = mem_total - mem_reserved
+        torch_free = mem_total - mem_reserved
+
+        driver_free = 0.0
+        try:
+            free_b, _total_b = torch.cuda.mem_get_info(0)
+            driver_free = float(free_b) / (1024 ** 3)
+        except Exception:
+            driver_free = 0.0
+
+        effective = torch_free if driver_free <= 0.0 else min(
+            torch_free, driver_free
+        )
+
         return {
             "available": True,
             "name": props.name,
             "total_gb": round(mem_total, 2),
             "reserved_gb": round(mem_reserved, 2),
             "allocated_gb": round(mem_allocated, 2),
-            "free_gb": round(mem_free, 2),
+            "torch_free_gb": round(torch_free, 2),
+            "driver_free_gb": round(driver_free, 2),
+            "free_gb": round(effective, 2),
         }
     except Exception:
         return {"available": False}

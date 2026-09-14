@@ -342,6 +342,7 @@ class RefinerLLM:
         self._vision_marker_logged = False
         self.thinking = False
         self._think_probed = False
+        self._think_empty_noted = False
         self._no_think_kwarg = None
         self._json_marker_logged = False
 
@@ -816,12 +817,28 @@ class RefinerLLM:
             pass
 
     @staticmethod
+    def think_body(text: str) -> str:
+        s = str(text or "")
+        if "<think>" not in s:
+            return ""
+        tail = s.split("<think>", 1)[1]
+        if "</think>" in tail:
+            tail = tail.split("</think>", 1)[0]
+        return tail
+
+    @staticmethod
+    def think_filled(text: str) -> int:
+        return len("".join(str(RefinerLLM.think_body(text)).split()))
+
+    @staticmethod
     def looks_reasoning(text: str) -> bool:
         s = str(text or "").strip().lower()
         if not s:
             return False
         if "<think>" in s:
-            return True
+            if RefinerLLM.think_filled(s) > 0:
+                return True
+            return False
         for opener in REASONING_OPENERS:
             if s.startswith(opener):
                 return True
@@ -830,12 +847,27 @@ class RefinerLLM:
     def note_thinking(self, sample: str = "") -> None:
         if self.thinking:
             return
+
+        raw = str(sample or "")
+        if "<think>" in raw and self.think_filled(raw) <= 0:
+            if not self._think_empty_noted:
+                self._think_empty_noted = True
+                self._log(
+                    f"  ✅ [{self.label}] 사고 블록이 비어 있습니다 "
+                    f"({raw.strip()[:24]!r}) — enable_thinking 끄기가 정상 "
+                    f"작동했다는 증거이지 사고형 모델의 증거가 아닙니다. "
+                    f"토큰 예산을 올리지 않습니다."
+                )
+            return
+
         if not self.looks_reasoning(sample):
             return
+
         self.thinking = True
         self._log(
             f"  🧠 [{self.label}] 사고형(thinking) 모델로 판정했습니다 "
-            f"(응답이 '{str(sample).strip()[:28]}' 로 시작). 토큰 예산을 "
+            f"(사고 블록에 {self.think_filled(raw)}자가 실제로 들어 "
+            f"있습니다). 토큰 예산을 "
             f"{THINK_BUDGET_MULTIPLIER:.0f}배로 늘리고, 가능하면 사고 "
             f"단계를 끕니다."
         )

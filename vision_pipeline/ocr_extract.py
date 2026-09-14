@@ -274,6 +274,20 @@ LABEL_COSINE_FLOOR = 0.42
 LABEL_COSINE_MARGIN = 0.05
 LABEL_CANDIDATE_TOPK = 3
 
+LABEL_SHORT_LEN = 9
+LABEL_SHORT_FLOOR = 0.80
+
+
+def label_cosine_floor(label: str) -> float:
+    n = len(_compact_label(label))
+    if n >= LABEL_SHORT_LEN:
+        return LABEL_COSINE_FLOOR
+    if n <= LABEL_EXACT_MIN_LEN:
+        return LABEL_SHORT_FLOOR
+    span = float(LABEL_SHORT_LEN - LABEL_EXACT_MIN_LEN)
+    ratio = (float(n) - LABEL_EXACT_MIN_LEN) / max(1.0, span)
+    return LABEL_SHORT_FLOOR - (LABEL_SHORT_FLOOR - LABEL_COSINE_FLOOR) * ratio
+
 LABEL_SOURCE_WEIGHT: Dict[str, float] = {
     "label": 1.30,
     "name": 1.15,
@@ -688,12 +702,13 @@ def rank_label_fields(
     if len(_compact_label(label)) < LABEL_EXACT_MIN_LEN:
         return []
 
+    floor = label_cosine_floor(label)
     ranked = sorted(
         index.scores(label).items(), key=lambda kv: kv[1], reverse=True
     )
     passed = [
         (str(f), float(s)) for f, s in ranked
-        if float(s) >= LABEL_COSINE_FLOOR
+        if float(s) >= floor
     ]
     return passed[: max(1, int(top_k))]
 
@@ -715,7 +730,16 @@ def score_label_to_field(
     if score >= 1.0:
         return field, score, rival, rival_score
 
-    if score < LABEL_COSINE_FLOOR:
+    floor = label_cosine_floor(label)
+    if score < floor:
+        if log is not None and score >= LABEL_COSINE_FLOOR:
+            log.append(
+                f"       🚧 라벨 '{label[:16]}' 은 압축 {len(_compact_label(label))}자로 "
+                f"짧아 n-gram 이 몇 개뿐입니다. 코사인 {score:.2f} 는 긴 라벨 "
+                f"기준 {LABEL_COSINE_FLOOR:.2f} 는 넘지만 이 길이의 요구 "
+                f"바닥 {floor:.2f} 에 못 미쳐 배정하지 않습니다 — 크롭이 "
+                f"잘려 라벨 앞머리만 남은 경우입니다."
+            )
         return "", score, rival, rival_score
 
     if rival and (score - rival_score) < LABEL_COSINE_MARGIN:
@@ -949,6 +973,128 @@ def promote_by_labels(
             )
 
     return own, donated
+
+
+PROSE_CLAIM_SCORE = 0.45
+PROSE_MAX_LINES = 12
+PROSE_FIELD_MARGIN = 0.01
+
+
+def pick_prose_field(
+    text: str,
+    schema: Optional[dict],
+    category: str,
+    fallback: str = "",
+    log: Optional[List[str]] = None,
+) -> str:
+    index, _bank = build_label_index(schema, category=category)
+    if not index:
+        return fallback
+
+    ranked = sorted(
+        index.scores(text).items(), key=lambda kv: kv[1], reverse=True
+    )
+    if not ranked:
+        return fallback
+
+    top, top_s = str(ranked[0][0]), float(ranked[0][1])
+    second = str(ranked[1][0]) if len(ranked) > 1 else ""
+    second_s = float(ranked[1][1]) if len(ranked) > 1 else 0.0
+
+    if top_s <= 0.0 or (top_s - second_s) < PROSE_FIELD_MARGIN:
+        if log is not None:
+            log.append(
+                f"       ⚖ [PROSE FIELD] '{category}' 판독문을 사전에 걸어도 "
+                f"'{top}'({top_s:.3f}) 와 '{second or '-'}'({second_s:.3f}) 가 "
+                f"실질 동률입니다. 히트맵이 고른 '{fallback or top}' 을 "
+                f"그대로 씁니다."
+            )
+        return fallback or top
+
+    if log is not None:
+        log.append(
+            f"       🎯 [PROSE FIELD] '{category}' 판독문을 다국어 사전에 걸어 "
+            f"'{top}'({top_s:.3f}) 로 결정했습니다 — 차점 '{second or '-'}'"
+            f"({second_s:.3f}). 히트맵 후보는 '{fallback or '-'}' 였습니다."
+        )
+    return top
+
+
+def promote_prose_lines(
+    text: str,
+    schema: Optional[dict],
+    category: str,
+    top_field: str = "",
+    is_array: bool = False,
+    log: Optional[List[str]] = None,
+) -> Tuple[Dict[str, str], List[dict]]:
+    body = str(text or "").strip()
+    if not body or not schema:
+        return {}, []
+
+    lines = [ln.strip() for ln in body.splitlines() if ln.strip()]
+    if not lines:
+        return {}, []
+
+    try:
+        from core.text_prep import is_printed_label
+    except Exception:
+        return {}, []
+
+    _all_index, bank = build_label_index(schema, category="")
+    labelish = sum(1 for ln in lines if is_printed_label(ln, bank))
+    if labelish > 0:
+        if log is not None:
+            log.append(
+                f"    ⏭ [PROSE SKIP] '{category}' 크롭의 {len(lines)}줄 중 "
+                f"{labelish}줄이 스키마의 인쇄 라벨과 일치합니다. 라벨이 섞인 "
+                f"지면에서 줄 전체를 값으로 승격하면 라벨까지 값이 되므로 "
+                f"건너뜁니다."
+            )
+        return {}, []
+
+    kept = [ln for ln in lines if _value_plausible(ln)][:PROSE_MAX_LINES]
+    if not kept:
+        return {}, []
+
+    fields = (schema or {}).get("fields", {}) or {}
+    owner = _field_category_map(schema)
+
+    fallback = str(top_field or "")
+    if fallback not in fields or str(owner.get(fallback, "")) != str(category):
+        fallback = ""
+        for name, cat in owner.items():
+            if str(cat) == str(category):
+                fallback = str(name)
+                break
+    if not fallback:
+        return {}, []
+
+    joined = " ".join(kept)
+    target = pick_prose_field(joined, schema, category, fallback, log=log)
+    if target not in fields or str(owner.get(target, "")) != str(category):
+        target = fallback
+
+    if is_array:
+        rows = [{target: ln} for ln in kept]
+        if log is not None:
+            log.append(
+                f"    📜 [PROSE VALUE] '{category}' 는 인쇄 라벨이 한 줄도 없는 "
+                f"지면입니다. 라벨↔값 쌍을 만들 수 없으므로 판독된 "
+                f"{len(rows)}줄을 그대로 값으로 보고 '{target}' 에 행 단위로 "
+                f"넣습니다."
+            )
+            for r in rows[:4]:
+                log.append(f"       · {target} = {str(r[target])[:40]}")
+        return {}, rows
+
+    if log is not None:
+        log.append(
+            f"    📜 [PROSE VALUE] '{category}' 는 인쇄 라벨이 한 줄도 없는 "
+            f"지면입니다. 판독된 {len(kept)}줄을 '{target}' 의 값으로 "
+            f"승격합니다 — {joined[:40]}"
+        )
+    return {target: joined}, []
 
 
 def _text_similarity(a: str, b: str) -> float:
@@ -1730,6 +1876,7 @@ def extract_from_crops(
         (schema or {}).get("code") or (schema or {}).get("doc_type") or ""
     )
     seq = 0
+    twin_table_failed: set = set()
     reset_line_read_health()
     reset_refine_health()
     reset_read_mode()
@@ -1867,27 +2014,56 @@ def extract_from_crops(
                     str(dname), str(dpayload[0]),
                 ))
 
-        is_twin = str(getattr(plan, "source", "")).startswith("twin-of:")
+        if active_refine is None and not values and not rows_out:
+            prose_vals, prose_rows = promote_prose_lines(
+                cleaned, schema, plan.category,
+                top_field=str(getattr(plan, "top_field", "") or ""),
+                is_array=plan.category in arrays,
+                log=log,
+            )
+            for pname, pval in prose_vals.items():
+                values[pname] = str(pval)
+                seq += 1
+                proposals.append((
+                    PROSE_CLAIM_SCORE, seq, str(plan.category),
+                    str(pname), str(pval),
+                ))
+            if prose_rows:
+                rows_out.extend(prose_rows)
 
-        if is_twin and plan.category in arrays:
+        is_twin = str(getattr(plan, "source", "")).startswith("twin-of:")
+        twin_owner = ""
+        if is_twin:
+            twin_owner = str(plan.source).split(":", 1)[-1]
+        owner_failed = bool(twin_owner) and twin_owner in twin_table_failed
+
+        if is_twin and plan.category in arrays and not owner_failed:
             if log is not None:
-                owner = str(plan.source).split(":", 1)[-1]
                 log.append(
-                    f"    ⛔ [TWIN SKIP] '{plan.category}' 는 '{owner}' 와 "
+                    f"    ⛔ [TWIN SKIP] '{plan.category}' 는 '{twin_owner}' 와 "
                     f"좌표가 같아 배열을 만들지 않습니다."
                 )
         elif active_refine is None and plan.category in arrays and not rows_out:
+            if is_twin and owner_failed and log is not None:
+                log.append(
+                    f"    🔄 [TWIN RETRY] 좌표 소유자 '{twin_owner}' 가 표 "
+                    f"헤더를 찾지 못했으므로 '{plan.category}' 가 대신 "
+                    f"시도합니다 — 같은 표라도 스키마에 그 컬럼을 가진 쪽만 "
+                    f"배열을 만들 수 있습니다."
+                )
             table = build_table_rows(
                 crop_rows, schema, plan.category, log=log
             )
             if table:
                 rows_out.extend(table)
-            elif log is not None:
-                log.append(
-                    f"    ⚪ [TABLE] '{plan.category}' 에서 표 헤더를 찾지 "
-                    f"못해 배열을 만들지 않습니다. 라벨 없는 값 나열은 "
-                    f"어느 컬럼인지 알 수 없습니다."
-                )
+            else:
+                twin_table_failed.add(str(plan.category))
+                if log is not None:
+                    log.append(
+                        f"    ⚪ [TABLE] '{plan.category}' 에서 표 헤더를 찾지 "
+                        f"못해 배열을 만들지 않습니다. 라벨 없는 값 나열은 "
+                        f"어느 컬럼인지 알 수 없습니다."
+                    )
 
         if active_refine is None and plan.category not in arrays and not values:
             if log is not None:
