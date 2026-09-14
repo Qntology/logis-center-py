@@ -176,25 +176,56 @@ if %RAM_GB% GTR 0 if %RAM_GB% LSS 11 (
 
 echo.
 echo ============================================================
-echo   [STEP 6/6] Low-VRAM support (optional)
+echo   [STEP 6/6] Quantization backend (bitsandbytes)
 echo ============================================================
 
-for /f "tokens=*" %%v in ('python -c "import torch;print(int(torch.cuda.get_device_properties(0).total_memory/1024**3)) if torch.cuda.is_available() else print(0)" 2^>nul') do set VRAM_GB=%%v
+for /f "tokens=*" %%v in ('python -c "import torch;print(round(torch.cuda.get_device_properties(0).total_memory/1024**3)) if torch.cuda.is_available() else print(0)" 2^>nul') do set VRAM_GB=%%v
 if "%VRAM_GB%"=="" set VRAM_GB=0
 
-echo [INFO] Detected VRAM: %VRAM_GB% GB
+for /f "tokens=*" %%x in ('python -c "import torch;print(f'{torch.cuda.get_device_properties(0).total_memory/1024**3:.1f}') if torch.cuda.is_available() else print('0.0')" 2^>nul') do set VRAM_EXACT=%%x
+if "%VRAM_EXACT%"=="" set VRAM_EXACT=0.0
 
-if %VRAM_GB% GTR 0 if %VRAM_GB% LSS 6 (
-    echo [INFO] Low VRAM detected. Installing bitsandbytes for 4-bit quantization...
-    pip install bitsandbytes >nul 2>&1
-    if !errorlevel! equ 0 (
-        echo   [OK] bitsandbytes installed. 2B LLM will run in 4-bit.
-    ) else (
-        echo   [SKIP] bitsandbytes install failed. CPU offload will be used instead.
-    )
-) else (
-    echo [INFO] Sufficient VRAM. Skipping quantization package.
+echo [INFO] Detected VRAM: %VRAM_EXACT% GB (rounded: %VRAM_GB% GB)
+echo [INFO] Qwen3.5-4B needs ~8.6 GB in fp16, ~3.1 GB in 4-bit.
+
+if %VRAM_GB% EQU 0 (
+    echo [INFO] No CUDA device. Quantization is not applicable.
+    goto :quant_done
 )
+
+if %VRAM_GB% GEQ 10 (
+    echo [INFO] VRAM is sufficient for fp16. Installing bitsandbytes anyway
+    echo        so the 4-bit path stays available for larger models.
+)
+
+python -c "import bitsandbytes,sys;v=bitsandbytes.__version__;p=[int(''.join(c for c in x if c.isdigit()) or 0) for x in v.split('.')[:3]];sys.exit(0 if p>=[0,43,0] else 1)" 2>nul
+if !errorlevel! equ 0 (
+    for /f "tokens=*" %%b in ('python -c "import bitsandbytes;print(bitsandbytes.__version__)" 2^>nul') do set BNB_VER=%%b
+    echo   [SKIP] bitsandbytes !BNB_VER! already installed.
+) else (
+    echo [INFO] Installing bitsandbytes ^>=0.43.0 ...
+    pip install "bitsandbytes>=0.43.0"
+    if !errorlevel! neq 0 (
+        echo   [WARN] bitsandbytes install failed.
+        echo          The refiner will fall back to CPU offload, which is slow,
+        echo          or be skipped entirely on low-RAM machines.
+        goto :quant_done
+    )
+)
+
+echo [INFO] Verifying the 4-bit kernel actually runs...
+python -c "import torch,bitsandbytes as bnb;d=torch.bfloat16 if torch.cuda.get_device_capability(0)[0]>=8 else torch.float16;l=bnb.nn.Linear4bit(64,64,bias=False,compute_dtype=d,quant_type='nf4').to('cuda');x=torch.randn(2,64,device='cuda',dtype=d);y=l(x);assert torch.isfinite(y.float()).all();print(f'  [OK] 4-bit NF4 verified (compute dtype: {str(d).replace(chr(34),chr(39))})')" 2>nul
+if !errorlevel! neq 0 (
+    echo   [WARN] 4-bit self-test failed. Trying 8-bit...
+    python -c "import torch,bitsandbytes as bnb;l=bnb.nn.Linear8bitLt(64,64,bias=False,has_fp16_weights=False).to('cuda');x=torch.randn(2,64,device='cuda',dtype=torch.float16);y=l(x);assert torch.isfinite(y.float()).all();print('  [OK] 8-bit LLM.int8 verified')" 2>nul
+    if !errorlevel! neq 0 (
+        echo   [WARN] Neither 4-bit nor 8-bit works.
+        echo          The CUDA binary inside bitsandbytes may not match PyTorch.
+        echo          Try: pip install --force-reinstall "bitsandbytes>=0.43.0"
+    )
+)
+
+:quant_done
 
 echo.
 echo ============================================================
@@ -218,13 +249,20 @@ python -c "import os;os.environ.setdefault('FLAGS_use_mkldnn','0');from paddleoc
 if !errorlevel! neq 0 echo   PP-OCRv5 det: selftest failed (image-processing fallback will be used)
 
 python -c "import webview; print(f'  pywebview: {webview.__version__}')" 2>nul
-if !errorlevel! neq 0 echo   pywebview: NOT INSTALLED
+if !errorlevel! neq 0 (
+    echo   pywebview: IMPORT FAILED — details below
+    python -c "import webview" 2>&1 | findstr /v /c:\"\" 
+    echo.
+    echo          Windows needs pythonnet for the EdgeChromium backend:
+    echo            pip install --upgrade "pywebview>=5.0" "pythonnet>=3.0.3" pywin32
+    echo          The CLI still works: python app.py document.pdf --save
+)
 
 python -c "import stanza; print(f'  stanza: {stanza.__version__}')" 2>nul
 if !errorlevel! neq 0 echo   stanza: NOT INSTALLED (NLP gate disabled)
 
-python -c "import bitsandbytes; print('  bitsandbytes: OK (4-bit available)')" 2>nul
-if !errorlevel! neq 0 echo   bitsandbytes: not installed (offload fallback)
+python -c "import bitsandbytes; print(f'  bitsandbytes: {bitsandbytes.__version__}')" 2>nul
+if !errorlevel! neq 0 echo   bitsandbytes: NOT INSTALLED (offload fallback, very slow)
 
 python -c "import pypdfium2; print(f'  pypdfium2: {pypdfium2.V_PYPDFIUM2}')" 2>nul
 if !errorlevel! neq 0 python -c "import pypdfium2; print('  pypdfium2: OK')" 2>nul
@@ -232,6 +270,22 @@ if !errorlevel! neq 0 echo   pypdfium2: NOT INSTALLED (PDF rendering disabled)
 
 python -c "import pypdf; print(f'  pypdf: {pypdf.__version__}')" 2>nul
 if !errorlevel! neq 0 echo   pypdf: NOT INSTALLED (PDF text fallback disabled)
+
+echo.
+echo ============================================================
+echo   Preflight — importing app.py
+echo ============================================================
+python -c "import app; print('  [OK] app.py imported cleanly')"
+if %errorlevel% neq 0 (
+    echo.
+    echo [ERROR] app.py failed to import. The traceback above shows the cause.
+    echo         Common causes:
+    echo           - a missing name in a type annotation
+    echo           - a module removed but still imported
+    echo         Fix it before the app can start.
+    pause
+    exit /b 1
+)
 
 echo.
 echo ============================================================
@@ -269,11 +323,19 @@ echo     Cap RAM         : --ram-limit 8
 echo     Force load      : --allow-low-ram  (risk of process kill)
 echo   PDF
 echo     Engine          : PDFium via pypdfium2 (BSD-3-Clause)
-echo                       No Poppler, no Ghostscript, no AGPL.
+echo                       No Poppler, no Ghostscript, no copyleft.
 echo     Resolution      : --pdf-dpi 200
 echo     Page cap        : --pdf-pages 32
 echo     Text layer      : used automatically when present
 echo                       override with --pdf-force-vision
+echo   Quantization
+echo     Backend         : bitsandbytes (MIT)
+echo     Mode            : auto (4-bit NF4, falls back to 8-bit)
+echo     Force           : --quant 4bit ^| --quant 8bit ^| --quant off
+echo     Skip install    : --no-quant-install
+echo   Diagnostics
+echo     Component check : python app.py --preflight
+echo     Model status    : python app.py --check-only
 echo ============================================================
 echo.
 

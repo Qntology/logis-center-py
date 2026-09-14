@@ -417,6 +417,42 @@ FP8 KV (E4M3 quantize-dequantize) is disabled for multimodal generation,
 because positional indexing depends on exact cache length.
 ```
 
+### Quantization — Verified, Not Assumed
+
+`import bitsandbytes` succeeding does not mean 4-bit works. The bundled CUDA binary frequently mismatches the installed PyTorch build, and the failure only surfaces halfway through `from_pretrained` — after several gigabytes have already been staged in RAM.
+
+`core/quant_bootstrap.py` therefore runs a real kernel before committing:
+
+The probe builds a `Linear4bit(64, 64)`, moves it to CUDA, runs a forward pass, and checks the output is finite. Only then does the refiner receive a `BitsAndBytesConfig`.
+
+| Stage | Action on failure |
+|-------|-------------------|
+| Package missing or below `0.43.0` | `pip install "bitsandbytes>=0.43.0"` at runtime |
+| 4-bit probe fails | Retry with `Linear8bitLt` (8-bit LLM.int8) |
+| 8-bit probe fails | Disable quantization, log the reinstall command, fall back to CPU offload |
+| RAM insufficient even at 4-bit | Skip the refiner entirely, promote PP-OCRv5 output to fields |
+
+### Memory Budget by Mode
+
+Ratios are derived from the verified capability, not guessed:
+
+| Mode | VRAM ratio | RAM staging ratio | Qwen3.5-4B (7.3 GB on disk) |
+|------|-----------|-------------------|------------------------------|
+| `4bit` (NF4 + double quant) | 0.42 | 0.35 | ~3.1 GB VRAM / ~2.6 GB RAM |
+| `8bit` (LLM.int8) | 0.70 | 0.60 | ~5.1 GB VRAM / ~4.4 GB RAM |
+| `offload` (no quantization) | 1.15 | 1.00 | ~8.4 GB VRAM / ~7.3 GB RAM |
+
+### Compute dtype
+
+`bnb_4bit_compute_dtype` follows the device, not a hardcoded constant:
+
+| Compute capability | dtype | Rationale |
+|--------------------|-------|-----------|
+| sm_80 and above (Ampere+) | `bfloat16` | Native bf16 tensor cores; matches the checkpoint dtype, no cast |
+| Below sm_80 | `float16` | bf16 would be emulated |
+
+`bnb_4bit_quant_storage` is set to the same dtype so `accelerate` can shard the quantized weights without an intermediate conversion.
+
 ### Optimization Checklist
 
 - [x] `low_cpu_mem_usage=True` on every `from_pretrained`
@@ -427,6 +463,10 @@ because positional indexing depends on exact cache length.
 - [x] Shared `PaddleTextDetector` singleton — one model init per process
 - [x] Anchor embedding cache in zvec — repeated runs skip the encoder entirely
 - [x] Eviction failure cleans `slot.instance` and reclaims before re-raising
+- [x] Quantization capability verified with a live kernel, never assumed
+- [x] 4-bit → 8-bit → offload degradation chain, each step logged
+- [x] Compute dtype matched to the device (bf16 on Ampere+)
+- [x] VRAM and RAM estimates derived from the verified mode
 
 ---
 
@@ -459,8 +499,8 @@ pip install -r requirements.txt
 pip install paddlepaddle -i https://www.paddlepaddle.org.cn/packages/stable/cpu/
 pip install paddleocr
 
-# 4-bit quantization for low-VRAM machines
-pip install bitsandbytes
+# 4-bit quantization for low-VRAM machines (CUDA only)
+pip install -r requirements-gpu.txt
 
 python app.py
 ```
@@ -478,6 +518,9 @@ python app.py img.jpg --ram-limit 8            # cap staging admission at 8 GB
 python app.py doc.pdf --page 3                 # process page 3
 python app.py doc.pdf --pdf-dpi 300            # higher render resolution
 python app.py doc.pdf --pdf-force-vision       # ignore the embedded text layer
+python app.py img.jpg --quant 4bit             # force NF4, fail loudly if broken
+python app.py img.jpg --quant off              # disable quantization entirely
+python app.py --check-only                     # includes the quantization self-test
 ```
 
 ---
@@ -500,7 +543,10 @@ python app.py doc.pdf --pdf-force-vision       # ignore the embedded text layer
 | `--pdf-pages` / `NMS_PDF_MAX_PAGES` | `32` | Maximum pages processed per document |
 | `--pdf-force-vision` / `NMS_PDF_FORCE_VISION=1` | off | Ignore the embedded text layer, use the vision pipeline |
 | `--page` | `1` | Page number to process (1-based) |
-| `NMS_PDF_BACKEND` | auto | Pin the PDF backend (`pypdfium2` / `pypdf` / `pdf2image`) |
+| `NMS_PDF_BACKEND` | auto | Pin the PDF backend (`pypdfium2` / `pypdf`) |
+| `--quant` / `NMS_QUANT_MODE` | `auto` | `auto` / `4bit` / `8bit` / `off` |
+| `--no-quant-install` / `NMS_QUANT_AUTOINSTALL=0` | on | Disable runtime bitsandbytes installation |
+| `NMS_QUANT_TIMEOUT` | `600` | Seconds allowed for the bitsandbytes install |
 | `NMS_DIAG` | `1` | `0` quiet, `1` summary, `2` per-tensor |
 | `--vram-budget` | auto | Override detected VRAM |
 | `--low-vram` | auto (< 6 GB) | Force quantized / offloaded refiner |
@@ -570,11 +616,11 @@ No model weights are redistributed with this repository. Every checkpoint is fet
 
 ### Optional Dependencies
 
-| Library | Purpose | License |
-|---------|---------|---------|
-| [paddlepaddle](https://github.com/PaddlePaddle/Paddle) | PP-OCRv5 execution runtime | Apache-2.0 |
-| [paddleocr](https://github.com/PaddlePaddle/PaddleOCR) | `TextRecognition`, `TextDetection` | Apache-2.0 |
-| [bitsandbytes](https://github.com/bitsandbytes-foundation/bitsandbytes) | NF4 4-bit quantization | MIT |
+| Library | Purpose | Auto-installed | License |
+|---------|---------|----------------|---------|
+| [paddlepaddle](https://github.com/PaddlePaddle/Paddle) | PP-OCRv5 execution runtime | `core/paddle_bootstrap.py` | Apache-2.0 |
+| [paddleocr](https://github.com/PaddlePaddle/PaddleOCR) | `TextRecognition`, `TextDetection` | `core/paddle_bootstrap.py` | Apache-2.0 |
+| [bitsandbytes](https://github.com/bitsandbytes-foundation/bitsandbytes) | NF4 4-bit / LLM.int8 8-bit quantization | `core/quant_bootstrap.py` | MIT |
 
 ### PDF Handling — Fully Permissive
 
