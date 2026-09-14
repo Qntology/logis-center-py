@@ -8,7 +8,7 @@ import threading
 import time
 import traceback
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Sequence
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 from PIL import Image
@@ -58,6 +58,7 @@ from core.llm import (
 from core import memory as memory_mod
 from core import paddle_bootstrap
 from core import pdf_render
+from core import quant_bootstrap
 from core.phrase_cache import CachedEmbedder
 from core.model_manager import (
     BOOTSTRAP_LANGUAGES,
@@ -101,7 +102,7 @@ PDF_TEXT_MIN_CHARS = 60
 
 
 class NMSOcrApp:
-    LOW_VRAM_THRESHOLD_GB = 6.0
+    LOW_VRAM_THRESHOLD_GB = 10.0
 
     def __init__(
         self,
@@ -111,12 +112,16 @@ class NMSOcrApp:
         vram_budget: float = 0.0,
         force_low_vram: bool = False,
         paddle_autoinstall: bool = True,
+        quant_autoinstall: bool = True,
     ):
         self._external_log = log
         self.log_lines: List[str] = []
         self.paddle_autoinstall = bool(paddle_autoinstall)
+        self.quant_autoinstall = bool(quant_autoinstall)
         if not self.paddle_autoinstall:
             os.environ[paddle_bootstrap.ENV_AUTO] = "0"
+        if not self.quant_autoinstall:
+            os.environ[quant_bootstrap.ENV_AUTO] = "0"
         paddle_bootstrap.configure_runtime()
 
         self.vram_budget = float(vram_budget or 0.0)
@@ -318,17 +323,29 @@ class NMSOcrApp:
 
         self._log(f"  📊 VRAM 예산 {self.vram_budget:.1f} GB")
         if self.low_vram:
+            mode = str(quant_bootstrap.status().get("capability") or "")
             self._log(
-                "  ⚠️ 저VRAM 모드: 정제 LLM 은 지연 로드 + 양자화/오프로드로 실행합니다."
+                f"  ⚠️ 저VRAM 모드 (< {self.LOW_VRAM_THRESHOLD_GB:.0f} GB): "
+                f"정제 LLM 은 지연 로드로 실행합니다."
             )
-            self._log(
-                "     Qwen3.5-4B(fp16 ≈ 8.6GB / 4bit ≈ 3.1GB)가 예산을 "
-                "초과하면 OCR 원문으로 자동 폴백합니다."
-            )
-            self._log(
-                "     4B 는 2B 보다 유사 글자 변별이 좋지만 4GB 카드에서는 "
-                "4bit 양자화가 필수입니다: pip install bitsandbytes"
-            )
+            if mode == "4bit":
+                self._log(
+                    "     ✅ 4bit(NF4) 양자화 활성 — Qwen3.5-4B 가 "
+                    "8.6 GB → 약 3.1 GB 로 줄어 4 GB 카드에서 동작합니다."
+                )
+            elif mode == "8bit":
+                self._log(
+                    "     ⚠️ 8bit(LLM.int8) 양자화 활성 — 4B 가 약 4.6 GB 로 "
+                    "줄지만 4 GB 카드에는 여전히 빠듯합니다."
+                )
+            else:
+                self._log(
+                    "     ❌ 양자화 비활성 — Qwen3.5-4B(fp16 ≈ 8.6 GB)를 "
+                    "그대로 올려야 해 실패 가능성이 높습니다."
+                )
+                self._log(
+                    f"     해결: {quant_bootstrap.manual_command()}"
+                )
 
     def check_models(self) -> dict:
         self._sync_registry_language()
@@ -699,6 +716,14 @@ class NMSOcrApp:
                 log=self._log, auto=self.paddle_autoinstall
             )
         for line in paddle_bootstrap.report_lines():
+            self._log(line)
+
+        if self.low_vram and self.vram_budget > 0.0:
+            self._log("═══ 양자화 백엔드 확인 ═══")
+            quant_bootstrap.ensure_bitsandbytes(
+                log=self._log, auto=self.quant_autoinstall
+            )
+        for line in quant_bootstrap.report_lines():
             self._log(line)
 
         if SLOT_JOINT in self.crossover.slots:
@@ -1493,7 +1518,19 @@ class NMSOcrApp:
         }
 
     REFINER_EST_GB_4BIT = 3.1
+    REFINER_EST_GB_8BIT = 4.8
     REFINER_EST_GB_FP16 = 8.6
+
+    def _refiner_estimate_gb(self, disk_gb: float) -> Tuple[float, str]:
+        if not self.low_vram:
+            return max(self.REFINER_EST_GB_FP16, disk_gb * 1.15), "fp16"
+
+        mode = quant_bootstrap.capability(log=self._log)
+        if mode == "4bit":
+            return max(1.5, disk_gb * quant_bootstrap.vram_ratio()), "4bit"
+        if mode == "8bit":
+            return max(2.0, disk_gb * quant_bootstrap.vram_ratio()), "8bit"
+        return max(self.REFINER_EST_GB_FP16, disk_gb * 1.15), "offload"
 
     def _ensure_refiner_slot(self) -> bool:
         if SLOT_REFINER in self.crossover.slots:
@@ -1518,19 +1555,18 @@ class NMSOcrApp:
                 budget_gb=budget,
             )
 
-        est = self.REFINER_EST_GB_4BIT if low else self.REFINER_EST_GB_FP16
         disk = memory_mod.model_disk_gb(ref_path)
+        est, plan = self._refiner_estimate_gb(disk)
 
         self.crossover.register(
             SLOT_REFINER, _load_refiner, label=ref_label, est_gb=est
         )
-        mode = "저VRAM(양자화/오프로드)" if low else "표준"
         self._log(
-            f"  ⏳ [{ref_label}] 정제 LLM 지연 로드 예약 — {mode} "
-            f"| 예상 VRAM {est:.1f} GB | 가중치 {disk:.1f} GB"
+            f"  ⏳ [{ref_label}] 정제 LLM 지연 로드 예약 — 적재 방식 "
+            f"'{plan}' | 예상 VRAM {est:.1f} GB | 가중치 {disk:.1f} GB"
         )
 
-        stage = disk * 1.2 + memory_mod.RAM_SAFETY_GB
+        stage = disk * quant_bootstrap.stage_ratio() + memory_mod.RAM_SAFETY_GB
         room = memory_mod.usable_ram_gb()
         if room > 0.0 and room < stage:
             self._log(
@@ -2328,6 +2364,7 @@ class NMSOcrApp:
             "paddle": paddle_bootstrap.status(),
             "ram": memory_mod.ram_info(),
             "ram_usable_gb": round(memory_mod.usable_ram_gb(), 2),
+            "quant": quant_bootstrap.status(),
             "pdf": {
                 "backends": pdf_render.available_backends(),
                 "active": pdf_render.preferred_backend(),
@@ -2404,6 +2441,10 @@ def run_cli(args) -> int:
         os.environ[pdf_render.ENV_MAX_PAGES] = str(int(args.pdf_pages))
     if args.pdf_force_vision:
         os.environ[pdf_render.ENV_FORCE_VISION] = "1"
+    if args.quant:
+        os.environ[quant_bootstrap.ENV_MODE] = str(args.quant)
+    if args.no_quant_install:
+        os.environ[quant_bootstrap.ENV_AUTO] = "0"
     paddle_bootstrap.configure_runtime()
 
     app = NMSOcrApp(
@@ -2412,6 +2453,7 @@ def run_cli(args) -> int:
         vram_budget=args.vram_budget,
         force_low_vram=args.low_vram,
         paddle_autoinstall=not args.no_paddle_install,
+        quant_autoinstall=not args.no_quant_install,
     )
     app.print_model_report()
     app._log_vram_profile()
@@ -2512,8 +2554,38 @@ def run_ui(args) -> int:
 
     try:
         import webview
-    except ImportError:
-        print("pywebview 가 설치되어 있지 않습니다. `pip install pywebview`", file=sys.stderr)
+    except Exception as e:
+        print("=" * 60, file=sys.stderr)
+        print("  pywebview 를 불러오지 못해 UI 를 띄울 수 없습니다.", file=sys.stderr)
+        print(f"  원인: {type(e).__name__}: {e}", file=sys.stderr)
+        print("", file=sys.stderr)
+
+        if isinstance(e, ImportError) and "webview" in str(e):
+            print("  설치: pip install pywebview", file=sys.stderr)
+        else:
+            print("  패키지는 있지만 초기화에 실패했습니다.", file=sys.stderr)
+            if sys.platform.startswith("win"):
+                print(
+                    "  Windows 는 EdgeChromium 백엔드에 pythonnet 이 필요합니다:",
+                    file=sys.stderr,
+                )
+                print(
+                    '  pip install --upgrade "pywebview>=5.0" '
+                    '"pythonnet>=3.0.3" pywin32',
+                    file=sys.stderr,
+                )
+            print(
+                "  강제 백엔드 지정: python app.py --gui qt", file=sys.stderr
+            )
+
+        print("", file=sys.stderr)
+        print("  UI 없이 쓰려면 CLI 로 실행하세요:", file=sys.stderr)
+        print("    python app.py 문서.pdf --save", file=sys.stderr)
+        print("    python app.py --check-only", file=sys.stderr)
+        print("=" * 60, file=sys.stderr)
+
+        import traceback as _tb
+        _tb.print_exc()
         return 1
 
     caps = devtools_mod.webview_capabilities()
@@ -2543,6 +2615,10 @@ def run_ui(args) -> int:
         os.environ[pdf_render.ENV_MAX_PAGES] = str(int(args.pdf_pages))
     if args.pdf_force_vision:
         os.environ[pdf_render.ENV_FORCE_VISION] = "1"
+    if args.quant:
+        os.environ[quant_bootstrap.ENV_MODE] = str(args.quant)
+    if args.no_quant_install:
+        os.environ[quant_bootstrap.ENV_AUTO] = "0"
     paddle_bootstrap.configure_runtime()
 
     app = NMSOcrApp(
@@ -2551,6 +2627,7 @@ def run_ui(args) -> int:
         vram_budget=args.vram_budget,
         force_low_vram=args.low_vram,
         paddle_autoinstall=not args.no_paddle_install,
+        quant_autoinstall=not args.no_quant_install,
     )
     if dev_info:
         app._log(f"🛠 원격 DevTools: {dev_info['url']} ({dev_info['platform']})")
@@ -2662,6 +2739,15 @@ def run_ui(args) -> int:
             info = memory_mod.ram_info()
             info["usable_gb"] = round(memory_mod.usable_ram_gb(), 2)
             return info
+
+        def quant_status(self):
+            return quant_bootstrap.status()
+
+        def install_quant(self):
+            with app.job_slot("양자화 백엔드 설치"):
+                return quant_bootstrap.ensure_bitsandbytes(
+                    log=app._log, auto=True, force=True
+                )
 
         def reclaim_memory(self):
             with app.job_slot("메모리 회수"):
@@ -2831,6 +2917,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="PDF 내장 텍스트를 무시하고 비전 경로로 처리",
     )
     p.add_argument(
+        "--quant",
+        default="",
+        choices=["", "auto", "4bit", "8bit", "off"],
+        help="양자화 모드 강제 지정 (기본 auto)",
+    )
+    p.add_argument(
+        "--no-quant-install",
+        action="store_true",
+        help="bitsandbytes 자동 설치 비활성화",
+    )
+    p.add_argument(
+        "--preflight",
+        action="store_true",
+        help="모델 로드 없이 구성 요소만 점검하고 종료",
+    )
+    p.add_argument(
         "--page",
         type=int,
         default=1,
@@ -2839,8 +2941,53 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def preflight() -> int:
+    problems: List[str] = []
+
+    try:
+        import torch
+        print(f"  torch          {torch.__version__} | CUDA {torch.cuda.is_available()}")
+    except Exception as e:
+        problems.append(f"torch: {type(e).__name__}: {e}")
+
+    try:
+        import transformers
+        print(f"  transformers   {transformers.__version__}")
+    except Exception as e:
+        problems.append(f"transformers: {type(e).__name__}: {e}")
+
+    try:
+        import webview
+        ver = getattr(webview, "__version__", "?")
+        print(f"  pywebview      {ver}")
+    except Exception as e:
+        problems.append(f"pywebview: {type(e).__name__}: {e}")
+
+    for line in pdf_render.report_lines():
+        print(line)
+    for line in quant_bootstrap.report_lines():
+        print(line)
+    for line in memory_mod.report_lines():
+        print(line)
+    for line in paddle_bootstrap.report_lines():
+        print(line)
+
+    if problems:
+        print("")
+        print("  다음 구성 요소에 문제가 있습니다:")
+        for p in problems:
+            print(f"    · {p}")
+        return 1
+
+    print("")
+    print("  모든 구성 요소가 정상입니다.")
+    return 0
+
+
 def main() -> int:
     args = build_parser().parse_args()
+    if getattr(args, "preflight", False):
+        return preflight()
     if args.no_ui or args.input or args.check_only:
         return run_cli(args)
     return run_ui(args)

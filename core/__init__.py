@@ -92,6 +92,9 @@ _LAZY = {
     "ensure_paddle": (".paddle_bootstrap", "ensure_paddle"),
     "paddle_status": (".paddle_bootstrap", "status"),
     "paddle_ready": (".paddle_bootstrap", "ready"),
+    "ensure_bitsandbytes": (".quant_bootstrap", "ensure_bitsandbytes"),
+    "quant_status": (".quant_bootstrap", "status"),
+    "quant_capability": (".quant_bootstrap", "capability"),
 }
 
 
@@ -170,6 +173,9 @@ __all__ = [
     "ensure_paddle",
     "paddle_status",
     "paddle_ready",
+    "ensure_bitsandbytes",
+    "quant_status",
+    "quant_capability",
     "ModelRegistry",
     "STEP_REQUIREMENTS",
     "ROLE_LABELS",

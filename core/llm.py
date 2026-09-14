@@ -6,6 +6,11 @@ import torch
 
 from .device import configure_backends, detect_accelerator, select_dtype
 from .memory import can_stage, make_room, model_disk_gb, reclaim, usable_ram_gb
+from .quant_bootstrap import (
+    build_config as build_quant_config,
+    capability as quant_capability,
+    stage_ratio as quant_stage_ratio,
+)
 from .model_manager import (
     BOOTSTRAP_LANGUAGES,
     LLM_PATH,
@@ -279,24 +284,31 @@ class RefinerLLM:
         configure_backends(self.device)
 
         self.weight_gb = model_disk_gb(self.model_path)
+        self.quant_mode = ""
 
         quant_ready = False
         if self.low_vram and self.device.type == "cuda":
-            try:
-                import bitsandbytes  # noqa: F401
-                quant_ready = True
-            except Exception:
-                quant_ready = False
+            mode = quant_capability(log=self._log)
+            quant_ready = bool(mode)
+            if quant_ready:
+                self.quant_mode = mode
 
         if quant_ready:
-            self.stage_gb = max(1.5, self.weight_gb * 0.35)
+            ratio = quant_stage_ratio()
+            self.stage_gb = max(1.5, self.weight_gb * ratio)
             self._log(
-                f"  🧮 [{self.label}] 4bit 양자화는 샤드 단위로 스트리밍되어 "
-                f"전량이 동시에 RAM 에 있지 않습니다. 스테이징 추정 "
-                f"{self.stage_gb:.1f} GB (가중치 {self.weight_gb:.1f} GB)"
+                f"  🧮 [{self.label}] {self.quant_mode} 양자화는 샤드 단위로 "
+                f"스트리밍되어 전량이 동시에 RAM 에 있지 않습니다. "
+                f"스테이징 추정 {self.stage_gb:.1f} GB "
+                f"(가중치 {self.weight_gb:.1f} GB × {ratio:.2f})"
             )
         else:
             self.stage_gb = self.weight_gb
+            if self.low_vram and self.device.type == "cuda":
+                self._log(
+                    f"  ⚠ [{self.label}] 양자화 없이 원본 {self.weight_gb:.1f} GB 를 "
+                    f"그대로 펼쳐야 합니다. 로드가 실패할 가능성이 높습니다."
+                )
 
         ok, why = can_stage(self.stage_gb, log=self._log, label=self.label)
 
@@ -314,9 +326,10 @@ class RefinerLLM:
                 why = f"회수 후 가용 {room:.1f} GB ≥ 필요 {need:.1f} GB"
 
         if not ok:
+            from .quant_bootstrap import manual_command as quant_cmd
             tip = (
-                "    · pip install bitsandbytes 로 4bit 양자화를 켜면\n"
-                "      스테이징 용량이 크게 줄어듭니다.\n"
+                f"    · 4bit 양자화를 켜면 스테이징이 약 1/3 로 줄어듭니다.\n"
+                f"      {quant_cmd()}\n"
                 if not quant_ready else ""
             )
             raise MissingModelError(
@@ -349,7 +362,7 @@ class RefinerLLM:
                 if quant is not None:
                     kwargs["quantization_config"] = quant
                     kwargs["device_map"] = "auto"
-                    self.load_mode = "4bit"
+                    self.load_mode = self.quant_mode or "4bit"
                 else:
                     kwargs["device_map"] = "auto"
                     self.load_mode = "offload"
@@ -553,28 +566,23 @@ class RefinerLLM:
             )
 
     def _try_quant_config(self):
-        try:
-            import bitsandbytes  # noqa: F401
-        except Exception:
+        cfg, mode = build_quant_config(log=self._log)
+
+        if cfg is None:
             self._log(
-                f"  ⏭ [{self.label}] bitsandbytes 미설치 → 4bit 양자화 대신 오프로드를 씁니다.\n"
-                f"     설치하면 4GB VRAM 에서도 안정적으로 동작합니다: "
-                f"pip install bitsandbytes"
+                f"  ⏭ [{self.label}] 양자화를 쓸 수 없어 CPU 오프로드로 "
+                f"진행합니다. 속도가 크게 느려집니다."
             )
             return None
 
-        try:
-            from transformers import BitsAndBytesConfig
-            import torch as _t
-            return BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_compute_dtype=_t.float16,
-                bnb_4bit_quant_type="nf4",
-                bnb_4bit_use_double_quant=True,
-            )
-        except Exception as e:
-            self._log(f"  ⏭ [{self.label}] 양자화 설정 실패({e}) → 오프로드로 진행합니다.")
-            return None
+        self.quant_mode = mode
+        label = "4bit(NF4 + double quant)" if mode == "4bit" else "8bit(LLM.int8)"
+        self._log(
+            f"  🧊 [{self.label}] {label} 양자화를 적용합니다 — "
+            f"가중치를 {'약 1/4' if mode == '4bit' else '약 1/2'} 로 "
+            f"줄여 GPU 에 올립니다."
+        )
+        return cfg
 
     def _log(self, msg: str):
         try:

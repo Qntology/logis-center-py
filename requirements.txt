@@ -14,3 +14,6 @@ stanza>=1.8.0
 PyYAML>=6.0
 opencv-python-headless>=4.9.0
 psutil>=5.9.0
+
+# GPU extras live in requirements-gpu.txt (bitsandbytes, CUDA only).
+# The app also installs it at runtime via core/quant_bootstrap.py.
