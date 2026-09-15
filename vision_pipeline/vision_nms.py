@@ -290,6 +290,72 @@ def band_gutters_from_boxes(
     return {c for c in range(cols) if not hit[c]}
 
 
+def col_gutters_from_boxes(
+    text_boxes: Optional[Sequence[Tuple[int, int, int, int]]],
+    grid: VisionPatchGrid,
+    c0: int,
+    c1: int,
+) -> set:
+    if not text_boxes:
+        return set()
+
+    rows = max(1, int(grid.rows))
+    cw = max(1.0, float(grid.cell_width()))
+    ch = max(1.0, float(grid.cell_height()))
+    x0 = float(int(c0)) * cw
+    x1 = float(int(c1) + 1) * cw
+
+    hit = [False] * rows
+    for b in text_boxes:
+        if float(b[2]) <= x0 or float(b[0]) >= x1:
+            continue
+        r0 = int(max(0, min(rows - 1, int(float(b[1]) // ch))))
+        r1 = int(max(0, min(rows - 1, int((float(b[3]) - 1.0) // ch))))
+        for r in range(r0, r1 + 1):
+            hit[r] = True
+
+    return {r for r in range(rows) if not hit[r]}
+
+
+def expand_col_band(
+    box: Tuple[int, int, int, int],
+    content: np.ndarray,
+    gate: float,
+    rows: int,
+    cols: int,
+    blocked_rows: Optional[set] = None,
+    max_height: int = 0,
+) -> Tuple[int, int, int, int]:
+    br = set(blocked_rows or ())
+    r_min, r_max, c_min, c_max = (int(v) for v in box)
+    cap = int(max_height) if max_height and max_height > 0 else int(rows)
+
+    def band_has(r: int) -> bool:
+        for c in range(c_min, c_max + 1):
+            idx = r * cols + c
+            if idx < content.size and content[idx] > gate:
+                return True
+        return False
+
+    while (
+        r_max + 1 < rows
+        and (r_max + 1) not in br
+        and (r_max - r_min + 1) < cap
+        and band_has(r_max + 1)
+    ):
+        r_max += 1
+
+    while (
+        r_min > 0
+        and (r_min - 1) not in br
+        and (r_max - r_min + 1) < cap
+        and band_has(r_min - 1)
+    ):
+        r_min -= 1
+
+    return (r_min, r_max, c_min, c_max)
+
+
 PLINKO_CLIFF_RATIO = 0.97
 PLINKO_BRIDGE_CLIFF_RATIO = 0.80
 PLINKO_FLOOR_RATIO = 0.55
@@ -705,6 +771,17 @@ def plan_crops(
         band_gutter_cache[key] = out
         return out
 
+    col_gutter_cache: Dict[Tuple[int, int], set] = {}
+
+    def _col_gutters(bc0: int, bc1: int) -> set:
+        key = (int(bc0), int(bc1))
+        got = col_gutter_cache.get(key)
+        if got is not None:
+            return got
+        out = col_gutters_from_boxes(text_boxes, grid, bc0, bc1)
+        col_gutter_cache[key] = out
+        return out
+
     def _tight(px: Tuple[int, int, int, int]) -> Tuple[int, int, int, int]:
         if not text_boxes:
             return px
@@ -828,6 +905,7 @@ def plan_crops(
         peaks: List[float] = []
         counts: List[int] = []
         band_hits = 0
+        col_hits = 0
         plinko_hits = 0
 
         for comp in comps:
@@ -858,6 +936,29 @@ def plan_crops(
                             f"(같은 행 밴드의 값 셀 편입){wall}"
                         )
 
+                width = max(1, gb[3] - gb[2] + 1)
+                cap_h = max(2, int(area_cap) // width)
+                vlocal = _col_gutters(gb[2], gb[3])
+                vb = expand_col_band(
+                    gb, content, content_gate, rows, cols,
+                    br | vlocal, cap_h,
+                )
+                if (vb[0], vb[1]) != (gb[0], gb[1]):
+                    col_hits += 1
+                    if log is not None:
+                        wall = (
+                            f" | 밴드 여백 행 {sorted(vlocal)} 에서 멈춤"
+                            if vlocal else ""
+                        )
+                        log.append(
+                            f"    ↕️ [COL BAND] '{h.category}' | "
+                            f"r{gb[0]}~{gb[1]} → r{vb[0]}~{vb[1]} "
+                            f"(같은 열 밴드의 아래 값 셀 편입 — 이 서식은 "
+                            f"라벨이 위, 값이 아래라 가로만 넓히면 값 행이 "
+                            f"크롭 밖에 남습니다){wall}"
+                        )
+                    gb = vb
+
                 grown, trace, axis = plinko_grow_region(
                     gb, h, grid, pmat, content_ok,
                     text_boxes=text_boxes, area_cap=area_cap,
@@ -883,7 +984,8 @@ def plan_crops(
             log.append(
                 f"    🧩 [COMPONENTS] '{h.category}' | 영역 {len(boxes)}개 "
                 f"| Gate: {gate:+.4f} | Top: {top_field_of[h.category]}"
-                f"({h.top_score:+.4f}) | 행밴드 확장 {band_hits}건"
+                f"({h.top_score:+.4f}) | 행밴드 확장 {band_hits}건 "
+                f"| 열밴드 확장 {col_hits}건"
             )
 
     if not per_cat:

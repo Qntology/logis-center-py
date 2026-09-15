@@ -28,6 +28,55 @@ PROSE_TRUST_CONF = 0.985
 
 REFINE_DEAD_CROPS = 2
 
+SCRIPT_MIN_SAMPLE = 12
+SCRIPT_DOMINANT_RATIO = 0.70
+
+_DOC_SCRIPT: Dict[str, int] = {}
+
+
+def reset_doc_script() -> None:
+    _DOC_SCRIPT.clear()
+
+
+def observe_script(text: str) -> None:
+    body = str(text or "").strip()
+    if not body:
+        return
+    try:
+        from core.lang_codes import block_census
+        census = block_census(body)
+    except Exception:
+        return
+    for name, n in (census or {}).items():
+        _DOC_SCRIPT[str(name)] = _DOC_SCRIPT.get(str(name), 0) + int(n)
+
+
+def dominant_doc_script() -> Tuple[str, int]:
+    if not _DOC_SCRIPT:
+        return "", 0
+    total = sum(int(v) for v in _DOC_SCRIPT.values())
+    if total < SCRIPT_MIN_SAMPLE:
+        return "", total
+    name, n = max(_DOC_SCRIPT.items(), key=lambda kv: kv[1])
+    if float(n) / float(max(1, total)) < SCRIPT_DOMINANT_RATIO:
+        return "", total
+    return str(name), total
+
+
+def script_conflicts(text: str) -> Tuple[bool, str, str]:
+    doc, total = dominant_doc_script()
+    if not doc:
+        return False, "", ""
+    try:
+        from core.lang_codes import block_census
+        census = block_census(str(text or ""))
+    except Exception:
+        return False, doc, ""
+    if not census:
+        return False, doc, ""
+    top = max(census.items(), key=lambda kv: kv[1])[0]
+    return (str(top) != doc), doc, str(top)
+
 _LINE_READ_DEAD = {"strikes": 0, "off": False, "calls": 0, "changed": 0}
 _REFINE_HEALTH = {"strikes": 0, "off": False, "calls": 0, "gained": 0}
 _READ_MODE = {"mode": READ_MODE_FORM, "density": 0.0, "rows": 0, "decided": False}
@@ -47,6 +96,23 @@ def reset_refine_health() -> None:
     _REFINE_HEALTH["off"] = False
     _REFINE_HEALTH["calls"] = 0
     _REFINE_HEALTH["gained"] = 0
+    _REFINE_HEALTH["down"] = False
+
+
+def mark_refiner_down(category: str, log: Optional[List[str]] = None) -> None:
+    if _REFINE_HEALTH.get("down"):
+        _REFINE_HEALTH["off"] = True
+        return
+
+    _REFINE_HEALTH["down"] = True
+    _REFINE_HEALTH["off"] = True
+    if log is not None:
+        log.append(
+            f"    ⛔ [REFINER DOWN] '{category}' 에서 정제 LLM 이 적재 자체에 "
+            f"실패했음을 확인했습니다. 실패 횟수를 2회까지 세지 않고 이 "
+            f"크롭부터 바로 다국어 사전 코사인 경로로 넘깁니다 — 세는 동안 "
+            f"앞쪽 크롭 두 개가 읽어 놓은 글자를 그대로 버리고 있었습니다."
+        )
 
 
 def reset_read_mode() -> None:
@@ -769,6 +835,8 @@ def match_label_to_field(
 PAIR_BELOW_MAX_GAP = 2.2
 PAIR_RIGHT_MAX_GAP = 1.2
 PAIR_VERT_TOLERANCE = 0.6
+PAIR_COLUMN_PENALTY = 1.6
+PAIR_RIGHT_VERT_WEIGHT = 0.5
 
 
 def pair_rows_by_geometry(
@@ -824,8 +892,14 @@ def pair_rows_by_geometry(
             gap_y = (vy0 - ly1) / unit
             if -0.2 <= gap_y <= PAIR_BELOW_MAX_GAP:
                 overlap = min(lx1, vx1) - max(lx0, vx0)
+                span = max(1.0, min(float(lx1 - lx0), float(vx1 - vx0)))
                 if overlap > 0:
-                    cost = abs(gap_y) + abs(vcx - lcx) / max(1.0, unit * 6.0)
+                    share = min(1.0, float(overlap) / span)
+                    cost = (
+                        abs(gap_y)
+                        + abs(vcx - lcx) / max(1.0, float(lx1 - lx0))
+                        + (1.0 - share) * PAIR_COLUMN_PENALTY
+                    )
                     if cost < best_cost:
                         best = vi
                         best_cost = cost
@@ -834,7 +908,7 @@ def pair_rows_by_geometry(
             gap_x = (vx0 - lx1) / unit
             vert = abs(((vy0 + vy1) * 0.5) - ((ly0 + ly1) * 0.5)) / unit
             if 0.0 <= gap_x <= PAIR_RIGHT_MAX_GAP and vert <= PAIR_VERT_TOLERANCE:
-                cost = gap_x + vert
+                cost = gap_x + vert * PAIR_RIGHT_VERT_WEIGHT
                 if cost < best_cost:
                     best = vi
                     best_cost = cost
@@ -978,6 +1052,47 @@ def promote_by_labels(
 PROSE_CLAIM_SCORE = 0.45
 PROSE_MAX_LINES = 12
 PROSE_FIELD_MARGIN = 0.01
+PROSE_MIN_CHARS = 3
+PROSE_MIN_CHARS_DENSE = 1
+DENSE_SCRIPTS = ("hangul", "han", "hiragana", "katakana", "kana", "cjk")
+
+
+def prose_min_chars(text: str) -> int:
+    try:
+        from core.lang_codes import block_census
+        census = block_census(str(text or ""))
+    except Exception:
+        return PROSE_MIN_CHARS
+    if not census:
+        return PROSE_MIN_CHARS
+    top = str(max(census.items(), key=lambda kv: kv[1])[0]).lower()
+    for name in DENSE_SCRIPTS:
+        if name in top:
+            return PROSE_MIN_CHARS_DENSE
+    return PROSE_MIN_CHARS
+
+
+def field_value_lengths(
+    schema: Optional[dict],
+    category: str,
+) -> Dict[str, float]:
+    fields = (schema or {}).get("fields", {}) or {}
+    out: Dict[str, float] = {}
+    for name, definition in fields.items():
+        d = definition if isinstance(definition, dict) else {}
+        if category and str(d.get("category") or "misc") != category:
+            continue
+        lens: List[float] = []
+        for key in ("value", "examples", "bias"):
+            for piece in _dict_phrases(d.get(key)):
+                n = len("".join(str(piece).split()))
+                if n > 0:
+                    lens.append(float(n))
+        if not lens:
+            continue
+        lens.sort()
+        out[str(name)] = lens[len(lens) // 2]
+    return out
 
 
 def pick_prose_field(
@@ -994,20 +1109,41 @@ def pick_prose_field(
     ranked = sorted(
         index.scores(text).items(), key=lambda kv: kv[1], reverse=True
     )
-    if not ranked:
-        return fallback
-
-    top, top_s = str(ranked[0][0]), float(ranked[0][1])
+    top = str(ranked[0][0]) if ranked else ""
+    top_s = float(ranked[0][1]) if ranked else 0.0
     second = str(ranked[1][0]) if len(ranked) > 1 else ""
     second_s = float(ranked[1][1]) if len(ranked) > 1 else 0.0
 
-    if top_s <= 0.0 or (top_s - second_s) < PROSE_FIELD_MARGIN:
+    flat = (not ranked) or top_s <= 0.0 or (top_s - second_s) < PROSE_FIELD_MARGIN
+
+    if flat:
+        profile = field_value_lengths(schema, category)
+        want = float(len("".join(str(text or "").split())))
+        if profile and want > 0.0:
+            scored = sorted(
+                profile.items(),
+                key=lambda kv: abs(
+                    math.log((want + 1.0) / (float(kv[1]) + 1.0))
+                ),
+            )
+            pick, typical = str(scored[0][0]), float(scored[0][1])
+            if log is not None:
+                log.append(
+                    f"       📏 [PROSE LENGTH] '{category}' 은 사전 n-gram 이 "
+                    f"'{top or '-'}'({top_s:.3f}) 와 '{second or '-'}'"
+                    f"({second_s:.3f}) 로 동률이라 값 길이로 가릅니다 — 판독문 "
+                    f"{int(want)}자에 가장 가까운 전형 길이 {typical:.0f}자를 "
+                    f"가진 '{pick}' 을 고릅니다. 라벨이 없는 지면에서는 "
+                    f"값의 길이가 필드를 가장 잘 구분합니다."
+                )
+            return pick
+
         if log is not None:
             log.append(
                 f"       ⚖ [PROSE FIELD] '{category}' 판독문을 사전에 걸어도 "
-                f"'{top}'({top_s:.3f}) 와 '{second or '-'}'({second_s:.3f}) 가 "
-                f"실질 동률입니다. 히트맵이 고른 '{fallback or top}' 을 "
-                f"그대로 씁니다."
+                f"'{top or '-'}'({top_s:.3f}) 와 '{second or '-'}'"
+                f"({second_s:.3f}) 가 실질 동률이고 값 길이 표본도 없습니다. "
+                f"히트맵이 고른 '{fallback or top}' 을 그대로 씁니다."
             )
         return fallback or top
 
@@ -1020,12 +1156,65 @@ def pick_prose_field(
     return top
 
 
+PROSE_BLOCK_GAP_UNITS = 0.9
+
+
+def group_prose_blocks(
+    lines: Sequence[str],
+    rows: Optional[Sequence[Tuple[str, float, Tuple[int, int, int, int]]]] = None,
+    log: Optional[List[str]] = None,
+) -> List[List[str]]:
+    items = [str(t or "").strip() for t in (lines or []) if str(t or "").strip()]
+    if not items:
+        return []
+    if len(items) == 1:
+        return [items]
+
+    boxed: List[Tuple[int, int, int, int]] = []
+    for ln in items:
+        hit = None
+        for t, _s, b in (rows or []):
+            if str(t or "").strip() == ln:
+                hit = b
+                break
+        if hit is None:
+            return [items]
+        boxed.append(tuple(int(v) for v in hit))
+
+    heights = sorted(float(b[3] - b[1]) for b in boxed)
+    unit = max(8.0, heights[len(heights) // 2])
+
+    order = sorted(range(len(items)), key=lambda i: (boxed[i][1], boxed[i][0]))
+    blocks: List[List[str]] = [[items[order[0]]]]
+    cuts = 0
+
+    for k in range(1, len(order)):
+        prev = boxed[order[k - 1]]
+        cur = boxed[order[k]]
+        gap = (float(cur[1]) - float(prev[3])) / unit
+        overlap = min(prev[2], cur[2]) - max(prev[0], cur[0])
+        if gap > PROSE_BLOCK_GAP_UNITS or overlap <= 0:
+            blocks.append([items[order[k]]])
+            cuts += 1
+            continue
+        blocks[-1].append(items[order[k]])
+
+    if log is not None and cuts:
+        log.append(
+            f"       🧱 [PROSE BLOCK] 줄 {len(items)}개를 세로 간격 "
+            f"{PROSE_BLOCK_GAP_UNITS:.1f}줄 기준으로 {len(blocks)}덩이로 "
+            f"나눴습니다 (행 높이 단위 {unit:.0f}px)."
+        )
+    return blocks
+
+
 def promote_prose_lines(
     text: str,
     schema: Optional[dict],
     category: str,
     top_field: str = "",
     is_array: bool = False,
+    rows: Optional[Sequence[Tuple[str, float, Tuple[int, int, int, int]]]] = None,
     log: Optional[List[str]] = None,
 ) -> Tuple[Dict[str, str], List[dict]]:
     body = str(text or "").strip()
@@ -1053,8 +1242,38 @@ def promote_prose_lines(
             )
         return {}, []
 
-    kept = [ln for ln in lines if _value_plausible(ln)][:PROSE_MAX_LINES]
+    kept: List[str] = []
+    dropped_script = 0
+    dropped_short = 0
+
+    for ln in lines:
+        if not _value_plausible(ln):
+            continue
+        conflict, doc_s, line_s = script_conflicts(ln)
+        if conflict:
+            dropped_script += 1
+            if log is not None:
+                log.append(
+                    f"       🔤 [PROSE SCRIPT] '{ln[:20]}' 는 문서 지배 문자체계 "
+                    f"'{doc_s}' 가 아니라 '{line_s}' 입니다. 인쇄 라벨이 없는 "
+                    f"지면에서 줄 전체를 값으로 올리는 경로이므로, 다른 "
+                    f"문자체계가 섞인 줄은 판독 환각으로 보고 버립니다."
+                )
+            continue
+        if len("".join(ln.split())) < prose_min_chars(ln):
+            dropped_short += 1
+            continue
+        kept.append(ln)
+
+    kept = kept[:PROSE_MAX_LINES]
+
     if not kept:
+        if log is not None and (dropped_script or dropped_short):
+            log.append(
+                f"    ⏭ [PROSE DROP] '{category}' 에서 승격 가능한 줄이 "
+                f"없습니다 — 문자체계 불일치 {dropped_script}건 / 너무 짧음 "
+                f"{dropped_short}건. 값을 만들지 않고 OCR 원문만 남깁니다."
+            )
         return {}, []
 
     fields = (schema or {}).get("fields", {}) or {}
@@ -1075,18 +1294,46 @@ def promote_prose_lines(
     if target not in fields or str(owner.get(target, "")) != str(category):
         target = fallback
 
+    fmt_map = _field_format_map(schema)
+    if _format_penalty(fmt_map.get(target, ""), joined) < 1.0:
+        alt = ""
+        for name, cat in owner.items():
+            if str(cat) != str(category) or name == target:
+                continue
+            if name not in fields:
+                continue
+            if _format_penalty(fmt_map.get(str(name), ""), joined) >= 1.0:
+                alt = str(name)
+                break
+        if log is not None:
+            log.append(
+                f"       🚧 [PROSE FORMAT] '{target}' 는 형식이 "
+                f"'{fmt_map.get(target, '-')}' 인데 값 '{joined[:20]}' 가 맞지 "
+                f"않습니다 — "
+                + (
+                    f"같은 카테고리의 '{alt}' 로 옮깁니다."
+                    if alt else
+                    "대체할 필드가 없어 이 크롭은 값을 만들지 않습니다."
+                )
+            )
+        if not alt:
+            return {}, []
+        target = alt
+
     if is_array:
-        rows = [{target: ln} for ln in kept]
+        blocks = group_prose_blocks(kept, rows, log=log)
+        out_rows = [{target: " ".join(b)} for b in blocks if b]
         if log is not None:
             log.append(
                 f"    📜 [PROSE VALUE] '{category}' 는 인쇄 라벨이 한 줄도 없는 "
-                f"지면입니다. 라벨↔값 쌍을 만들 수 없으므로 판독된 "
-                f"{len(rows)}줄을 그대로 값으로 보고 '{target}' 에 행 단위로 "
-                f"넣습니다."
+                f"지면입니다. 판독된 {len(kept)}줄을 줄 간격으로 묶어 "
+                f"{len(out_rows)}개 덩이로 만들고 '{target}' 에 행 단위로 "
+                f"넣습니다 — 말풍선 한 개 안의 여러 줄은 한 발화이므로 "
+                f"줄마다 행을 만들면 같은 대사가 쪼개집니다."
             )
-            for r in rows[:4]:
+            for r in out_rows[:4]:
                 log.append(f"       · {target} = {str(r[target])[:40]}")
-        return {}, rows
+        return {}, out_rows
 
     if log is not None:
         log.append(
@@ -1706,6 +1953,7 @@ def build_table_rows(
     ordered = sorted(bands.keys())
     header_band = -1
     header_cols: List[Tuple[str, float, float]] = []
+    header_slots: List[Tuple[str, float, float]] = []
     header_span = 1
 
     for bi, _band in enumerate(ordered):
@@ -1713,9 +1961,11 @@ def build_table_rows(
             group = ordered[bi: bi + span]
             if len(group) < span:
                 break
+            slots: List[Tuple[str, float, float]] = []
             cols: List[Tuple[str, float, float]] = []
             for text, x0, x1 in _merge_header_cells(group):
                 field = match_label_to_field(text, index)
+                slots.append((str(field or ""), x0, x1))
                 if not field:
                     continue
                 cols.append((field, x0, x1))
@@ -1732,6 +1982,7 @@ def build_table_rows(
             if len(uniq) >= TABLE_HEADER_MIN_COLS:
                 header_band = int(group[-1])
                 header_cols = uniq
+                header_slots = sorted(slots, key=lambda c: c[1])
                 header_span = span
                 break
         if header_band >= 0:
@@ -1739,6 +1990,17 @@ def build_table_rows(
 
     if header_band < 0:
         return []
+
+    if log is not None:
+        blind = [s for s in header_slots if not s[0]]
+        if blind:
+            log.append(
+                f"    🕳 [TABLE BLIND COL] 헤더 칸 {len(header_slots)}개 중 "
+                f"{len(blind)}개는 스키마 필드에 붙지 않았습니다 "
+                f"(x≈{', '.join(str(int(s[1])) for s in blind[:6])}). "
+                f"이 자리에 떨어진 값은 배정하지 않습니다 — 예전에는 최근접 "
+                f"인식 컬럼으로 밀려 옆 컬럼 값이 덮어썼습니다."
+            )
 
     if log is not None:
         brief = " | ".join(f"{f}@{int(x0)}" for f, x0, _x1 in header_cols)
@@ -1752,6 +2014,7 @@ def build_table_rows(
         )
 
     out: List[dict] = []
+    blind_drop = 0
     for band in sorted(b for b in bands.keys() if b > header_band):
         row: Dict[str, str] = {}
         for i in bands[band]:
@@ -1761,29 +2024,37 @@ def build_table_rows(
                 continue
             cx = (b[0] + b[2]) * 0.5
 
-            best = ""
-            best_dist = 1e9
-            for field, x0, x1 in header_cols:
+            slot = ""
+            slot_dist = 1e9
+            for field, x0, x1 in header_slots:
                 if x0 <= cx <= x1:
-                    best = field
-                    best_dist = 0.0
+                    slot = str(field)
+                    slot_dist = 0.0
                     break
                 dist = min(abs(cx - x0), abs(cx - x1))
-                if dist < best_dist:
-                    best = field
-                    best_dist = dist
+                if dist < slot_dist:
+                    slot = str(field)
+                    slot_dist = dist
 
-            width = max(1.0, header_cols[-1][2] - header_cols[0][1])
-            if best and best_dist <= width * TABLE_COL_TOLERANCE:
-                row.setdefault(best, t)
+            if not slot:
+                blind_drop += 1
+                continue
+
+            width = max(1.0, header_slots[-1][2] - header_slots[0][1])
+            if slot_dist <= width * TABLE_COL_TOLERANCE:
+                row.setdefault(slot, t)
 
         if len(row) >= 2:
             out.append(row)
 
     if log is not None:
+        tail = (
+            f" | 미인식 컬럼 자리에 떨어져 버린 값 {blind_drop}건"
+            if blind_drop else ""
+        )
         log.append(
             f"    🧾 [TABLE ROWS] '{category}' 데이터 행 {len(out)}건 구성 "
-            f"(헤더 아래 밴드 기준)"
+            f"(헤더 아래 밴드 기준){tail}"
         )
         for r in out[:3]:
             brief = " | ".join(f"{k}={v[:14]}" for k, v in list(r.items())[:5])
@@ -1880,6 +2151,12 @@ def extract_from_crops(
     reset_line_read_health()
     reset_refine_health()
     reset_read_mode()
+    reset_doc_script()
+
+    for _p in plans:
+        _memo = ocr_memo.get(tuple(_p.bbox))
+        if _memo is not None:
+            observe_script(_memo[0])
 
     for plan in plans:
         if log is not None:
@@ -1915,6 +2192,8 @@ def extract_from_crops(
                 f"    🧬 NLP 게이트: {nlp_meta['lines_in']} → "
                 f"{nlp_meta['lines_out']}줄 ({nlp_meta['dropped']}줄 제거)"
             )
+
+        observe_script(cleaned)
 
         line_texts: List[str] = []
         windows_n = 0
@@ -1970,6 +2249,11 @@ def extract_from_crops(
                 if log is not None:
                     log.append(f"    ⚠ 정제 추출 실패: {e}")
 
+            if isinstance(refined, dict) and refined.get("__refiner_down__"):
+                mark_refiner_down(str(plan.category), log=log)
+                refined = {}
+                active_refine = None
+
             raw_alt = refined.get("__raw__") if isinstance(refined, dict) else ""
             if isinstance(raw_alt, str) and raw_alt.strip():
                 if log is not None:
@@ -2019,6 +2303,7 @@ def extract_from_crops(
                 cleaned, schema, plan.category,
                 top_field=str(getattr(plan, "top_field", "") or ""),
                 is_array=plan.category in arrays,
+                rows=crop_rows,
                 log=log,
             )
             for pname, pval in prose_vals.items():
@@ -2121,6 +2406,8 @@ def fields_to_record(
     schema_fields = set((schema or {}).get("fields", {}) or {})
     array_fields = _array_field_names(schema)
 
+    carried: List[str] = []
+
     for f in fields:
         if getattr(f, "rows", None):
             prev = record.get(f.category)
@@ -2129,6 +2416,18 @@ def fields_to_record(
                 if r not in merged:
                     merged.append(r)
             record[f.category] = merged
+
+            for key, val in (f.field_values or {}).items():
+                if not val:
+                    continue
+                if schema_fields and key not in schema_fields:
+                    continue
+                if key == f.category:
+                    continue
+                if record.get(key):
+                    continue
+                record[key] = val
+                carried.append(f"{key}={str(val)[:24]}")
             continue
 
         if f.field_values:
@@ -2183,6 +2482,16 @@ def fields_to_record(
             continue
         record[key] = payload[0]
         adopted.append(f"{key}={payload[0][:24]}")
+
+    if log is not None and carried:
+        log.append(
+            f"  🧷 [ROW CARRY] 배열을 만든 크롭이 함께 확정한 단일 필드 "
+            f"{len(carried)}건을 배열과 나란히 보존했습니다 — 예전에는 rows 가 "
+            f"있으면 그 크롭의 field_values 를 통째로 버려, 전역 배타 배정이 "
+            f"확정한 값이 JSON 에서 사라졌습니다."
+        )
+        for line in carried[:10]:
+            log.append(f"     · {line}")
 
     if log is not None and (adopted or blocked):
         log.append(

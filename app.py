@@ -2169,7 +2169,7 @@ class NMSOcrApp:
         def _fn(category: str, raw_text: str, crop_image, top_field: str = "") -> dict:
             obj = self._acquire_refiner()
             if obj is None:
-                return {}
+                return {"__refiner_down__": True}
             self.refiner = obj
 
             script = _probe_script(obj)
