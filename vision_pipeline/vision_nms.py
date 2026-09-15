@@ -1715,13 +1715,27 @@ def plan_crops(
             thin = legible_n >= 0 and legible_n < RESCUE_MIN_LEGIBLE
             if blank or thin:
                 if log is not None:
+                    if det_live and boxed_n <= 0:
+                        why = (
+                            "검출기가 이 지면에서 박스를 찾았는데 이 자리만 "
+                            "0개입니다. STEP 4 가 같은 조건으로 OCR 을 "
+                            "거부하므로 크롭을 만들어도 한 글자도 못 읽습니다"
+                        )
+                    elif thin:
+                        why = (
+                            f"판독 가능 패치가 {max(0, legible_n)}개로 최소 "
+                            f"{RESCUE_MIN_LEGIBLE}개에 못 미칩니다. 로고 "
+                            f"테두리나 도장이 검출 박스로 잡혀 통과하던 자리입니다"
+                        )
+                    else:
+                        why = (
+                            f"검출기가 이 지면에서 박스를 하나도 못 찾았고 "
+                            f"잉크 패치도 {inked_n}개뿐입니다"
+                        )
                     log.append(
-                        f"    ⛔ [COVERAGE SKIP] 미커버 덩이 grid{gb} 에는 "
-                        f"읽을 글자가 없습니다 (검출 박스 {boxed_n} / 판독 "
-                        f"가능 {max(0, legible_n)} / 잉크 {inked_n}). 구제 "
-                        f"크롭은 판독 가능 패치를 최소 "
-                        f"{RESCUE_MIN_LEGIBLE}개 요구합니다 — 로고 테두리나 "
-                        f"도장도 검출 박스로 잡혀 빈 크롭이 통과했습니다."
+                        f"    ⛔ [COVERAGE SKIP] 미커버 덩이 grid{gb} 를 "
+                        f"크롭하지 않습니다 (검출 박스 {boxed_n} / 판독 가능 "
+                        f"{max(0, legible_n)} / 잉크 {inked_n}) — {why}."
                     )
                 continue
 

@@ -982,6 +982,8 @@ def promote_by_labels(
     fmt_map = _field_format_map(schema)
 
     cands: List[Tuple[float, int, str, str]] = []
+    trace: Dict[Tuple[int, str], Tuple[str, float, float]] = {}
+    picked: Dict[str, Tuple[int, str]] = {}
     noisy = 0
     label_echo = 0
     unmatched = 0
@@ -1000,10 +1002,13 @@ def promote_by_labels(
             unmatched += 1
             continue
         for field, score in ranked:
-            adj = float(score) * _format_penalty(fmt_map.get(field, ""), value)
+            fmt = str(fmt_map.get(field, "") or "")
+            pen = float(_format_penalty(fmt, value))
+            adj = float(score) * pen
             if adj < LABEL_COSINE_FLOOR:
                 fmt_blocked += 1
                 continue
+            trace[(idx, str(field))] = (fmt, float(score), pen)
             cands.append((float(adj), idx, str(field), value))
 
     own: Dict[str, Tuple[str, float]] = {}
@@ -1018,6 +1023,7 @@ def promote_by_labels(
                 continue
             used_pairs.add(idx)
             taken.add(field)
+            picked[str(field)] = (int(idx), str(pairs[idx][0]))
             if str(owner.get(field, "")) == str(category):
                 own[field] = (value, float(score))
             else:
@@ -1027,6 +1033,16 @@ def promote_by_labels(
         for dname, why in list(drop.items())[:4]:
             log.append(f"       🧹 [AXIS DROP] '{dname}' — {why}")
 
+    def _pair_note(name: str) -> str:
+        hit = picked.get(str(name))
+        if hit is None:
+            return ""
+        fmt, base, pen = trace.get((hit[0], str(name)), ("", 0.0, 1.0))
+        return (
+            f" | 라벨 '{str(hit[1])[:24]}' | 형식 {fmt or '미추론'} "
+            f"| 원점수 {base:.2f} × 감점 {pen:.2f}"
+        )
+
     if log is not None and (own or donated or unmatched or noisy or label_echo):
         log.append(
             f"    🏷 [LABEL PAIR] '{category}' 라벨↔값 {len(pairs)}쌍 → "
@@ -1035,15 +1051,21 @@ def promote_by_labels(
             f"| 미매칭 {unmatched}건 | 형식 불일치 {fmt_blocked}건 차단 "
             f"| 라벨 에코 {label_echo}건 | 잡음값 {noisy}건 폐기"
         )
+        log.append(
+            f"       ℹ 형식 게이트는 하드 거부가 아니라 곱셈 감점입니다 — "
+            f"원점수 × 감점이 바닥값 {LABEL_COSINE_FLOOR:.2f} 을 넘으면 "
+            f"형식이 어긋나도 통과합니다. 아래 줄의 '형식' 과 '감점' 이 "
+            f"이름 필드가 순수 숫자를 받아들인 경로를 보여 줍니다."
+        )
         for k, payload in list(own.items())[:8]:
             log.append(
                 f"       · {k} = {str(payload[0])[:40]} "
-                f"(사전 코사인 {float(payload[1]):.2f})"
+                f"(사전 코사인 {float(payload[1]):.2f}){_pair_note(k)}"
             )
         for k, payload in list(donated.items())[:8]:
             log.append(
                 f"       ↗ {k} = {str(payload[0])[:40]} "
-                f"(사전 코사인 {float(payload[1]):.2f})"
+                f"(사전 코사인 {float(payload[1]):.2f}){_pair_note(k)}"
             )
 
     return own, donated
