@@ -16,6 +16,7 @@ class CategoryHeatmap:
         top_score: float = 0.0,
         bank_size: int = 0,
         affinity: Optional[np.ndarray] = None,
+        anchor: Optional[np.ndarray] = None,
     ):
         self.category = category
         self.scores = np.asarray(scores, dtype=np.float32)
@@ -25,6 +26,10 @@ class CategoryHeatmap:
         self.affinity = (
             np.asarray(affinity, dtype=np.float32)
             if affinity is not None else self.scores.copy()
+        )
+        self.anchor = (
+            np.asarray(anchor, dtype=np.float32).reshape(-1)
+            if anchor is not None else None
         )
         self.absent = False
         self.absent_reason = ""
@@ -256,6 +261,7 @@ def build_field_heatmaps(
     raw: Dict[str, np.ndarray] = {}
     top_field_map: Dict[str, str] = {}
     bank_sizes: Dict[str, int] = {}
+    anchors: Dict[str, np.ndarray] = {}
 
     for cat, names_in in cat_fields.items():
         cols: List[np.ndarray] = []
@@ -271,6 +277,11 @@ def build_field_heatmaps(
             continue
 
         bmat = np.stack(cols).astype(np.float32)
+        centroid = bmat.mean(axis=0)
+        cnorm = float(np.linalg.norm(centroid))
+        if cnorm > 1e-8:
+            anchors[cat] = (centroid / cnorm).astype(np.float32)
+
         sims = pm @ bmat.T
         best_idx = np.argmax(sims, axis=1)
         bias_map = sims[np.arange(sims.shape[0]), best_idx]
@@ -343,6 +354,7 @@ def build_field_heatmaps(
                 top_score=float(scores[peak]),
                 bank_size=bank_sizes.get(cat, 0),
                 affinity=affinity[i].astype(np.float32),
+                anchor=anchors.get(cat),
             )
         )
 

@@ -31,6 +31,8 @@ from .vision_nms import (
     extract_components,
     plan_crops,
     build_content_mask,
+    expand_col_band,
+    col_gutters_from_boxes,
 )
 from .text_boxes import (
     box_union,
@@ -84,6 +86,8 @@ __all__ = [
     "extract_components",
     "plan_crops",
     "build_content_mask",
+    "expand_col_band",
+    "col_gutters_from_boxes",
     "box_union",
     "detect_text_boxes",
     "median_text_height",

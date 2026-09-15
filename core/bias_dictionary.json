@@ -1,50 +1,22 @@
 {
   "analytic_event_filters": {
     "touch": {
-      "semantic": "the user interacted with the element via a touch screen, including starting a touch, moving, or releasing",
+    "semantic": "the user interacted with the element via a touch screen, including starting a touch, moving, or releasing",
       "bias": "touch, touched, swipe, swiped, touchstart, touchend, touchmove, touchcancel, drag, dragged, 터치, 스와이프, 문지르기, 터치시작, 터치종료, 터치이동, タッチ, スワイプ, 触摸, 滑动, 触控, toucher, berühren, tocar",
       "prejudice": "hover, mouse over, hovered, typed, entered, input, summary, report, right click",
       "exact_match": [
-        "touch",
-        "touched",
-        "touchstart",
-        "touchend",
-        "touchmove",
-        "touchcancel",
-        "swipe",
-        "swiped",
-        "터치",
-        "터치한",
-        "스와이프",
-        "タッチ",
-        "スワイプ",
-        "触摸",
-        "滑动",
-        "触控",
-        "berühren",
-        "berührt",
-        "wischen",
-        "tocar",
-        "tocado",
-        "deslizar",
-        "toucher",
-        "touché",
-        "balayage",
-        "tocar",
-        "tocado",
-        "deslizar",
-        "لمس",
-        "ملموس",
-        "تمرير",
-        "dotyk",
-        "dotknutí",
-        "přejetí",
-        "tocco",
-        "toccato",
-        "scorrere",
-        "aanraken",
-        "aangeraakt",
-        "vegen"
+        "touch", "touched", "touchstart", "touchend", "touchmove", "touchcancel", "swipe", "swiped",
+        "터치", "터치한", "스와이프", 
+        "タッチ", "スワイプ", 
+        "触摸", "滑动", "触控",
+        "berühren", "berührt", "wischen",
+        "tocar", "tocado", "deslizar",
+        "toucher", "touché", "balayage",
+        "tocar", "tocado", "deslizar",
+        "لمس", "ملموس", "تمرير",
+        "dotyk", "dotknutí", "přejetí",
+        "tocco", "toccato", "scorrere",
+        "aanraken", "aangeraakt", "vegen"
       ]
     },
     "click": {
@@ -52,29 +24,17 @@
       "bias": "click, clicked, press, pressed, tap, tapped, select, selected, choose, chose, pick, picked, open, opened, 클릭, 눌렀, 선택, 골랐, 터치, クリック, 押した, 点击, 选择, cliquer, klicken, hacer clic",
       "prejudice": "hover, mouse over, lingered, typed, entered, input, summary, report",
       "exact_match": [
-        "click",
-        "clicked",
-        "클릭",
-        "클릭한",
-        "클릭된",
-        "クリック",
-        "クリックした",
-        "点击",
-        "单击",
-        "klick",
-        "geklickt",
-        "clic",
-        "cliqueado",
-        "cliqué",
-        "cliquer",
-        "clique",
-        "clicado",
-        "نقر",
-        "نقرة",
-        "klik",
-        "kliknutí",
-        "cliccato",
-        "cliccare",
+        "click", "clicked", 
+        "클릭", "클릭한", "클릭된", 
+        "クリック", "クリックした", 
+        "点击", "单击", 
+        "klick", "geklickt", 
+        "clic", "cliqueado", 
+        "cliqué", "cliquer", 
+        "clique", "clicado", 
+        "نقر", "نقرة", 
+        "klik", "kliknutí", 
+        "cliccato", "cliccare", 
         "geklikt"
       ]
     },
@@ -83,28 +43,18 @@
       "bias": "hover, hovered, mouse over, linger, lingered, dwell, dwelled, look at, looked at, browse, browsed, scan, glance, viewed without clicking, 호버, 마우스오버, 머물, 둘러봤, 살펴봤, 구경, ホバー, 悬停, survoler, schweben",
       "prejudice": "click, pressed, selected, typed, entered, input, summary, report",
       "exact_match": [
-        "hover",
-        "hovered",
-        "호버",
-        "마우스오버",
-        "ホバー",
-        "マウスオーバー",
-        "悬停",
-        "划过",
-        "gehovert",
-        "schweben",
-        "pasar el ratón",
-        "sobreponer",
-        "survol",
-        "survolé",
-        "passar o mouse",
-        "تمرير المؤشر",
-        "تحويم",
-        "najetí myší",
-        "přejetí",
-        "passaggio del mouse",
-        "zweven",
-        "eroverheen gaan"
+        "hover", "hovered", 
+        "호버", "마우스오버", 
+        "ホバー", "マウスオーバー", 
+        "悬停", "划过", 
+        "gehovert", "schweben", 
+        "pasar el ratón", "sobreponer", 
+        "survol", "survolé", 
+        "passar o mouse", 
+        "تمرير المؤشر", "تحويم", 
+        "najetí myší", "přejetí", 
+        "passaggio del mouse", 
+        "zweven", "eroverheen gaan"
       ]
     },
     "change": {
@@ -112,42 +62,18 @@
       "bias": "change, changed, type, typed, enter, entered, input, fill in, filled in, edit, edited, modify, toggle, switch, select an option, 입력, 입력한, 변경, 수정, 타이핑, 검색어, 옵션선택, 入力, 変更, 输入, 修改, saisir, eingeben",
       "prejudice": "click, pressed, hover, mouse over, lingered, summary, report",
       "exact_match": [
-        "change",
-        "changed",
-        "input",
-        "입력",
-        "입력한",
-        "변경",
-        "수정",
-        "入力",
-        "変更",
-        "输入",
-        "修改",
-        "更改",
-        "änderung",
-        "geändert",
-        "eingabe",
-        "cambio",
-        "cambiado",
-        "ingreso",
-        "changement",
-        "changé",
-        "saisie",
-        "mudança",
-        "alterado",
-        "inserido",
-        "تغيير",
-        "تعديل",
-        "إدخال",
-        "změna",
-        "změněno",
-        "zadání",
-        "modifica",
-        "cambiato",
-        "inserimento",
-        "wijziging",
-        "gewijzigd",
-        "invoer"
+        "change", "changed", "input", 
+        "입력", "입력한", "변경", "수정", 
+        "入力", "変更", 
+        "输入", "修改", "更改", 
+        "änderung", "geändert", "eingabe", 
+        "cambio", "cambiado", "ingreso", 
+        "changement", "changé", "saisie", 
+        "mudança", "alterado", "inserido", 
+        "تغيير", "تعديل", "إدخال", 
+        "změna", "změněno", "zadání", 
+        "modifica", "cambiato", "inserimento", 
+        "wijziging", "gewijzigd", "invoer"
       ]
     },
     "report": {
@@ -155,38 +81,129 @@
       "bias": "report, summary, overview, behaviour flow, user journey, pattern, trend, analysis, insight, statistics, aggregated, most frequent, most clicked, ranking, 리포트, 요약, 흐름, 패턴, 경향, 분석, 통계, 가장 많이, 가장 자주, 순위, レポート, 要約, 报告, 汇总, rapport, Bericht",
       "prejudice": "single click, single hover, one keystroke, individual event",
       "exact_match": [
-        "report",
-        "summary",
-        "리포트",
-        "요약",
-        "패턴",
-        "통계",
-        "レポート",
-        "要約",
-        "統計",
-        "报告",
-        "汇总",
-        "统计",
-        "bericht",
-        "zusammenfassung",
-        "informe",
-        "reporte",
-        "resumen",
-        "rapport",
-        "résumé",
-        "relatório",
-        "resumo",
-        "تقرير",
-        "ملخص",
-        "إحصائيات",
-        "zpráva",
-        "přehled",
-        "statistika",
-        "rapporto",
-        "riepilogo",
-        "overzicht",
-        "samenvatting"
+        "report", "summary", 
+        "리포트", "요약", "패턴", "통계", 
+        "レポート", "要約", "統計", 
+        "报告", "汇总", "统计", 
+        "bericht", "zusammenfassung", 
+        "informe", "reporte", "resumen", 
+        "rapport", "résumé", 
+        "relatório", "resumo", 
+        "تقرير", "ملخص", "إحصائيات", 
+        "zpráva", "přehled", "statistika", 
+        "rapporto", "riepilogo", 
+        "overzicht", "samenvatting"
       ]
+    }
+  },
+  "comics_schema": {
+    "base": {
+      "page": {
+        "title": "Series or work title printed on the page {String}",
+        "episode_number": "Episode or chapter number printed on the page {String}",
+        "page_number": "Page number printed in a corner or margin {String}",
+        "credits": "Author, artist, studio or publisher credit line {String}",
+        "publisher": "Publisher or platform name printed on the page {String}",
+        "release_label": "Release, update or serialization label printed on the page {String}"
+      },
+      "panel": {
+        "panel_index": "Reading order index of this panel within the page {Number}",
+        "panel_caption": "Caption box text attached to this panel {String}",
+        "scene_location": "Where this panel takes place as drawn or captioned {String}",
+        "scene_time": "Time of day or elapsed time indicated in this panel {String}"
+      },
+      "speech": {
+        "dialogue": "a speech balloon, an oval white bubble with a pointed tail aimed at a character mouth, containing conversational text {String}",
+        "character_name": "a small name label lettered next to a speech balloon identifying who is talking {String}",
+        "speaker_role": "an interjection or exclamation, a short emotive outburst lettered larger than surrounding dialogue {String}",
+        "balloon_shape": "the drawn outline of a text bubble, smooth oval for talking, jagged spikes for shouting, dashed for whispering {String}",
+        "emphasis": "words inside a balloon drawn bolder, larger or in a different colour than the rest of the line {String}"
+      },
+      "thought": {
+        "thought_balloon": "a thought bubble, a fluffy cloud shaped outline trailing small round bubbles toward a character head, holding unspoken inner monologue {String}",
+        "thinker_name": "the character whose head the trailing bubbles of a thought cloud point back to {String}"
+      },
+      "narration": {
+        "narration": "a rectangular caption box with straight corners and no tail, placed at a panel edge, carrying narrator prose about time or place {String}",
+        "aside": "tiny handwritten author commentary squeezed into the gutter outside the panel border {String}"
+      },
+      "effect": {
+        "sound_effect": "onomatopoeia, a sound word lettered directly onto the artwork without any balloon, drawn in a distorted display typeface that imitates the noise it names {String}",
+        "effect_intensity": "how forcefully the onomatopoeia is lettered, tiny thin strokes for quiet sounds, huge jagged strokes for loud impacts {String}",
+        "motion_cue": "speed lines, impact starbursts, sweat drops, blush marks and other non textual emotion or motion symbols drawn around a character {String}"
+      },
+      "signage": {
+        "sign_text": "environmental lettering painted on a hanging shop sign, wall poster, chalkboard or banner that belongs to the drawn scenery rather than to any character {String}",
+        "screen_text": "lettering rendered on a device display drawn inside the scene, a phone screen, monitor or tablet held by a character {String}",
+        "book_text": "lettering printed on a book cover, magazine spine or paper sheet drawn as a prop within the scene {String}",
+        "brand_text": "a shop logo or storefront wordmark drawn as part of the background architecture {String}"
+      },
+      "cast": {
+        "character_appearance": "How a character is drawn, hair colour clothing and build {String}",
+        "character_expression": "Facial expression drawn on a character {String}",
+        "character_count": "How many distinct characters are drawn in this panel {Number}"
+      }
+    },
+    "overlay": {
+      "WEBTOON": {
+        "page": {
+          "title": "The WEBTOON series title printed on this episode page {String}",
+          "episode_number": "The WEBTOON episode number printed on this page {String}"
+        },
+        "panel": {
+          "panel_index": "Vertical scroll order index of this cut {Number}"
+        },
+        "signage": {
+          "screen_text": "Chat bubbles or phone screen text drawn in this webtoon cut {String}"
+        }
+      },
+      "MANGA": {
+        "page": {
+          "title": "The manga series title printed on this page {String}",
+          "page_number": "Page number printed in the outer margin of this manga page {String}"
+        },
+        "panel": {
+          "panel_index": "Right to left reading order index of this manga panel {Number}"
+        },
+        "effect": {
+          "sound_effect": "Japanese onomatopoeia lettering drawn over this manga panel {String}"
+        }
+      },
+      "COMIC_STRIP": {
+        "page": {
+          "title": "The comic strip title printed above the panels {String}"
+        },
+        "panel": {
+          "panel_index": "Left to right strip panel order index {Number}"
+        },
+        "narration": {
+          "aside": "Punchline caption printed under the final strip panel {String}"
+        }
+      },
+      "GRAPHIC_NOVEL": {
+        "page": {
+          "title": "The graphic novel title printed on this page {String}",
+          "credits": "Writer, penciller, inker, colourist and letterer credit line {String}"
+        },
+        "narration": {
+          "narration": "Prose narration caption box in this graphic novel page {String}"
+        }
+      },
+      "STORYBOARD": {
+        "page": {
+          "title": "Production or scene title printed on this storyboard sheet {String}"
+        },
+        "panel": {
+          "panel_caption": "Shot description written beside this storyboard frame {String}",
+          "scene_time": "Shot duration or timing note written on this storyboard frame {String}"
+        }
+      },
+      "ILLUSTRATION": {
+        "page": {
+          "title": "Artwork title printed on this illustration {String}",
+          "credits": "Artist signature or handle drawn on this illustration {String}"
+        }
+      }
     }
   },
   "trade_schema": {
@@ -291,6 +308,7 @@
       }
     },
     "overlay": {
+
       "CI": {
         "header": {
           "doc_number": "The INVOICE NUMBER of this commercial invoice, printed under the title {String}"
@@ -301,6 +319,7 @@
           "grand_total_amount": "Grand total after freight and insurance {Number}"
         }
       },
+
       "PI": {
         "header": {
           "doc_number": "The PROFORMA INVOICE NUMBER of this document {String}",
@@ -310,6 +329,7 @@
           "estimated_shipment_date": "Estimated shipment date offered {String}"
         }
       },
+
       "PO": {
         "header": {
           "doc_number": "The PURCHASE ORDER NUMBER of this order {String}"
@@ -322,6 +342,7 @@
           "discount": "Discount applied to this order {Number}"
         }
       },
+
       "SC": {
         "header": {
           "doc_number": "The CONTRACT NUMBER of this sales contract {String}",
@@ -333,6 +354,7 @@
           "estimated_shipment_date": "Estimated shipment date agreed {String}"
         }
       },
+
       "LC": {
         "header": {
           "doc_number": "The CREDIT NUMBER of this letter of credit {String}"
@@ -345,6 +367,7 @@
           "required_documents": "Documents required for negotiation, as printed {String}"
         }
       },
+
       "LLC": {
         "header": {
           "doc_number": "The LOCAL L/C NUMBER of this domestic credit {String}",
@@ -357,6 +380,7 @@
           "latest_shipment_date": "Latest shipment date under this local credit {String}"
         }
       },
+
       "CP": {
         "header": {
           "doc_number": "The CONFIRMATION NUMBER of this purchase confirmation {String}",
@@ -367,6 +391,7 @@
           "tax_rate": "Tax rate applied {Number}"
         }
       },
+
       "BE": {
         "header": {
           "doc_number": "The DRAFT NUMBER or bill of exchange number {String}"
@@ -377,6 +402,7 @@
           "drawn_under_terms": "The credit or contract this draft is drawn under {String}"
         }
       },
+
       "TR": {
         "header": {
           "doc_number": "The TRUST RECEIPT NUMBER of this document {String}",
@@ -390,12 +416,14 @@
           "purpose": "Stated purpose of releasing the goods {String}"
         }
       },
+
       "LG": {
         "header": {
           "doc_number": "The GUARANTEE NUMBER of this letter of guarantee {String}",
           "reference_bl": "Referenced Bill of Lading number covered by this Letter of Guarantee {String}"
         }
       },
+
       "EL": {
         "header": {
           "doc_number": "The LICENCE NUMBER of this export licence {String}",
@@ -407,12 +435,14 @@
           "license_condition": "Conditions attached to this licence {String}"
         }
       },
+
       "PL": {
         "header": {
           "doc_number": "The PACKING LIST NUMBER of this document {String}",
           "reference_invoice": "Referenced Commercial Invoice number (e.g. CI-2026-08001) {String}"
         }
       },
+
       "BL": {
         "header": {
           "doc_number": "The B/L NUMBER of this bill of lading {String}"
@@ -421,12 +451,14 @@
           "freight_term": "Freight term as printed on this B/L {String}"
         }
       },
+
       "HBL": {
         "header": {
           "doc_number": "The HOUSE B/L NUMBER of this document {String}",
           "reference_master_bl": "The Master B/L number covering this House B/L {String}"
         }
       },
+
       "SWB": {
         "header": {
           "doc_number": "The WAYBILL NUMBER of this sea waybill {String}"
@@ -435,6 +467,7 @@
           "non_negotiable": "Whether this waybill is marked non-negotiable {String}"
         }
       },
+
       "AWB": {
         "header": {
           "doc_number": "The AIR WAYBILL NUMBER of this document {String}"
@@ -454,11 +487,13 @@
           "charge_amount": "Amount of this charge {Number}"
         }
       },
+
       "SR": {
         "header": {
           "doc_number": "The SHIPPING REQUEST NUMBER of this document {String}"
         }
       },
+
       "BC": {
         "header": {
           "doc_number": "The BOOKING NUMBER of this confirmation {String}"
@@ -468,6 +503,7 @@
           "container_allocation": "Container allocation as printed {String}"
         }
       },
+
       "BK": {
         "header": {
           "doc_number": "The BOOKING NUMBER of this confirmation {String}",
@@ -478,6 +514,7 @@
           "container_allocation": "Container allocation as printed {String}"
         }
       },
+
       "SA": {
         "header": {
           "doc_number": "The ADVICE NUMBER of this shipping advice {String}",
@@ -487,6 +524,7 @@
           "attached_documents": "Documents attached to this advice, as printed {String}"
         }
       },
+
       "DO": {
         "header": {
           "doc_number": "The DELIVERY ORDER NUMBER of this document {String}",
@@ -497,6 +535,7 @@
           "pickup_location": "Where the cargo is to be picked up {String}"
         }
       },
+
       "AN": {
         "header": {
           "doc_number": "The NOTICE NUMBER of this arrival notice {String}",
@@ -512,6 +551,7 @@
           "charge_amount": "Amount of this charge {Number}"
         }
       },
+
       "POD": {
         "header": {
           "doc_number": "The POD NUMBER of this proof of delivery {String}",
@@ -523,6 +563,7 @@
           "received_by": "Name of the person who signed for receipt {String}"
         }
       },
+
       "FCR": {
         "header": {
           "doc_number": "The FCR NUMBER of this forwarder's certificate of receipt {String}",
@@ -533,6 +574,7 @@
           "date_received": "Date the goods were received {String}"
         }
       },
+
       "WR": {
         "header": {
           "doc_number": "The RECEIPT NUMBER of this warehouse receipt {String}"
@@ -544,6 +586,7 @@
           "inspection_on_arrival": "Condition noted on arrival {String}"
         }
       },
+
       "CM": {
         "header": {
           "doc_number": "The MANIFEST NUMBER of this cargo manifest {String}",
@@ -557,6 +600,7 @@
           "total_containers": "Total number of containers on this manifest {Number}"
         }
       },
+
       "FI": {
         "header": {
           "doc_number": "The INVOICE NUMBER of this freight invoice {String}",
@@ -569,6 +613,7 @@
           "charge_amount": "Amount of this charge {Number}"
         }
       },
+
       "ED": {
         "header": {
           "doc_number": "The DECLARATION NUMBER of this export declaration {String}",
@@ -586,6 +631,7 @@
           "exchange_rate": "Exchange rate applied by customs {Number}"
         }
       },
+
       "ID": {
         "header": {
           "doc_number": "The DECLARATION NUMBER of this import declaration {String}",
@@ -602,12 +648,14 @@
           "pccc_number": "Personal customs clearance code for B2C shipments {String}"
         }
       },
+
       "CINV": {
         "header": {
           "doc_number": "The INVOICE NUMBER of this customs invoice {String}",
           "reference_origin": "Referenced Certificate of Origin number (e.g. CO-2026-KR-0801) {String}"
         }
       },
+
       "CSI": {
         "header": {
           "doc_number": "The CONSULAR INVOICE NUMBER of this document {String}"
@@ -619,6 +667,7 @@
           "legalization_fee": "Legalization fee charged {Number}"
         }
       },
+
       "CO": {
         "header": {
           "doc_number": "The CERTIFICATE NUMBER of this certificate of origin {String}"
@@ -633,6 +682,7 @@
           "declaration": "The exporter's declaration text as printed {String}"
         }
       },
+
       "CNM": {
         "header": {
           "doc_number": "The CERTIFICATE NUMBER of this non-manipulation certificate {String}",
@@ -647,6 +697,7 @@
           "certification_statement": "The certifying statement as printed {String}"
         }
       },
+
       "CCC": {
         "header": {
           "doc_number": "The CERTIFICATE NUMBER of this customs clearance certificate {String}",
@@ -661,6 +712,7 @@
           "duty_amount": "Duty paid {Number}"
         }
       },
+
       "IC": {
         "header": {
           "doc_number": "The CERTIFICATE NUMBER of this inspection certificate {String}"
@@ -672,6 +724,7 @@
           "inspection_result": "Result of the inspection {String}"
         }
       },
+
       "COA": {
         "header": {
           "doc_number": "The CERTIFICATE NUMBER of this certificate of analysis {String}",
@@ -688,6 +741,7 @@
           "test_value": "Measured result for this item {String}"
         }
       },
+
       "WC": {
         "header": {
           "doc_number": "The CERTIFICATE NUMBER of this weight certificate {String}"
@@ -702,6 +756,7 @@
           "container_tare_weight": "Tare weight of the container {Number}"
         }
       },
+
       "CA": {
         "header": {
           "doc_number": "The CERTIFICATE NUMBER of this certificate of analysis {String}"
@@ -711,6 +766,7 @@
           "test_summary": "Summary of the analysis {String}"
         }
       },
+
       "PHYTO": {
         "header": {
           "doc_number": "The CERTIFICATE NUMBER of this phytosanitary certificate {String}"
@@ -726,6 +782,7 @@
           "place_of_origin": "Place of origin as declared {String}"
         }
       },
+
       "PC": {
         "header": {
           "doc_number": "The CERTIFICATE NUMBER of this phytosanitary certificate {String}",
@@ -745,6 +802,7 @@
           "means_of_conveyance": "Means of conveyance as declared {String}"
         }
       },
+
       "FC": {
         "header": {
           "doc_number": "The CERTIFICATE NUMBER of this fumigation certificate {String}"
@@ -759,6 +817,7 @@
           "ispm15_mark": "Whether the ISPM 15 mark is applied {String}"
         }
       },
+
       "HC": {
         "header": {
           "doc_number": "The CERTIFICATE NUMBER of this health certificate {String}"
@@ -768,6 +827,7 @@
           "certification_statement": "The certifying statement as printed {String}"
         }
       },
+
       "BEN_CERT": {
         "header": {
           "doc_number": "The CERTIFICATE NUMBER of this beneficiary certificate {String}"
@@ -776,6 +836,7 @@
           "certification_statement": "The beneficiary's certifying statement as printed {String}"
         }
       },
+
       "CDR": {
         "header": {
           "doc_number": "The REPORT NUMBER of this survey report {String}",
@@ -799,6 +860,7 @@
           "damaged_packages": "Number of damaged packages {Number}"
         }
       },
+
       "DGD": {
         "header": {
           "doc_number": "The DECLARATION NUMBER of this dangerous goods declaration {String}"
@@ -811,6 +873,7 @@
           "emergency_contact": "24-hour emergency contact number {String}"
         }
       },
+
       "MSDS": {
         "hazmat": {
           "un_number": "UN number (e.g. UN1263) {String}",
@@ -822,16 +885,19 @@
           "emergency_contact": "24-hour emergency contact number {String}"
         }
       },
+
       "POA": {
         "header": {
           "doc_number": "The REFERENCE NUMBER of this power of attorney {String}"
         }
       },
+
       "BIZ_LIC": {
         "header": {
           "doc_number": "The REGISTRATION NUMBER on this business licence {String}"
         }
       },
+
       "INS": {
         "header": {
           "doc_number": "The POLICY NUMBER of this insurance policy {String}"
@@ -845,6 +911,7 @@
           "effective_date": "Date cover takes effect {String}"
         }
       },
+
       "IP": {
         "header": {
           "doc_number": "The POLICY NUMBER of this insurance policy {String}"
@@ -858,6 +925,7 @@
           "effective_date": "Date cover takes effect {String}"
         }
       },
+
       "ICF": {
         "header": {
           "doc_number": "The CLAIM NUMBER of this insurance claim {String}",
@@ -874,6 +942,7 @@
           "enclosed_documents": "Documents enclosed with this claim, as printed {String}"
         }
       },
+
       "SOA": {
         "header": {
           "doc_number": "The STATEMENT NUMBER of this statement of account {String}",
@@ -893,6 +962,7 @@
           "balance": "Running balance after this line {Number}"
         }
       },
+
       "DN": {
         "header": {
           "doc_number": "The DEBIT NOTE NUMBER of this document {String}"
@@ -909,6 +979,7 @@
           "charge_amount": "Amount of this charge {Number}"
         }
       },
+
       "CN": {
         "header": {
           "doc_number": "The CREDIT NOTE NUMBER of this document {String}"
@@ -924,6 +995,7 @@
           "charge_amount": "Amount of this adjustment {Number}"
         }
       },
+
       "TI": {
         "header": {
           "doc_number": "The TAX INVOICE NUMBER of this document {String}",
@@ -943,114 +1015,25 @@
   },
   "search_bridge": {
     "path_alias": {
-      "amount": [
-        "amount_total",
-        "total_amount",
-        "grand_total_amount",
-        "price",
-        "total_price_sum"
-      ],
-      "amount_subtotal": [
-        "subtotal",
-        "sub_total",
-        "net_amount",
-        "total_supply_amount"
-      ],
-      "amount_tax": [
-        "tax_amount",
-        "vat_amount",
-        "total_vat_amount"
-      ],
-      "doc_number": [
-        "document_number",
-        "bl_number",
-        "awb_number",
-        "po_number",
-        "invoice_number",
-        "certificate_number",
-        "declaration_number",
-        "policy_number",
-        "claim_number",
-        "statement_number",
-        "no"
-      ],
-      "sender_name": [
-        "supplier_name",
-        "shipper_name",
-        "exporter_name",
-        "consignor_name",
-        "seller_name",
-        "vendor_name"
-      ],
-      "recipient_name": [
-        "buyer_name",
-        "consignee_name",
-        "importer_name",
-        "receiver_name"
-      ],
-      "vessel": [
-        "vessel_name",
-        "vehicle_name",
-        "ocean_vessel",
-        "mother_vessel"
-      ],
-      "flight_number": [
-        "flight_no",
-        "carrier_flight"
-      ],
-      "pol": [
-        "port_of_loading",
-        "location_port_of_loading",
-        "loading_port",
-        "airport_of_departure"
-      ],
-      "pod": [
-        "port_of_discharge",
-        "location_port_of_discharge",
-        "discharge_port",
-        "airport_of_destination"
-      ],
-      "incoterms": [
-        "incoterms_code",
-        "trade_terms",
-        "price_terms"
-      ],
-      "container_number": [
-        "container_no",
-        "cntr_no"
-      ],
-      "seal_number": [
-        "seal_no"
-      ],
-      "weight_gross": [
-        "gross_weight",
-        "total_gross_weight",
-        "verified_gross_mass"
-      ],
-      "weight_net": [
-        "net_weight",
-        "total_net_weight"
-      ],
-      "volume": [
-        "volume_measurement",
-        "measurement",
-        "cbm"
-      ],
-      "package_count": [
-        "number_of_packages",
-        "total_packages",
-        "number_of_pieces"
-      ],
-      "sale_price": [
-        "price",
-        "selling_price",
-        "final_price"
-      ],
-      "tracking_number": [
-        "tracking_no",
-        "waybill_number",
-        "invoice_number_parcel"
-      ]
+      "amount": ["amount_total", "total_amount", "grand_total_amount", "price", "total_price_sum"],
+      "amount_subtotal": ["subtotal", "sub_total", "net_amount", "total_supply_amount"],
+      "amount_tax": ["tax_amount", "vat_amount", "total_vat_amount"],
+      "doc_number": ["document_number", "bl_number", "awb_number", "po_number", "invoice_number", "certificate_number", "declaration_number", "policy_number", "claim_number", "statement_number", "no"],
+      "sender_name": ["supplier_name", "shipper_name", "exporter_name", "consignor_name", "seller_name", "vendor_name"],
+      "recipient_name": ["buyer_name", "consignee_name", "importer_name", "receiver_name"],
+      "vessel": ["vessel_name", "vehicle_name", "ocean_vessel", "mother_vessel"],
+      "flight_number": ["flight_no", "carrier_flight"],
+      "pol": ["port_of_loading", "location_port_of_loading", "loading_port", "airport_of_departure"],
+      "pod": ["port_of_discharge", "location_port_of_discharge", "discharge_port", "airport_of_destination"],
+      "incoterms": ["incoterms_code", "trade_terms", "price_terms"],
+      "container_number": ["container_no", "cntr_no"],
+      "seal_number": ["seal_no"],
+      "weight_gross": ["gross_weight", "total_gross_weight", "verified_gross_mass"],
+      "weight_net": ["net_weight", "total_net_weight"],
+      "volume": ["volume_measurement", "measurement", "cbm"],
+      "package_count": ["number_of_packages", "total_packages", "number_of_pieces"],
+      "sale_price": ["price", "selling_price", "final_price"],
+      "tracking_number": ["tracking_no", "waybill_number", "invoice_number_parcel"]
     },
     "sales_to_order": {
       "trigger_words": "sales, sold, selling, revenue, sales volume, purchase volume, transaction, turnover, sales performance",
@@ -1060,34 +1043,50 @@
       "prejudice": "product registration, product list, display, exposure, traffic, page views, impressions"
     },
     "domain_affinity": {
-      "coupon": [
-        "event",
-        "goods"
-      ],
-      "event": [
-        "coupon",
-        "goods"
-      ],
-      "order": [
-        "tracking",
-        "goods",
-        "review"
-      ],
-      "tracking": [
-        "order",
-        "goods"
-      ],
-      "goods": [
-        "order",
-        "review",
-        "tracking"
-      ],
-      "review": [
-        "goods",
-        "order"
-      ]
+      "coupon": ["event", "goods"],
+      "event": ["coupon", "goods"],
+      "order": ["tracking", "goods", "review"],
+      "tracking": ["order", "goods"],
+      "goods": ["order", "review", "tracking"],
+      "review": ["goods", "order"]
     },
     "multilingual_value_anchor": {
+      "comics.sound_effect": {
+        "semantic": "onomatopoeia, a sound imitating word lettered straight onto the artwork with no balloon around it",
+        "bias": "의성어, 의태어, 효과음, 소리 표현, 울림 글자, 흉내말, onomatopoeia, sound effect lettering, sound word, noise word, impact lettering, 擬音語, 擬態語, 効果音, 象声词, 拟声词, 音效文字"
+      },
+      "comics.dialogue": {
+        "semantic": "a spoken conversational line inside an oval balloon whose tail points at a talking mouth",
+        "bias": "대사, 말풍선 대사, 구어체 문장, 대화문, 회화체, 말하는 문장, spoken dialogue, conversational line, quoted speech, utterance, 台詞, 会話文, 吹き出しの台詞, 对白, 对话, 台词"
+      },
+      "comics.speaker_role": {
+        "semantic": "an interjection or exclamation, a short emotive outburst lettered larger than the surrounding dialogue",
+        "bias": "감탄사, 외침, 탄성, 감탄 표현, 놀람 표현, 부르는 말, 호격, interjection, exclamation, outburst, shout, gasp, 感動詞, 感嘆詞, 叫び声, 感叹词, 语气词, 呼喊"
+      },
+      "comics.thought_balloon": {
+        "semantic": "unspoken inner monologue inside a fluffy cloud outline trailing small round bubbles",
+        "bias": "속마음, 내적 독백, 생각 풍선, 혼잣말, 마음의 소리, 독백, inner monologue, unspoken thought, inner voice, soliloquy, 心の声, モノローグ, 独白, 内心独白, 心理活动, 自言自语"
+      },
+      "comics.narration": {
+        "semantic": "narrator prose in a rectangular caption box with straight corners and no tail",
+        "bias": "내레이션, 지문, 해설, 서술문, 장면 설명, 상황 설명, narration, caption prose, narrator voice, scene description, ナレーション, 地の文, 場面説明, 旁白, 叙述, 场景说明"
+      },
+      "comics.character_name": {
+        "semantic": "a small name label lettered beside a balloon identifying the speaker",
+        "bias": "인물명, 등장인물 이름, 화자 표시, 캐릭터 이름표, 호명, character name label, speaker tag, name plate, 人物名, 話者名, キャラ名, 角色名, 说话人标签, 人名"
+      },
+      "comics.sign_text": {
+        "semantic": "environmental lettering on scenery signage that belongs to the background, not to any character",
+        "bias": "간판 문구, 게시물, 벽보, 안내문, 표지판, 배경 글자, 소품 글씨, shop signage, poster lettering, notice board text, environmental text, background lettering, 看板文字, 掲示物, 貼り紙, 招牌文字, 告示, 背景文字"
+      },
+      "comics.motion_cue": {
+        "semantic": "non textual emotion and motion symbols drawn around a character",
+        "bias": "만화적 기호, 집중선, 속도선, 땀방울, 홍조, 핏대, 별표, 하트 표시, emotion symbol, speed lines, impact burst, sweat drop, blush mark, 漫符, 集中線, 効果線, 汗マーク, 漫画符号, 速度线, 汗滴"
+      },
+      "comics.emphasis": {
+        "semantic": "words lettered bolder or larger than the rest of the line for stress",
+        "bias": "강조 표현, 굵은 글씨, 확대 글자, 어조 강조, 힘준 말, emphasis lettering, bold word, enlarged word, stressed syllable, 強調文字, 太字, 強調表現, 强调, 加粗, 重音"
+      },
       "goods.title": {
         "semantic": "the concrete name of a physical product a shopper searches for",
         "bias": "product name, item name, goods name, clothing, apparel, garment, knitwear, knit, cardigan, sweater, coat, jacket, shirt, pants, dress, shoes, bag, accessory, electronics, gadget, appliance, furniture, cosmetics, food, 상품명, 제품명, 품목명, 의류, 옷, 니트, 가디건, 스웨터, 코트, 자켓, 셔츠, 바지, 원피스, 신발, 가방, 액세서리, 가전, 가구, 화장품, 식품, 商品名, 製品名, 衣類, ニット, カーディガン, セーター, コート, 商品名称, 服装, 针织, 开衫, 毛衣, 外套, nombre del producto, ropa, prenda, punto, cárdigan, suéter, abrigo, nom du produit, vêtement, tricot, cardigan, pull, manteau, produktname, kleidung, strick, strickjacke, pullover, mantel, nome do produto, roupa, malha, casaco, nome del prodotto, abbigliamento, maglia, maglione, cappotto, название товара, одежда, трикотаж, кардиган, свитер, пальто, اسم المنتج, ملابس, تريكو, كارديجان, سترة, معطف, उत्पाद का नाम, कपड़े, बुना हुआ, कार्डिगन, स्वेटर, कोट, ชื่อสินค้า, เสื้อผ้า, ถักนิตติ้ง, คาร์ดิแกน, เสื้อกันหนาว, เสื้อโค้ท, tên sản phẩm, quần áo, áo len, áo cardigan, áo khoác, nama produk, pakaian, rajut, kardigan, sweter, mantel",
@@ -1095,7 +1094,7 @@
       },
       "goods.tags": {
         "semantic": "category keywords a shopper uses to narrow a catalog",
-        "bias": "category, keyword, tag, genre, collection, season, style, material, fabric, 카테고리, 키워드, 태그, 분류, 컬렉션, 시즌, 스타일, 소재, 원단, カテゴリ, キーワード, タグ, 素材, 分类, 关键词, 标签, 材质, categoría, palabra clave, etiqueta, material, catégorie, mot clé, étiquette, matière, kategorie, schlagwort, categoria, parola chiave, tessuto, категория, ключевое слово, материал, فئة, كلمة مفتاحية, مادة, श्रेणी, कीवर्ड, सामग्री, หมวดหมู่, คําสําคัญ, วัสดุ, danh mục, từ khóa, chất liệu, kategori, kata kunci, bahan",
+        "bias": "category, keyword, tag, genre, collection, season, style, material, fabric, 카테고리, 키워드, 태그, 분류, 컬렉션, 시즌, 스타일, 소재, 원단, カテゴリ, キーワード, タグ, 素材, 分类, 关键词, 标签, 材质, categoría, palabra clave, etiqueta, material, catégorie, mot clé, étiquette, matière, kategorie, schlagwort, categoria, parola chiave, tessuto, категория, ключевое слово, материал, فئة, كلمة مفتاحية, مادة, श्रेणी, कीवर्ड, सामग्री, หมวดหมู่, คำสำคัญ, วัสดุ, danh mục, từ khóa, chất liệu, kategori, kata kunci, bahan",
         "prejudice": "identifier, code, url, link, date, price, quantity, status"
       },
       "goods.description": {
@@ -1120,7 +1119,7 @@
       },
       "goods.color": {
         "semantic": "the color a shopper names when narrowing a catalog",
-        "bias": "color, beige, black, white, red, blue, green, yellow, pink, brown, grey, gray, purple, navy, ivory, silver, gold, 색상, 컬러, 베이지, 검정, 블랙, 흰색, 화이트, 빨강, 레드, 파랑, 블루, 초록, 그린, 노랑, 옐로우, 분홍, 핑크, 갈색, 브라운, 회색, 그레이, 보라, 퍼플, 남색, 네이비, 아이보리, 은색, 실버, 금색, 골드, 颜色, 米色, 黑色, 白色, 红色, 蓝色, 绿色, 黄色, 粉色, 棕色, 灰色, 紫色, 藏青色, 象牙色, 银色, 金色, カラー, ベージュ, 黒, 白, 赤, 青, 緑, ピンク, 茶色, 紫, ネイビー, アイボリー, シルバー, ゴールド, beige, negro, blanco, rojo, azul, verde, amarillo, rosa, marrón, gris, morado, marino, marfil, plata, oro, couleur, noir, rouge, bleu, vert, jaune, marron, violet, ivoire, argent, farbe, schwarz, weiß, rot, blau, grün, gelb, braun, grau, lila, marineblau, elfenbein, silber, цвет, бежевый, черный, белый, красный, синий, зеленый, желтый, розовый, коричневый, серый, фиолетовый, لون, بيج, أسود, أبيض, أحمر, أزرق, أخضر, أصفر, وردي, بني, رمادي, أرجواني, रंग, बेज, काला, सफेद, लाल, नीला, हरा, पीला, गुलाबी, भूरा, ग्रे, बैंगनी, warna, krem, hitam, putih, merah, biru, hijau, kuning, cokelat, abu-abu, ungu, màu, màu be, đen, trắng, đỏ, xanh da trời, xanh lá, vàng, hồng, nâu, xám, tím, สี, เบจ, ดํา, ขาว, แดง, น้ําเงิน, เขียว, เหลือง, ชมพู, น้ําตาล, เทา, ม่วง",
+        "bias": "color, beige, black, white, red, blue, green, yellow, pink, brown, grey, gray, purple, navy, ivory, silver, gold, 색상, 컬러, 베이지, 검정, 블랙, 흰색, 화이트, 빨강, 레드, 파랑, 블루, 초록, 그린, 노랑, 옐로우, 분홍, 핑크, 갈색, 브라운, 회색, 그레이, 보라, 퍼플, 남색, 네이비, 아이보리, 은색, 실버, 금색, 골드, 颜色, 米色, 黑色, 白色, 红色, 蓝色, 绿色, 黄色, 粉色, 棕色, 灰色, 紫色, 藏青色, 象牙色, 银色, 金色, カラー, ベージュ, 黒, 白, 赤, 青, 緑, ピンク, 茶色, 紫, ネイビー, アイボリー, シルバー, ゴールド, beige, negro, blanco, rojo, azul, verde, amarillo, rosa, marrón, gris, morado, marino, marfil, plata, oro, couleur, noir, rouge, bleu, vert, jaune, marron, violet, ivoire, argent, farbe, schwarz, weiß, rot, blau, grün, gelb, braun, grau, lila, marineblau, elfenbein, silber, цвет, бежевый, черный, белый, красный, синий, зеленый, желтый, розовый, коричневый, серый, фиолетовый, لون, بيج, أسود, أبيض, أحمر, أزرق, أخضر, أصفر, وردي, بني, رمادي, أرجواني, रंग, बेज, काला, सफेद, लाल, नीला, हरा, पीला, गुलाबी, भूरा, ग्रे, बैंगनी, warna, krem, hitam, putih, merah, biru, hijau, kuning, cokelat, abu-abu, ungu, màu, màu be, đen, trắng, đỏ, xanh da trời, xanh lá, vàng, hồng, nâu, xám, tím, สี, เบจ, ดำ, ขาว, แดง, น้ำเงิน, เขียว, เหลือง, ชมพู, น้ำตาล, เทา, ม่วง",
         "prejudice": "identifier, code, url, link, date, price, quantity, status, address, phone number, card, bank, payment, size, weight"
       },
       "shipping_doc.pol": {
@@ -1170,7 +1169,7 @@
       },
       "comics.sound_effect": {
         "semantic": "a stylized noise word drawn over the artwork without any balloon",
-        "bias": "sound effect, onomatopoeia, impact lettering, noise word, 효과음, 의성어, 의태어, 擬音, 効果音, オノマトポ, 拟声词, 音效, onomatopeya, onomatopée, lautmalerei, onomatopea, звукоподражание, محاكاة صوتية, ध्वन्यात्मक, คําเลียนเสียง, từ tượng thanh, kata tiruan bunyi",
+        "bias": "sound effect, onomatopoeia, impact lettering, noise word, 효과음, 의성어, 의태어, 擬音, 効果音, オノマトペ, 拟声词, 音效, onomatopeya, onomatopée, lautmalerei, onomatopea, звукоподражание, محاكاة صوتية, ध्वन्यात्मक, คําเลียนเสียง, từ tượng thanh, kata tiruan bunyi",
         "prejudice": "complete sentence with a subject and a verb, spoken line, title lettering, narration caption, character name tag, author credit, page number, identifier, date, price"
       },
       "comics.character_name": {
@@ -1296,31 +1295,19 @@
   },
   "insight": {
     "conversion_insight": {
-      "target_domain": [
-        "order"
-      ],
+      "target_domain": ["order"],
       "semantic": "Sales performance analysis including conversion rate, checkout abandonment, and funnel analysis",
       "bias": "conversion rate, CVR, checkout abandonment, bounce rate, sales funnel, customer journey, AOV, purchase conversion",
       "prejudice": "page views, impressions, traffic sources, CTR, click-through rate"
     },
     "traffic_insight": {
-      "target_domain": [
-        "goods",
-        "event"
-      ],
+      "target_domain": ["goods", "event"],
       "semantic": "Traffic, impression, and user engagement analysis",
       "bias": "page views, impressions, click-through rate, CTR, traffic, unique visitors, sessions, engagement rate",
       "prejudice": "payment, refund, cancellation, shipping, conversion rate, CVR, checkout, AOV, acquisition"
     },
     "general_insight": {
-      "target_domain": [
-        "order",
-        "goods",
-        "tracking",
-        "review",
-        "coupon",
-        "event"
-      ],
+      "target_domain": ["order", "goods", "tracking", "review", "coupon", "event"],
       "semantic": "Diagnostic analytics, root cause analysis, and general statistical reporting",
       "bias": "root cause analysis, RCA, diagnostic analytics, statistics, report, KPI, dashboard, variance analysis, anomaly investigation, insights",
       "prejudice": "detail page, list, delete, register, edit, update, UI, layout"
@@ -1402,7 +1389,7 @@
   },
   "color": {
     "semantic": "color, hue, tint, shade of a product",
-    "bias": "color, beige, black, white, red, blue, green, yellow, pink, brown, grey, gray, purple, navy, ivory, silver, gold, 색상, 컬러, 베이지, 검정, 블랙, 흰색, 화이트, 빨강, 레드, 파랑, 블루, 초록, 그린, 노랑, 옐로우, 분홍, 핑크, 갈색, 브라운, 회색, 그레이, 보라, 퍼플, 남색, 네이비, 아이보리, 은색, 실버, 금색, 골드, 颜色, 米色, 黑色, 白色, 红色, 蓝色, 绿色, 黄色, 粉色, 棕色, 灰色, 紫色, 藏青色, 象牙色, 银色, 金色, 色, カラー, ベージュ, 黒, 白, 赤, 青, 緑, ピンク, 茶色, 紫, ネイビー, アイボリー, シルバー, ゴールド, color, beige, negro, blanco, rojo, azul, verde, amarillo, rosa, marrón, gris, morado, marino, marfil, plata, oro, couleur, noir, blanc, rouge, bleu, vert, jaune, rose, marron, gris, violet, ivoire, argent, farbe, schwarz, weiß, rot, blau, grün, gelb, rosa, braun, grau, lila, marineblau, elfenbein, silber, цвет, бежевый, черный, белый, красный, синий, зеленый, желтый, розовый, коричневый, серый, фиолетовый, темно-синий, слоновая кость, серебро, золото, cor, bege, preto, branco, vermelho, amarelo, cinza, roxo, azul marinho, marfim, prata, colore, nero, bianco, rosso, giallo, marrone, grigio, viola, blu scuro, avorio, argento, لون, بيج, أسود, أبيض, أحمر, أزرق, أخضر, أصفر, وردي, بني, رمادي, أرجواني, كحلي, عاجي, فضي, ذهبي, रंग, बेज, काला, सफेद, लाल, नीला, हरा, पीला, गुलाबी, भूरा, ग्रे, बैंगनी, नेवी, हाथी दांत, चांदी, सोना, warna, krem, hitam, putih, merah, biru, hijau, kuning, merah muda, cokelat, abu-abu, ungu, biru dongker, gading, perak, emas, màu, màu be, đen, trắng, đỏ, xanh da trời, xanh lá, vàng, hồng, nâu, xám, tím, xanh navy, ngà, bạc, สี, เบจ, ดํา, ขาว, แดง, น้ําเงิน, เขียว, เหลือง, ชมพู, น้ําตาล, เทา, ม่วง, กรมท่า, งาช้าง, เงิน, ทอง, renk, bej, siyah, beyaz, kırmızı, mavi, yeşil, sarı, pembe, kahverengi, gri, mor, lacivert, fildişi, gümüş, altın, kleur, zwart, wit, rood, blauw, groen, geel, roze, bruin, grijs, paars, marineblauw, ivoor, zilver, goud, kolor, beżowy, czarny, biały, czerwony, niebieski, zielony, żółty, różowy, brązowy, szary, fioletowy, granatowy, kość słoniowa, srebro, złoto, ngjyrë, e zezë, e bardhë, e kuqe, e gjelbër, e verdhë, kafe, vjollcë, rəng, qara, ağ, qırmızı, göy, yaşıl, sarı, çəhrayı, qəhvəyi, boz, bənövşəyi, রঙ, কালো, সাদা, লাল, নীল, সবুজ, হলুদ, গোলাপি, বাদামী, ধূসর, বেগুনি, цвят, черен, бял, червен, син, зелен, жълт, розов, кафяв, сив, лилав, negre, blanc, roig, verd, groc, marró, boja, crno, bijelo, crveno, plavo, zeleno, žuto, rozo, smeđe, sivo, ljubičasto, barva, černá, bílá, červená, modrá, zelená, žlutá, růžová, hnědá, šedá, fialová, farve, sort, hvid, rød, grøn, gul, brun, grå, lilla, värv, must, valge, punane, sinine, roheline, kollane, roosa, pruun, hall, väri, musta, valkoinen, punainen, sininen, vihreä, keltainen, vaaleanpunainen, ruskea, harmaa, purppura, ფერი, შავი, თეთრი, წითელი, ლურჯი, მწვანე, ყვითელი, ვარდისფერი, ყავისფერი, ნაცრისფერი, იასამნისფერი, χρώμα, μαύρο, άσπρο, κόκκινο, μπλε, πράσινο, κίτρινο, ροζ, καφέ, γκρι, μωβ, צבע, שחור, לבן, אדום, כחול, ירוק, צהוב, ורוד, חום, אפור, סגול, szín, fekete, fehér, piros, kék, zöld, sárga, rózsaszín, barna, szürke, lila, litur, svartur, hvítur, rauður, blár, grænn, gulur, bleikur, brúnn, grár, fjólublár, түс, қара, ақ, қызыл, көк, жасыл, сары, қызғылт, қоңыр, сұр, күлгін, ពណ៌, ខ្មៅ, ស, ក្រហម, ខៀវ, បៃតង, លឿង, ពណ៌ផ្កាឈូក, ត្នោត, ប្រផេះ, ស្វាយ, krāsa, melns, balts, sarkans, zils, zaļš, dzeltens, sārts, brūns, pelēks, violets, spalva, juoda, balta, raudona, mėlyna, žalia, geltona, rožinė, ruda, pilka, violetinė, farge, svart, hvit, rød, grön, gul, rosa, brun, grå, lila, رنگ, سیاه, سفید, قرمز, آبی, سبز, زرد, صورتی, قهوه ای, خاکستری, بنفش, culoare, negru, alb, roșu, albastru, verde, galben, roz, maro, gri, violet, боја, црна, бела, црвена, плава, зелена, жута, розе, браон, сива, љубичаста, farba, čierna, biela, červená, modrá, zelená, žltá, ružová, hnedá, sivá, fialová, črna, bela, rdeča, modra, rumena, roza, rjava, siva, vijolična, rangi, nyeusi, nyeupe, nyekundu, bluu, kijani, njano, pinki, kahawia, kijivu, zambarau, färg, svart, vit, röd, blå, grön, gul, rosa, brun, grå, lila, kulay, itim, puti, pula, asul, berde, dilaw, rosas, kulay-kapeng, abo, lila, రంగు, నలుపు, తెలుపు, ఎరుపు, నీలం, ఆకుపచ్చ, పసుపు, గులాబీ, గోధుమ, బూడిద, ఊదా, колір, чорний, білий, червоний, синій, зелений, жовтий, рожевий, коричневий, сірий, фіолетовий, رنگ, کالا, سفید, لال, نیلا, سبز, پیلا, گلابی, بھورا, سرمئی, جامنی, rang, qora, oq, qizil, ko'k, yashil, sariq, pushti, jigarrang, kulrang, binafsha, रंग, काळा, पांढरा, लाल, निळा, हिरवा, पिवळा, गुलाबी, बदामी, राखाडी, जांभळा",
+    "bias": "color, beige, black, white, red, blue, green, yellow, pink, brown, grey, gray, purple, navy, ivory, silver, gold, 색상, 컬러, 베이지, 검정, 블랙, 흰색, 화이트, 빨강, 레드, 파랑, 블루, 초록, 그린, 노랑, 옐로우, 분홍, 핑크, 갈색, 브라운, 회색, 그레이, 보라, 퍼플, 남색, 네이비, 아이보리, 은색, 실버, 금색, 골드, 颜色, 米色, 黑色, 白色, 红色, 蓝色, 绿色, 黄色, 粉色, 棕色, 灰色, 紫色, 藏青色, 象牙色, 银色, 金色, 色, カラー, ベージュ, 黒, 白, 赤, 青, 緑, ピンク, 茶色, 紫, ネイビー, アイボリー, シルバー, ゴールド, color, beige, negro, blanco, rojo, azul, verde, amarillo, rosa, marrón, gris, morado, marino, marfil, plata, oro, couleur, noir, blanc, rouge, bleu, vert, jaune, rose, marron, gris, violet, ivoire, argent, farbe, schwarz, weiß, rot, blau, grün, gelb, rosa, braun, grau, lila, marineblau, elfenbein, silber, цвет, бежевый, черный, белый, красный, синий, зеленый, желтый, розовый, коричневый, серый, фиолетовый, темно-синий, слоновая кость, серебро, золото, cor, bege, preto, branco, vermelho, amarelo, cinza, roxo, azul marinho, marfim, prata, colore, nero, bianco, rosso, giallo, marrone, grigio, viola, blu scuro, avorio, argento, لون, بيج, أسود, أبيض, أحمر, أزرق, أخضر, أصفر, وردي, بني, رمادي, أرجواني, كحلي, عاجي, فضي, ذهبي, रंग, बेज, काला, सफेद, लाल, नीला, हरा, पीला, गुलाबी, भूरा, ग्रे, बैंगनी, नेवी, हाथी दांत, चांदी, सोना, warna, krem, hitam, putih, merah, biru, hijau, kuning, merah muda, cokelat, abu-abu, ungu, biru dongker, gading, perak, emas, màu, màu be, đen, trắng, đỏ, xanh da trời, xanh lá, vàng, hồng, nâu, xám, tím, xanh navy, ngà, bạc, สี, เบจ, ดำ, ขาว, แดง, น้ำเงิน, เขียว, เหลือง, ชมพู, น้ำตาล, เทา, ม่วง, กรมท่า, งาช้าง, เงิน, ทอง, renk, bej, siyah, beyaz, kırmızı, mavi, yeşil, sarı, pembe, kahverengi, gri, mor, lacivert, fildişi, gümüş, altın, kleur, zwart, wit, rood, blauw, groen, geel, roze, bruin, grijs, paars, marineblauw, ivoor, zilver, goud, kolor, beżowy, czarny, biały, czerwony, niebieski, zielony, żółty, różowy, brązowy, szary, fioletowy, granatowy, kość słoniowa, srebro, złoto, ngjyrë, e zezë, e bardhë, e kuqe, e gjelbër, e verdhë, kafe, vjollcë, rəng, qara, ağ, qırmızı, göy, yaşıl, sarı, çəhrayı, qəhvəyi, boz, bənövşəyi, রঙ, কালো, সাদা, লাল, নীল, সবুজ, হলুদ, গোলাপি, বাদামী, ধূসর, বেগুনি, цвят, черен, бял, червен, син, зелен, жълт, розов, кафяв, сив, лилав, negre, blanc, roig, verd, groc, marró, boja, crno, bijelo, crveno, plavo, zeleno, žuto, rozo, smeđe, sivo, ljubičasto, barva, černá, bílá, červená, modrá, zelená, žlutá, růžová, hnědá, šedá, fialová, farve, sort, hvid, rød, grøn, gul, brun, grå, lilla, värv, must, valge, punane, sinine, roheline, kollane, roosa, pruun, hall, väri, musta, valkoinen, punainen, sininen, vihreä, keltainen, vaaleanpunainen, ruskea, harmaa, purppura, ფერი, შავი, თეთრი, წითელი, ლურჯი, მწვანე, ყვითელი, ვარდისფერი, ყავისფერი, ნაცრისფერი, იასამნისფერი, χρώμα, μαύρο, άσπρο, κόκκινο, μπλε, πράσινο, κίτρινο, ροζ, καφέ, γκρι, μωβ, צבע, שחור, לבן, אדום, כחול, ירוק, צהוב, ורוד, חום, אפור, סגול, szín, fekete, fehér, piros, kék, zöld, sárga, rózsaszín, barna, szürke, lila, litur, svartur, hvítur, rauður, blár, grænn, gulur, bleikur, brúnn, grár, fjólublár, түс, қара, ақ, қызыл, көк, жасыл, сары, қызғылт, қоңыр, сұр, күлгін, ពណ៌, ខ្មៅ, ស, ក្រហម, ខៀវ, បៃតង, លឿង, ពណ៌ផ្កាឈូក, ត្នោត, ប្រផេះ, ស្វាយ, krāsa, melns, balts, sarkans, zils, zaļš, dzeltens, sārts, brūns, pelēks, violets, spalva, juoda, balta, raudona, mėlyna, žalia, geltona, rožinė, ruda, pilka, violetinė, farge, svart, hvit, rød, grön, gul, rosa, brun, grå, lila, رنگ, سیاه, سفید, قرمز, آبی, سبز, زرد, صورتی, قهوه ای, خاکستری, بنفش, culoare, negru, alb, roșu, albastru, verde, galben, roz, maro, gri, violet, боја, црна, бела, црвена, плава, зелена, жута, розе, браон, сива, љубичаста, farba, čierna, biela, červená, modrá, zelená, žltá, ružová, hnedá, sivá, fialová, črna, bela, rdeča, modra, rumena, roza, rjava, siva, vijolična, rangi, nyeusi, nyeupe, nyekundu, bluu, kijani, njano, pinki, kahawia, kijivu, zambarau, färg, svart, vit, röd, blå, grön, gul, rosa, brun, grå, lila, kulay, itim, puti, pula, asul, berde, dilaw, rosas, kulay-kapeng, abo, lila, రంగు, నలుపు, తెలుపు, ఎరుపు, నీలం, ఆకుపచ్చ, పసుపు, గులాబీ, గోధుమ, బూడిద, ఊదా, колір, чорний, білий, червоний, синій, зелений, жовтий, рожевий, коричневий, сірий, фіолетовий, رنگ, کالا, سفید, لال, نیلا, سبز, پیلا, گلابی, بھورا, سرمئی, جامنی, rang, qora, oq, qizil, ko'k, yashil, sariq, pushti, jigarrang, kulrang, binafsha, रंग, काळा, पांढरा, लाल, निळा, हिरवा, पिवळा, गुलाबी, बदामी, राखाडी, जांभळा",
     "prejudice": "card, bank, payment, account, size, weight, price, quantity, time, date, status, shipping, fee, width, height, length"
   },
   "time_filters": {
@@ -1410,157 +1397,37 @@
       "semantic": "current day, today",
       "bias": "today, current day, this day, right now, present 24 hours, instantaneous",
       "prejudice": "yesterday, tomorrow, last week, next month, past, future, year, month, ago, history",
-      "exact_match": [
-        "today",
-        "오늘",
-        "今日",
-        "今天",
-        "hoy",
-        "aujourd'hui",
-        "heute",
-        "сегодня",
-        "اليوم",
-        "आज",
-        "hari ini",
-        "hôm nay",
-        "วันนี้",
-        "oggi",
-        "hoje",
-        "bugün",
-        "vandaag",
-        "dzisiaj",
-        "σήμερα",
-        "היום"
-      ]
+      "exact_match": ["today", "오늘", "今日", "今天", "hoy", "aujourd'hui", "heute", "сегодня", "اليوم", "आज", "hari ini", "hôm nay", "วันนี้", "oggi", "hoje", "bugün", "vandaag", "dzisiaj", "σήμερα", "היום"]
     },
     "yesterday": {
       "semantic": "previous day, yesterday",
       "bias": "yesterday, previous day, day before today, past 24 hours, one day ago",
       "prejudice": "today, tomorrow, last week, next month, future, year, month, now, current, present",
-      "exact_match": [
-        "yesterday",
-        "어제",
-        "昨日",
-        "昨天",
-        "ayer",
-        "hier",
-        "gestern",
-        "вчера",
-        "أمس",
-        "kemarin",
-        "hôm qua",
-        "เมื่อวาน",
-        "ieri",
-        "ontem",
-        "dün",
-        "gisteren",
-        "wczoraj",
-        "χθες",
-        "אתמול"
-      ]
+      "exact_match": ["yesterday", "어제", "昨日", "昨天", "ayer", "hier", "gestern", "вчера", "أمس", "kemarin", "hôm qua", "เมื่อวาน", "ieri", "ontem", "dün", "gisteren", "wczoraj", "χθες", "אתמול"]
     },
     "this_month": {
       "semantic": "current month",
       "bias": "this month, current month, present 30 days, current calendar month",
       "prejudice": "last month, next month, today, yesterday, year, week, day, specific hour, exact minute",
-      "exact_match": [
-        "this month",
-        "이번달",
-        "이번 달",
-        "금월",
-        "今月",
-        "本月",
-        "este mes",
-        "ce mois",
-        "diesen monat",
-        "в этом месяце",
-        "هذا الشهر",
-        "इस महीने",
-        "bulan ini",
-        "tháng này",
-        "เดือนนี้",
-        "questo mese",
-        "este mês",
-        "bu ay"
-      ]
+      "exact_match": ["this month", "이번달", "이번 달", "금월", "今月", "本月", "este mes", "ce mois", "diesen monat", "в этом месяце", "هذا الشهر", "इस महीने", "bulan ini", "tháng này", "เดือนนี้", "questo mese", "este mês", "bu ay"]
     },
     "last_month": {
       "semantic": "previous month",
       "bias": "last month, previous month, past 30 days, preceding calendar month",
       "prejudice": "this month, next month, today, yesterday, year, week, day, future, present",
-      "exact_match": [
-        "last month",
-        "지난달",
-        "지난 달",
-        "저번달",
-        "전월",
-        "先月",
-        "上个月",
-        "el mes pasado",
-        "le mois dernier",
-        "letzten monat",
-        "в прошлом месяце",
-        "الشهر الماضي",
-        "पिछले महीने",
-        "bulan lalu",
-        "tháng trước",
-        "เดือนที่แล้ว",
-        "il mese scorso",
-        "mês passado",
-        "geçen ay"
-      ]
+      "exact_match": ["last month", "지난달", "지난 달", "저번달", "전월", "先月", "上个月", "el mes pasado", "le mois dernier", "letzten monat", "в прошлом месяце", "الشهر الماضي", "पिछले महीने", "bulan lalu", "tháng trước", "เดือนที่แล้ว", "il mese scorso", "mês passado", "geçen ay"]
     },
     "this_year": {
       "semantic": "current year",
       "bias": "this year, current year, present 365 days, ongoing twelve months",
       "prejudice": "last year, next year, month, day, week, specific hour, exact minute, ago",
-      "exact_match": [
-        "this year",
-        "올해",
-        "금년",
-        "이번년",
-        "이번 해",
-        "今年",
-        "本年",
-        "este año",
-        "cette année",
-        "dieses jahr",
-        "в этом году",
-        "هذا العام",
-        "इस साल",
-        "tahun ini",
-        "năm nay",
-        "ปีนี้",
-        "quest'anno",
-        "este ano",
-        "bu yıl"
-      ]
+      "exact_match": ["this year", "올해", "금년", "이번년", "이번 해", "今年", "本年", "este año", "cette année", "dieses jahr", "в этом году", "هذا العام", "इस साल", "tahun ini", "năm nay", "ปีนี้", "quest'anno", "este ano", "bu yıl"]
     },
     "last_year": {
       "semantic": "previous year",
       "bias": "last year, previous year, past 365 days, preceding twelve months",
       "prejudice": "this year, next year, month, day, week, future, today, tomorrow, present",
-      "exact_match": [
-        "last year",
-        "작년",
-        "지난해",
-        "지난 해",
-        "전년",
-        "去年",
-        "昨年",
-        "el año pasado",
-        "l'année dernière",
-        "letztes jahr",
-        "в прошлом году",
-        "العام الماضي",
-        "पिछले साल",
-        "tahun lalu",
-        "năm ngoái",
-        "ปีที่แล้ว",
-        "l'anno scorso",
-        "ano passado",
-        "geçen yıl"
-      ]
+      "exact_match": ["last year", "작년", "지난해", "지난 해", "전년", "去年", "昨年", "el año pasado", "l'année dernière", "letztes jahr", "в прошлом году", "العام الماضي", "पिछले साल", "tahun lalu", "năm ngoái", "ปีที่แล้ว", "l'anno scorso", "ano passado", "geçen yıl"]
     },
     "recently": {
       "semantic": "recent past, lately",
@@ -1574,53 +1441,11 @@
       "bias": "spring, springtime, vernal equinox, blooming, flowers, sprout, thaw, rebirth, blossom",
       "prejudice": "summer, autumn, winter, fall, heat, hot, scorcher, cold, freezing, snow, ice, frost, harvest, falling leaves",
       "exact_match": [
-        "spring",
-        "봄",
-        "春",
-        "春天",
-        "primavera",
-        "printemps",
-        "frühling",
-        "весна",
-        "الربيع",
-        "वसंत",
-        "pranverë",
-        "yaz",
-        "বসন্ত",
-        "пролет",
-        "proljeće",
-        "jaro",
-        "forår",
-        "lente",
-        "voorjaar",
-        "kevad",
-        "kevät",
-        "გაზაფხული",
-        "άνοιξη",
-        "אביב",
-        "tavasz",
-        "vor",
-        "musim semi",
-        "kөктем",
-        "រដូវផ្ការីក",
-        "pavasaris",
-        "musim bunga",
-        "vår",
-        "بهار",
-        "wiosna",
-        "primăvară",
-        "пролеће",
-        "jar",
-        "pomlad",
-        "majira ya kuchipua",
-        "tagsibol",
-        "వసంత",
-        "ฤดูใบไม้ผลิ",
-        "ilkbahar",
-        "bahar",
-        "mùa xuân",
-        "bahor",
-        "بہار"
+        "spring", "봄", "春", "春天", "primavera", "printemps", "frühling", "весна", "الربيع", "वसंत", 
+        "pranverë", "yaz", "বসন্ত", "пролет", "proljeće", "jaro", "forår", "lente", "voorjaar", "kevad", 
+        "kevät", "გაზაფხული", "άνοιξη", "אביב", "tavasz", "vor", "musim semi", "kөктем", "រដូវផ្ការីក", 
+        "pavasaris", "musim bunga", "vår", "بهار", "wiosna", "primăvară", "пролеће", "jar", "pomlad", 
+        "majira ya kuchipua", "tagsibol", "వసంత", "ฤดูใบไม้ผลิ", "ilkbahar", "bahar", "mùa xuân", "bahor", "بہار"
       ]
     },
     "summer": {
@@ -1628,53 +1453,11 @@
       "bias": "summer, summertime, summer solstice, heat, hot, warm, beach, sunny, sweat",
       "prejudice": "spring, autumn, winter, fall, cold, freezing, snow, ice, frost, blooming, harvest, sprout",
       "exact_match": [
-        "summer",
-        "여름",
-        "夏",
-        "夏天",
-        "verano",
-        "été",
-        "sommer",
-        "лето",
-        "صيف",
-        "गर्मी",
-        "verë",
-        "yay",
-        "গ্রীষ্ম",
-        "лято",
-        "estiu",
-        "ljeto",
-        "léto",
-        "zomer",
-        "suvi",
-        "kesä",
-        "ზაფხული",
-        "καλοκαίρι",
-        "קיץ",
-        "nyár",
-        "sumar",
-        "musim panas",
-        "estate",
-        "жаз",
-        "រដូវក្តៅ",
-        "vasara",
-        "उन्हाळा",
-        "تابستان",
-        "lato",
-        "vară",
-        "leto",
-        "poletje",
-        "majira ya joto",
-        "tag-araw",
-        "tag-init",
-        "వేసవి",
-        "ฤดูร้อน",
-        "yaz",
-        "літо",
-        "موسم گرما",
-        "yoz",
-        "mùa hè",
-        "mùa hạ"
+        "summer", "여름", "夏", "夏天", "verano", "été", "sommer", "лето", "صيف", "गर्मी", 
+        "verë", "yay", "গ্রীষ্ম", "лято", "estiu", "ljeto", "léto", "zomer", "suvi", "kesä", 
+        "ზაფხული", "καλοκαίρι", "קיץ", "nyár", "sumar", "musim panas", "estate", "жаз", "រដូវក្តៅ", 
+        "vasara", "उन्हाळा", "تابستان", "lato", "vară", "leto", "poletje", "majira ya joto", "tag-araw", 
+        "tag-init", "వేసవి", "ฤดูร้อน", "yaz", "літо", "موسم گرما", "yoz", "mùa hè", "mùa hạ"
       ]
     },
     "autumn": {
@@ -1682,57 +1465,12 @@
       "bias": "autumn, autumnal equinox, falling leaves, foliage, breeze",
       "prejudice": "spring, summer, winter, heat, hot, warm, blooming, blossom, snow, freezing, ice, frost",
       "exact_match": [
-        "autumn",
-        "fall",
-        "가을",
-        "秋",
-        "秋天",
-        "otoño",
-        "automne",
-        "herbst",
-        "осень",
-        "خريف",
-        "पतझड़",
-        "vjeshtë",
-        "payız",
-        "শরৎ",
-        "есен",
-        "tardor",
-        "jesen",
-        "podzim",
-        "efterår",
-        "herfst",
-        "najaar",
-        "sügis",
-        "syksy",
-        "შემოდგომა",
-        "φθινόπωρο",
-        "סתיו",
-        "ősz",
-        "haust",
-        "musim gugur",
-        "autunno",
-        "күз",
-        "រដូវស្លឹកឈើជ្រุះ",
-        "rudens",
-        "ruduo",
-        "musim luruh",
-        "høst",
-        "پاییز",
-        "jesień",
-        "outono",
-        "toamnă",
-        "vuli",
-        "höst",
-        "taglagas",
-        "శరదృతువు",
-        "ฤดูใบไม้ร่วง",
-        "sonbahar",
-        "güz",
-        "осінь",
-        "خزاں",
-        "kuz",
-        "mùa thu"
+        "autumn", "fall", "가을", "秋", "秋天", "otoño", "automne", "herbst", "осень", "خريف", 
+        "पतझड़", "vjeshtë", "payız", "শরৎ", "есен", "tardor", "jesen", "podzim", "efterår", "herfst", 
+        "najaar", "sügis", "syksy", "შემოდგომა", "φθινόπωρο", "סתיו", "ősz", "haust", "musim gugur", 
+        "autunno", "күз", "រដូវស្លឹកឈើជ្រุះ", "rudens", "ruduo", "musim luruh", "høst", "پاییز", "jesień", 
+        "outono", "toamnă", "vuli", "höst", "taglagas", "శరదృతువు", "ฤดูใบไม้ร่วง", "sonbahar", "güz", 
+        "осінь", "خزاں", "kuz", "mùa thu"
       ]
     },
     "winter": {
@@ -1740,177 +1478,50 @@
       "bias": "winter, wintertime, winter solstice, cold, freezing, snow, ice, frost, chill, blizzard",
       "prejudice": "spring, summer, autumn, fall, heat, hot, warm, sunny, beach, blooming, blossom, harvest",
       "exact_match": [
-        "winter",
-        "겨울",
-        "冬",
-        "冬天",
-        "invierno",
-        "hiver",
-        "зима",
-        "شتاء",
-        "सर्दी",
-        "dimër",
-        "qış",
-        "শীত",
-        "hivern",
-        "zima",
-        "talv",
-        "talvi",
-        "ზამთარი",
-        "χειμώνας",
-        "חורף",
-        "tél",
-        "vetur",
-        "musim dingin",
-        "inverno",
-        "қыс",
-        "រដូវរងារ",
-        "ziema",
-        "žiema",
-        "musim sejuk",
-        "हिवाळा",
-        "زمستان",
-        "iarnă",
-        "majira ya baridi",
-        "taglamig",
-        "చలికాలం",
-        "ฤดูหนาว",
-        "kış",
-        "موسم سرما",
-        "qish",
-        "mùa đông"
+        "winter", "겨울", "冬", "冬天", "invierno", "hiver", "зима", "شتاء", "सर्दी", "dimër", 
+        "qış", "শীত", "hivern", "zima", "talv", "talvi", "ზამთარი", "χειμώνας", "חורף", "tél", 
+        "vetur", "musim dingin", "inverno", "қыс", "រដូវរងារ", "ziema", "žiema", "musim sejuk", "हिवाळा", 
+        "زمستان", "iarnă", "majira ya baridi", "taglamig", "చలికాలం", "ฤดูหนาว", "kış", "موسم سرما", 
+        "qish", "mùa đông"
       ]
     }
   },
   "status_filters": {
-    "draft": {
-      "bias": "draft, preparation, pending pickup, cart",
-      "prejudice": "complete, delivered, closed, running, active"
-    },
-    "progress": {
-      "bias": "progress, processing, active, running, transit",
-      "prejudice": "draft, complete, error, stop, pause"
-    },
-    "return": {
-      "bias": "return, returning",
-      "prejudice": "progress, complete, draft"
-    },
-    "complete": {
-      "bias": "complete, delivered, closed, finished, published",
-      "prejudice": "draft, progress, error, stop, return"
-    },
-    "error": {
-      "bias": "error, exception, failed, spam, blocked, rejected",
-      "prejudice": "complete, progress, active, draft"
-    },
-    "show": {
-      "bias": "show, visible, active",
-      "prejudice": "hide, hidden, stop"
-    },
-    "hide": {
-      "bias": "hide, hidden",
-      "prejudice": "show, visible, active"
-    },
-    "stop": {
-      "bias": "stop, hold, pause, suspended, blocked",
-      "prejudice": "progress, active, running, complete"
-    },
-    "cancel": {
-      "bias": "cancel, cancelled, deleted, withdrawn, discontinued",
-      "prejudice": "progress, complete, draft, active"
-    },
-    "refund": {
-      "bias": "refund, refunded",
-      "prejudice": "progress, active, complete"
-    },
-    "exchange": {
-      "bias": "exchange, exchanged",
-      "prejudice": "refund, return, complete"
-    },
-    "expire": {
-      "bias": "expire, expired",
-      "prejudice": "progress, active, complete"
-    },
-    "remove": {
-      "bias": "remove, deleted",
-      "prejudice": "show, complete, draft"
-    }
+    "draft": { "bias": "draft, preparation, pending pickup, cart", "prejudice": "complete, delivered, closed, running, active" },
+    "progress": { "bias": "progress, processing, active, running, transit", "prejudice": "draft, complete, error, stop, pause" },
+    "return": { "bias": "return, returning", "prejudice": "progress, complete, draft" },
+    "complete": { "bias": "complete, delivered, closed, finished, published", "prejudice": "draft, progress, error, stop, return" },
+    "error": { "bias": "error, exception, failed, spam, blocked, rejected", "prejudice": "complete, progress, active, draft" },
+    "show": { "bias": "show, visible, active", "prejudice": "hide, hidden, stop" },
+    "hide": { "bias": "hide, hidden", "prejudice": "show, visible, active" },
+    "stop": { "bias": "stop, hold, pause, suspended, blocked", "prejudice": "progress, active, running, complete" },
+    "cancel": { "bias": "cancel, cancelled, deleted, withdrawn, discontinued", "prejudice": "progress, complete, draft, active" },
+    "refund": { "bias": "refund, refunded", "prejudice": "progress, active, complete" },
+    "exchange": { "bias": "exchange, exchanged", "prejudice": "refund, return, complete" },
+    "expire": { "bias": "expire, expired", "prejudice": "progress, active, complete" },
+    "remove": { "bias": "remove, deleted", "prejudice": "show, complete, draft" }
   },
   "substantial_filters": {
-    "size": {
-      "bias": "size, physical dimensions, volume, width, height, length",
-      "prejudice": "weight, price, discount, quantity"
-    },
-    "weight": {
-      "bias": "weight, mass, heaviness",
-      "prejudice": "size, price, discount, quantity"
-    },
-    "shipping_fee": {
-      "bias": "shipping fee, cost of delivery, freight",
-      "prejudice": "sale price, supply price, size, weight"
-    },
-    "shipping_duration": {
-      "bias": "shipping duration, time taken for delivery",
-      "prejudice": "size, weight, price, fee"
-    },
-    "sale_price": {
-      "bias": "sale price, selling price, final price, customer price",
-      "prejudice": "shipping fee, weight, size, quantity"
-    },
-    "supply_price": {
-      "bias": "supply price, wholesale, original cost, purchase price",
-      "prejudice": "sale price, shipping fee, weight, size"
-    },
-    "low_stock_threshold": {
-      "bias": "low stock threshold, minimum inventory alert level",
-      "prejudice": "price, weight, size, fee"
-    },
-    "discount": {
-      "bias": "discount, price reduction, markdown",
-      "prejudice": "sale price, weight, size, duration"
-    },
-    "min_order_amount": {
-      "bias": "minimum order amount, spend required",
-      "prejudice": "sale price, weight, size"
-    },
-    "max_discount_amount": {
-      "bias": "maximum discount amount, discount cap",
-      "prejudice": "sale price, weight, size"
-    },
-    "usage_limit": {
-      "bias": "usage limit, maximum number of times usable globally",
-      "prejudice": "sale price, weight, size"
-    },
-    "usage_per": {
-      "bias": "usage per user, maximum times usable per user",
-      "prejudice": "sale price, weight, size"
-    }
+    "size": { "bias": "size, physical dimensions, volume, width, height, length", "prejudice": "weight, price, discount, quantity" },
+    "weight": { "bias": "weight, mass, heaviness", "prejudice": "size, price, discount, quantity" },
+    "shipping_fee": { "bias": "shipping fee, cost of delivery, freight", "prejudice": "sale price, supply price, size, weight" },
+    "shipping_duration": { "bias": "shipping duration, time taken for delivery", "prejudice": "size, weight, price, fee" },
+    "sale_price": { "bias": "sale price, selling price, final price, customer price", "prejudice": "shipping fee, weight, size, quantity" },
+    "supply_price": { "bias": "supply price, wholesale, original cost, purchase price", "prejudice": "sale price, shipping fee, weight, size" },
+    "low_stock_threshold": { "bias": "low stock threshold, minimum inventory alert level", "prejudice": "price, weight, size, fee" },
+    "discount": { "bias": "discount, price reduction, markdown", "prejudice": "sale price, weight, size, duration" },
+    "min_order_amount": { "bias": "minimum order amount, spend required", "prejudice": "sale price, weight, size" },
+    "max_discount_amount": { "bias": "maximum discount amount, discount cap", "prejudice": "sale price, weight, size" },
+    "usage_limit": { "bias": "usage limit, maximum number of times usable globally", "prejudice": "sale price, weight, size" },
+    "usage_per": { "bias": "usage per user, maximum times usable per user", "prejudice": "sale price, weight, size" }
   },
   "find_filters": {
-    "many": {
-      "bias": "many, high quantity, count, volume",
-      "prejudice": "few, little, low, light, heavy"
-    },
-    "few": {
-      "bias": "few, low quantity, count, volume",
-      "prejudice": "many, much, high, light, heavy"
-    },
-    "much": {
-      "bias": "much, high financial value, price, amount",
-      "prejudice": "few, little, low, light, heavy"
-    },
-    "little": {
-      "bias": "little, low financial value, price, amount",
-      "prejudice": "many, much, high, light, heavy"
-    },
-    "heavy": {
-      "bias": "heavy, high physical weight",
-      "prejudice": "many, few, much, little, light"
-    },
-    "light": {
-      "bias": "light, low physical weight",
-      "prejudice": "many, few, much, little, heavy"
-    }
+    "many": { "bias": "many, high quantity, count, volume", "prejudice": "few, little, low, light, heavy" },
+    "few": { "bias": "few, low quantity, count, volume", "prejudice": "many, much, high, light, heavy" },
+    "much": { "bias": "much, high financial value, price, amount", "prejudice": "few, little, low, light, heavy" },
+    "little": { "bias": "little, low financial value, price, amount", "prejudice": "many, much, high, light, heavy" },
+    "heavy": { "bias": "heavy, high physical weight", "prejudice": "many, few, much, little, light" },
+    "light": { "bias": "light, low physical weight", "prejudice": "many, few, much, little, heavy" }
   },
   "ko": {
     "tracking": {
@@ -2736,6 +2347,7 @@
         "bias": "HS코드, 세번, 관세분류번호, 품목분류, HS code, HS No, tariff number, tariff classification, HTS",
         "prejudice": "컨테이너번호, 씰번호, 서류번호, 부킹번호, 중량, 금액, 통화, 발행일, 항구, 선박명"
       },
+
       "no": {
         "semantic": "일련번호, 항목번호, 순번",
         "bias": "번호, 순번, 연번, 항목번호, 일련번호, No, S/No, Item No, line number, serial number",
@@ -2746,6 +2358,7 @@
         "bias": "만료일, 유효기일, 유효기한, 최종기한, 최종선적일, 신용장 유효기일, expiry date, date of expiry, valid until, validity, latest date, expiration date",
         "prejudice": "발행일, 작성일, 선적일, 출항일, 입항일, 서류번호, 발송인, 수하인, 항구, 중량, 금액"
       },
+
       "sender_address": {
         "semantic": "송하인 주소, 수출자 주소, 판매자 주소",
         "bias": "송하인 주소, 수출자 주소, 판매자 주소, 선적인 주소, 발송지 주소, 공급자 주소, shipper address, exporter address, seller address, consignor address, address of shipper",
@@ -2761,6 +2374,7 @@
         "bias": "통지처, 착화통지처, 통지선, 도착통지처, notify party, notify, also notify party, notify address",
         "prejudice": "송하인, 수출자, 판매자, 수하인, 수입자, 구매자, 선사, 운송인, 항구, 서류번호, 발행일, 중량, 금액"
       },
+
       "voyage_number": {
         "semantic": "항차, 항차번호, 편명번호",
         "bias": "항차, 항차번호, 항해번호, 운항번호, 편명, 편번호, VOY, V.NO, voyage number, voyage no, voy, flight leg, sailing number, V.123E, 0091E, 2426W",
@@ -2801,6 +2415,7 @@
         "bias": "운송기관, 운송장비, 운반수단, 차량, 트럭, 컨테이너선, 화물기, means of conveyance, conveyance, vehicle, truck, vessel type",
         "prejudice": "선박명, 항차, 운송수단, 항구, 서류번호, 중량, 금액"
       },
+
       "payment_terms": {
         "semantic": "결제조건, 지급조건",
         "bias": "결제조건, 지급조건, 대금결제조건, 송금방식, 전신환송금, 신용장방식, 일람불, 기한부, 외상, 선급, T/T, TT, L/C, LC, D/A, D/P, at sight, usance, net 30, net 60, payment terms, terms of payment, 30일, 60일, 90일",
@@ -2831,6 +2446,7 @@
         "bias": "특기사항, 특별지시사항, 비고, 참고사항, 유의사항, 요청사항, special instructions, remarks, notes, additional information, handling instructions",
         "prejudice": "서류번호, 발행일, 발송인, 수하인, 항구, 선박명, 중량, 금액, 통화, HS코드"
       },
+
       "amount_subtotal": {
         "semantic": "소계, 세전금액",
         "bias": "소계, 소계금액, 세전금액, 공급가액, 물품대금, 상품금액, subtotal, sub total, net amount, amount before tax, goods value",
@@ -2886,6 +2502,7 @@
         "bias": "스위프트코드, SWIFT, BIC, 은행식별코드, 전신코드, SWIFT code, BIC code, bank identifier code",
         "prejudice": "계좌번호, 서류번호, 컨테이너번호, 전화번호, 사업자등록번호, 금액, 통화"
       },
+
       "package_unit": {
         "semantic": "포장단위, 포장형태",
         "bias": "포장단위, 포장형태, 포장종류, 카톤, 박스, 팔레트, 드럼, 베일, 번들, 상자, CTN, CARTON, PLT, PALLET, PKG, PACKAGE, BOX, DRUM, BALE, BUNDLE, CASE, ROLL, package unit, type of package",
@@ -2901,6 +2518,7 @@
         "bias": "운임중량, 청구중량, 과금중량, 요금적용중량, 용적중량, chargeable weight, charge weight, volumetric weight, dimensional weight",
         "prejudice": "총중량, 순중량, 용적, 포장수, 금액, 통화, 서류번호, 컨테이너번호"
       },
+
       "description": {
         "semantic": "품명, 상품명세, 물품명",
         "bias": "품명, 상품명세, 물품명, 물품명세, 화물명세, 상품설명, 품목명, 명세, description of goods, description, commodity, commodity description, item description, goods description, nature of goods",
@@ -2956,6 +2574,7 @@
         "bias": "품목 포장형태, 라인 포장종류, 항목별 포장단위, package type, kind of package, packing type",
         "prejudice": "전체 포장단위, 수량, 단위, 중량, 용적, 단가, 금액"
       },
+
       "type_size": {
         "semantic": "컨테이너 규격, 컨테이너 종류",
         "bias": "컨테이너 규격, 컨테이너 종류, 컨테이너 타입, 규격, 20피트, 40피트, 20GP, 40GP, 40HC, 45HC, 20RF, 40RF, 20OT, 40FR, DRY, REEFER, type and size, size type, container type",
@@ -2976,6 +2595,7 @@
         "bias": "컨테이너별 용적, 컨테이너 용적, 컨테이너 부피, measurement, CBM per container, container measurement, M3",
         "prejudice": "전체 용적, 중량, 컨테이너번호, 씰번호, 규격, 포장수, 금액"
       },
+
       "party_role": {
         "semantic": "당사자 역할, 관계자 구분",
         "bias": "역할, 구분, 당사자, 관계자, 운송인, 선사, 보험자, 피보험자, 발행은행, 통지은행, 관세사, 세관, 창고업자, 검사기관, 계량기관, 손해사정인, 청구인, 신청인, 발행인, 지급인, 수취인, 선적대리점, 운송주선인, carrier, insurer, insured, issuing bank, advising bank, customs broker, customs authority, warehouse operator, inspection agency, surveying agency, claimant, applicant, drawer, drawee, payee, shipping agent, freight forwarder",
