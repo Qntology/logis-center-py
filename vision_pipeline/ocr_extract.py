@@ -1054,6 +1054,7 @@ PROSE_MAX_LINES = 12
 PROSE_FIELD_MARGIN = 0.01
 PROSE_MIN_CHARS = 3
 PROSE_MIN_CHARS_DENSE = 1
+PROSE_CAPACITY_SLACK = 1.15
 DENSE_SCRIPTS = ("hangul", "han", "hiragana", "katakana", "kana", "cjk")
 
 
@@ -1075,9 +1076,9 @@ def prose_min_chars(text: str) -> int:
 def field_value_lengths(
     schema: Optional[dict],
     category: str,
-) -> Dict[str, float]:
+) -> Dict[str, Tuple[float, float]]:
     fields = (schema or {}).get("fields", {}) or {}
-    out: Dict[str, float] = {}
+    out: Dict[str, Tuple[float, float]] = {}
     for name, definition in fields.items():
         d = definition if isinstance(definition, dict) else {}
         if category and str(d.get("category") or "misc") != category:
@@ -1091,7 +1092,9 @@ def field_value_lengths(
         if not lens:
             continue
         lens.sort()
-        out[str(name)] = lens[len(lens) // 2]
+        mid = lens[len(lens) // 2]
+        top = lens[min(len(lens) - 1, int(len(lens) * 0.9))]
+        out[str(name)] = (float(mid), float(top))
     return out
 
 
@@ -1120,21 +1123,35 @@ def pick_prose_field(
         profile = field_value_lengths(schema, category)
         want = float(len("".join(str(text or "").split())))
         if profile and want > 0.0:
-            scored = sorted(
-                profile.items(),
-                key=lambda kv: abs(
-                    math.log((want + 1.0) / (float(kv[1]) + 1.0))
-                ),
-            )
-            pick, typical = str(scored[0][0]), float(scored[0][1])
+            fits = [
+                (name, mid, cap) for name, (mid, cap) in profile.items()
+                if want <= cap * PROSE_CAPACITY_SLACK
+            ]
+            if fits:
+                fits.sort(key=lambda t: (t[2], abs(t[1] - want)))
+                pick = str(fits[0][0])
+                typical = float(fits[0][1])
+                cap = float(fits[0][2])
+                mode = f"용량 {cap:.0f}자"
+            else:
+                scored = sorted(
+                    profile.items(),
+                    key=lambda kv: abs(
+                        math.log((want + 1.0) / (float(kv[1][1]) + 1.0))
+                    ),
+                )
+                pick = str(scored[0][0])
+                typical = float(scored[0][1][0])
+                cap = float(scored[0][1][1])
+                mode = f"용량 {cap:.0f}자 (어느 필드에도 들어가지 않아 최근접)"
             if log is not None:
                 log.append(
                     f"       📏 [PROSE LENGTH] '{category}' 은 사전 n-gram 이 "
                     f"'{top or '-'}'({top_s:.3f}) 와 '{second or '-'}'"
                     f"({second_s:.3f}) 로 동률이라 값 길이로 가릅니다 — 판독문 "
-                    f"{int(want)}자에 가장 가까운 전형 길이 {typical:.0f}자를 "
-                    f"가진 '{pick}' 을 고릅니다. 라벨이 없는 지면에서는 "
-                    f"값의 길이가 필드를 가장 잘 구분합니다."
+                    f"{int(want)}자가 들어가는 가장 좁은 그릇 '{pick}' "
+                    f"({mode} / 전형 {typical:.0f}자) 을 고릅니다. 중앙값으로 "
+                    f"비교하면 짧은 값만 담는 필드가 긴 문장을 가져갑니다."
                 )
             return pick
 
@@ -1296,24 +1313,37 @@ def promote_prose_lines(
 
     fmt_map = _field_format_map(schema)
     if _format_penalty(fmt_map.get(target, ""), joined) < 1.0:
-        alt = ""
+        profile = field_value_lengths(schema, category)
+        want = float(len("".join(str(joined or "").split())))
+
+        pool: List[Tuple[float, float, str]] = []
         for name, cat in owner.items():
             if str(cat) != str(category) or name == target:
                 continue
             if name not in fields:
                 continue
-            if _format_penalty(fmt_map.get(str(name), ""), joined) >= 1.0:
-                alt = str(name)
-                break
+            if _format_penalty(fmt_map.get(str(name), ""), joined) < 1.0:
+                continue
+            mid, cap = profile.get(str(name), (want, want))
+            if want > float(cap) * PROSE_CAPACITY_SLACK:
+                continue
+            pool.append((float(cap), abs(float(mid) - want), str(name)))
+
+        pool.sort()
+        alt = pool[0][2] if pool else ""
+
         if log is not None:
             log.append(
                 f"       🚧 [PROSE FORMAT] '{target}' 는 형식이 "
                 f"'{fmt_map.get(target, '-')}' 인데 값 '{joined[:20]}' 가 맞지 "
                 f"않습니다 — "
                 + (
-                    f"같은 카테고리의 '{alt}' 로 옮깁니다."
+                    f"같은 카테고리에서 형식이 맞고 {int(want)}자가 들어가는 "
+                    f"필드 {len(pool)}개 중 가장 좁은 '{alt}' 로 옮깁니다."
                     if alt else
-                    "대체할 필드가 없어 이 크롭은 값을 만들지 않습니다."
+                    "형식이 맞으면서 이 길이를 담을 필드가 없어 이 크롭은 "
+                    "값을 만들지 않습니다 — 선언 순서로 아무 필드나 고르면 "
+                    "통화 코드 칸에 상품명이 들어갑니다."
                 )
             )
         if not alt:
@@ -1515,12 +1545,15 @@ def _ocr_tiles(
         if b[0] < tx1 and b[2] > tx0 and b[1] < ty1 and b[3] > ty0
     ]
 
-    if int(patches) > 0 and int(legible) <= 0 and not inside_boxes:
+    if int(patches) > 0 and not inside_boxes and (
+        bool(text_boxes) or int(legible) <= 0
+    ):
         if log is not None:
             log.append(
-                f"    🚫 [EMPTY CROP SKIP] '{category}' 는 판독 가능 패치가 "
-                f"0/{patches} 개이고 검출 박스도 0개입니다. OCR·VLM 호출을 "
-                f"모두 생략합니다."
+                f"    🚫 [EMPTY CROP SKIP] '{category}' 크롭을 가로지르는 "
+                f"검출 박스가 0개입니다 (판독 가능 {legible}/{patches}). "
+                f"검출기가 지면 전체에서는 글자를 찾았는데 이 자리만 "
+                f"비었다는 뜻이므로 OCR·VLM 호출을 모두 생략합니다."
             )
         return "", 1.0, "", 0, None, []
 
@@ -1812,6 +1845,7 @@ TABLE_COL_TOLERANCE = 0.55
 TABLE_ROW_TOLERANCE = 0.70
 TABLE_HEADER_MERGE_BANDS = 2
 TABLE_HEADER_X_OVERLAP = 0.45
+TABLE_HEADER_ALT_DEPTH = 8
 
 
 def reconcile_claims(
@@ -1820,7 +1854,7 @@ def reconcile_claims(
     schema: Optional[dict],
     log: Optional[List[str]] = None,
 ) -> None:
-    if not proposals or not fields:
+    if not fields:
         return
 
     owner = _field_category_map(schema)
@@ -1843,6 +1877,72 @@ def reconcile_claims(
         final[str(field)] = (str(value), float(score), str(category))
         if vkey:
             value_owner[vkey] = (str(field), float(score))
+
+    seen_rows: Dict[str, str] = {
+        k: v[0] for k, v in value_owner.items()
+    }
+    row_dropped = 0
+    row_notes: List[str] = []
+    table_kept: List[str] = []
+
+    for f in sorted(
+        fields, key=lambda x: -float(getattr(x, "score", 0.0))
+    ):
+        rows = getattr(f, "rows", None) or []
+        if not rows:
+            continue
+        if bool(getattr(f, "table_backed", False)):
+            table_kept.append(f"{f.category}({len(rows)}행)")
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                for k, v in row.items():
+                    vkey = _norm_text(v)
+                    if vkey and vkey not in seen_rows:
+                        seen_rows[vkey] = str(k)
+            continue
+        kept: List[dict] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            live: Dict[str, object] = {}
+            for k, v in row.items():
+                vkey = _norm_text(v)
+                if not vkey:
+                    continue
+                held = seen_rows.get(vkey)
+                if held is not None and held != str(k):
+                    row_dropped += 1
+                    if len(row_notes) < 8:
+                        row_notes.append(
+                            f"{f.category}.{k}={str(v)[:20]} → "
+                            f"'{held}' 선점"
+                        )
+                    continue
+                seen_rows[vkey] = str(k)
+                live[k] = v
+            if live:
+                kept.append(live)
+        f.rows = kept
+
+    if row_dropped and log is not None:
+        log.append(
+            f"  🧮 [ROW CLAIM] 배열 셀 {row_dropped}건을 버렸습니다 — 점수가 "
+            f"더 높은 크롭이 같은 글자를 이미 다른 필드로 확정했습니다. "
+            f"예전에는 단일값만 값 배타를 거쳐, 같은 말풍선 한 줄이 여러 "
+            f"카테고리 배열에 그대로 복제됐습니다."
+        )
+        for note in row_notes:
+            log.append(f"     · {note}")
+
+    if table_kept and log is not None:
+        log.append(
+            f"  🧾 [ROW CLAIM EXEMPT] 표 헤더로 컬럼이 확정된 배열 "
+            f"{', '.join(table_kept)} 은 값 배타에서 제외했습니다 — 셀 위치가 "
+            f"헤더 x 좌표로 이미 정해져 있으므로, 같은 숫자가 QTY 열의 여러 "
+            f"행에 나오는 것이 정상입니다. 위치 근거 없는 산문 행에만 값 "
+            f"배타를 겁니다."
+        )
 
     by_cat: Dict[str, ExtractedField] = {}
     for f in fields:
@@ -1954,6 +2054,8 @@ def build_table_rows(
     header_band = -1
     header_cols: List[Tuple[str, float, float]] = []
     header_slots: List[Tuple[str, float, float]] = []
+    header_dup = 0
+    header_moved = 0
     header_span = 1
 
     for bi, _band in enumerate(ordered):
@@ -1961,28 +2063,61 @@ def build_table_rows(
             group = ordered[bi: bi + span]
             if len(group) < span:
                 break
+
+            raw: List[Tuple[str, float, float, float, List[Tuple[str, float]]]] = []
+            for text, x0, x1 in _merge_header_cells(group):
+                floor = label_cosine_floor(text)
+                ranked_all = sorted(
+                    index.scores(text).items(),
+                    key=lambda kv: kv[1], reverse=True,
+                )
+                alt = [
+                    (str(k), float(v)) for k, v in ranked_all
+                    if float(v) >= floor
+                ][:TABLE_HEADER_ALT_DEPTH]
+                head = alt[0][0] if alt else ""
+                hs = alt[0][1] if alt else 0.0
+                raw.append((head, hs, x0, x1, alt))
+
+            pool: List[Tuple[float, int, str]] = []
+            for i, (_f, _s, _x0, _x1, alt) in enumerate(raw):
+                for name, sc in alt:
+                    pool.append((float(sc), i, str(name)))
+            pool.sort(key=lambda t: (-t[0], t[1]))
+
+            taken_col: Dict[int, str] = {}
+            taken_field: Dict[str, int] = {}
+            for sc, i, name in pool:
+                if i in taken_col or name in taken_field:
+                    continue
+                taken_col[i] = name
+                taken_field[name] = i
+
             slots: List[Tuple[str, float, float]] = []
             cols: List[Tuple[str, float, float]] = []
-            for text, x0, x1 in _merge_header_cells(group):
-                field = match_label_to_field(text, index)
-                slots.append((str(field or ""), x0, x1))
-                if not field:
+            dup = 0
+            moved = 0
+            for i, (head, _hs, x0, x1, alt) in enumerate(raw):
+                name = taken_col.get(i, "")
+                if not name:
+                    if alt:
+                        dup += 1
+                    slots.append(("", x0, x1))
                     continue
-                cols.append((field, x0, x1))
+                if head and name != head:
+                    moved += 1
+                slots.append((name, x0, x1))
+                cols.append((name, x0, x1))
+
             if len(cols) < TABLE_HEADER_MIN_COLS:
                 continue
             cols.sort(key=lambda c: c[1])
-            seen: set = set()
-            uniq: List[Tuple[str, float, float]] = []
-            for c in cols:
-                if c[0] in seen:
-                    continue
-                seen.add(c[0])
-                uniq.append(c)
-            if len(uniq) >= TABLE_HEADER_MIN_COLS:
+            if len(cols) >= TABLE_HEADER_MIN_COLS:
                 header_band = int(group[-1])
-                header_cols = uniq
+                header_cols = cols
                 header_slots = sorted(slots, key=lambda c: c[1])
+                header_dup = dup
+                header_moved = moved
                 header_span = span
                 break
         if header_band >= 0:
@@ -1993,13 +2128,17 @@ def build_table_rows(
 
     if log is not None:
         blind = [s for s in header_slots if not s[0]]
-        if blind:
+        if blind or header_moved:
             log.append(
                 f"    🕳 [TABLE BLIND COL] 헤더 칸 {len(header_slots)}개 중 "
                 f"{len(blind)}개는 스키마 필드에 붙지 않았습니다 "
-                f"(x≈{', '.join(str(int(s[1])) for s in blind[:6])}). "
-                f"이 자리에 떨어진 값은 배정하지 않습니다 — 예전에는 최근접 "
-                f"인식 컬럼으로 밀려 옆 컬럼 값이 덮어썼습니다."
+                f"(x≈{', '.join(str(int(s[1])) for s in blind[:6]) or '-'}). "
+                f"중복으로 밀린 칸 {header_dup + header_moved}개 중 "
+                f"{header_moved}개는 사전 차점 필드로 옮겨 살렸고 "
+                f"{header_dup}개는 차점도 없어 맹점으로 내렸습니다 — OCR 이 "
+                f"'UNIT OF MEASURE' 'UNIT WEIG' 'UNIT VALU' 를 모두 같은 "
+                f"필드로 밀어 넣으면 한 칸만 이기고 나머지 자리의 값이 옆 "
+                f"컬럼으로 밀립니다."
             )
 
     if log is not None:
@@ -2298,7 +2437,17 @@ def extract_from_crops(
                     str(dname), str(dpayload[0]),
                 ))
 
-        if active_refine is None and not values and not rows_out:
+        owned = int(getattr(plan, "owned_patches", -1))
+        if active_refine is None and not values and not rows_out and owned == 0:
+            if log is not None:
+                log.append(
+                    f"    ⛔ [PROSE TERRITORY] '{plan.category}' 크롭은 최종 "
+                    f"좌표 안에 자기 영토 패치를 한 칸도 담지 않았습니다. "
+                    f"인쇄 라벨이 없는 지면에서 줄 전체를 값으로 승격하면 "
+                    f"남의 셀 글자가 이 축의 값이 됩니다 — OCR 원문만 "
+                    f"보존합니다."
+                )
+        elif active_refine is None and not values and not rows_out:
             prose_vals, prose_rows = promote_prose_lines(
                 cleaned, schema, plan.category,
                 top_field=str(getattr(plan, "top_field", "") or ""),
@@ -2321,6 +2470,7 @@ def extract_from_crops(
         if is_twin:
             twin_owner = str(plan.source).split(":", 1)[-1]
         owner_failed = bool(twin_owner) and twin_owner in twin_table_failed
+        table_backed = False
 
         if is_twin and plan.category in arrays and not owner_failed:
             if log is not None:
@@ -2341,6 +2491,7 @@ def extract_from_crops(
             )
             if table:
                 rows_out.extend(table)
+                table_backed = True
             else:
                 twin_table_failed.add(str(plan.category))
                 if log is not None:
@@ -2376,6 +2527,7 @@ def extract_from_crops(
         field.field_values = values
         field.donations = dict(donated)
         field.rows = rows_out if plan.category in arrays else []
+        field.table_backed = bool(table_backed and field.rows)
         field.line_texts = list(line_texts)
         field.line_windows = int(windows_n)
         out.append(field)
@@ -2390,9 +2542,17 @@ def extract_from_crops(
                 preview = field.value[:60].replace("\n", " / ")
                 log.append(f"    📝 '{plan.category}' = {preview or '(공백)'}")
 
-    if proposals:
-        reconcile_claims(out, proposals, schema, log=log)
+    reconcile_claims(out, proposals, schema, log=log)
 
+    return out
+
+
+def _array_categories(schema: Optional[dict]) -> set:
+    out = set()
+    for _name, definition in ((schema or {}).get("fields", {}) or {}).items():
+        d = definition if isinstance(definition, dict) else {}
+        if d.get("array") or d.get("table"):
+            out.add(str(d.get("category") or "misc"))
     return out
 
 
@@ -2405,8 +2565,12 @@ def fields_to_record(
     raw_text: Dict[str, str] = {}
     schema_fields = set((schema or {}).get("fields", {}) or {})
     array_fields = _array_field_names(schema)
+    array_cats = _array_categories(schema)
 
     carried: List[str] = []
+    text_blocked: List[str] = []
+
+    stacked: List[str] = []
 
     for f in fields:
         if getattr(f, "rows", None):
@@ -2439,6 +2603,9 @@ def fields_to_record(
                 if key in record and record[key]:
                     continue
                 record[key] = val
+
+    for f in fields:
+        if getattr(f, "rows", None) or f.field_values:
             continue
 
         val = f.value
@@ -2448,14 +2615,28 @@ def fields_to_record(
             prev = raw_text.get(f.category, "")
             raw_text[f.category] = (prev + "\n" + val).strip() if prev else val
             continue
-        if f.category in record:
-            prev = record[f.category]
-            if isinstance(prev, list):
-                prev.append(val)
-            else:
-                record[f.category] = [prev, val]
-        else:
-            record[f.category] = val
+        if f.category in array_cats:
+            text_blocked.append(f.category)
+            prev = raw_text.get(f.category, "")
+            raw_text[f.category] = (prev + "\n" + val).strip() if prev else val
+            continue
+        if record.get(f.category):
+            stacked.append(f.category)
+            prev = raw_text.get(f.category, "")
+            raw_text[f.category] = (prev + "\n" + val).strip() if prev else val
+            continue
+        record[f.category] = val
+
+    if log is not None and stacked:
+        uniq = sorted(set(stacked))
+        log.append(
+            f"  🧱 [VALUE STACK BLOCK] 카테고리 {', '.join(uniq)} 는 이름이 "
+            f"스키마 필드와 같아 OCR 원문이 record 로 들어갑니다. 같은 "
+            f"카테고리 크롭이 둘 이상일 때 문자열을 배열로 쌓으면 접지가 "
+            f"리스트를 건너뛰어 폐기 판정이 무시되고 자연어 요약도 그 "
+            f"카테고리를 통째로 빠뜨립니다. 확정값을 남기고 나머지 원문 "
+            f"{len(stacked)}건은 ocr_by_category 로 보냈습니다."
+        )
 
     pool: Dict[str, Tuple[str, float]] = {}
     for f in fields:
@@ -2482,6 +2663,16 @@ def fields_to_record(
             continue
         record[key] = payload[0]
         adopted.append(f"{key}={payload[0][:24]}")
+
+    if log is not None and text_blocked:
+        uniq = sorted(set(text_blocked))
+        log.append(
+            f"  🧱 [ARRAY TEXT BLOCK] 배열 카테고리 {', '.join(uniq)} 에 "
+            f"OCR 원문이 문자열로 들어가려는 것을 {len(text_blocked)}건 "
+            f"막았습니다. 같은 키에 딕셔너리 행과 문자열이 섞이면 자연어 "
+            f"요약이 그 카테고리를 통째로 건너뜁니다. 원문은 "
+            f"ocr_by_category 에 보존됩니다."
+        )
 
     if log is not None and carried:
         log.append(

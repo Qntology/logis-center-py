@@ -12,6 +12,9 @@ MERGE_GAP_X = 12
 MERGE_GAP_Y = 4
 
 TIGHTEN_PAD_SPAN_RATIO = 0.25
+STRADDLE_MIN_RATIO = 0.25
+STRADDLE_MAX_GROWTH = 1.9
+STRADDLE_MAX_ROUNDS = 2
 
 
 def _binarize(image: Image.Image) -> np.ndarray:
@@ -234,6 +237,11 @@ def box_tighten(
     nx1 = max(nx1, cx1)
     ny1 = max(ny1, cy1)
 
+    nx0 = max(nx0, rx0 - px)
+    ny0 = max(ny0, ry0 - py)
+    nx1 = min(nx1, rx1 + px)
+    ny1 = min(ny1, ry1 + py)
+
     ux0 = min(rx0, cx0)
     uy0 = min(ry0, cy0)
     ux1 = max(rx1, cx1)
@@ -256,6 +264,69 @@ def box_tighten(
         return None
 
     return (int(nx0), int(ny0), int(nx1), int(ny1))
+
+
+def straddling_boxes(
+    boxes: Sequence[Tuple[int, int, int, int]],
+    rect: Tuple[int, int, int, int],
+    min_ratio: float = STRADDLE_MIN_RATIO,
+) -> List[Tuple[int, int, int, int]]:
+    x0, y0, x1, y1 = (int(v) for v in rect)
+    out: List[Tuple[int, int, int, int]] = []
+    for (bx0, by0, bx1, by1) in boxes:
+        ix0 = max(x0, int(bx0))
+        iy0 = max(y0, int(by0))
+        ix1 = min(x1, int(bx1))
+        iy1 = min(y1, int(by1))
+        if ix0 >= ix1 or iy0 >= iy1:
+            continue
+        if bx0 >= x0 and by0 >= y0 and bx1 <= x1 and by1 <= y1:
+            continue
+        inter = float((ix1 - ix0) * (iy1 - iy0))
+        area = float(max(1, (int(bx1) - int(bx0)) * (int(by1) - int(by0))))
+        if inter / area >= float(min_ratio):
+            out.append((int(bx0), int(by0), int(bx1), int(by1)))
+    return out
+
+
+def heal_straddles(
+    boxes: Sequence[Tuple[int, int, int, int]],
+    rect: Tuple[int, int, int, int],
+    bounds: Optional[Tuple[int, int]] = None,
+    min_ratio: float = STRADDLE_MIN_RATIO,
+    max_growth: float = STRADDLE_MAX_GROWTH,
+) -> Tuple[Tuple[int, int, int, int], int]:
+    cur = tuple(int(v) for v in rect)
+    base = float(max(1, cur[2] - cur[0]) * max(1, cur[3] - cur[1]))
+    healed = 0
+
+    for _ in range(int(STRADDLE_MAX_ROUNDS)):
+        cut = straddling_boxes(boxes, cur, min_ratio)
+        if not cut:
+            break
+
+        nx0 = min([cur[0]] + [b[0] for b in cut])
+        ny0 = min([cur[1]] + [b[1] for b in cut])
+        nx1 = max([cur[2]] + [b[2] for b in cut])
+        ny1 = max([cur[3]] + [b[3] for b in cut])
+
+        if bounds is not None:
+            nx0 = max(0, nx0)
+            ny0 = max(0, ny0)
+            nx1 = min(int(bounds[0]), nx1)
+            ny1 = min(int(bounds[1]), ny1)
+
+        if (nx0, ny0, nx1, ny1) == cur:
+            break
+
+        area = float(max(1, nx1 - nx0) * max(1, ny1 - ny0))
+        if area > base * float(max_growth):
+            break
+
+        cur = (nx0, ny0, nx1, ny1)
+        healed += len(cut)
+
+    return cur, healed
 
 
 def median_text_height(

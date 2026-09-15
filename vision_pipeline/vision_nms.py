@@ -65,6 +65,7 @@ class CropPlan:
         self.legible: int = 0
         self.patches_total: int = 0
         self.coverage: float = 0.0
+        self.owned_patches: int = 0
 
     def area(self) -> int:
         x0, y0, x1, y1 = self.bbox
@@ -84,6 +85,7 @@ class CropPlan:
             "table_rows": self.table_rows,
             "legible": self.legible,
             "patches_total": self.patches_total,
+            "owned_patches": self.owned_patches,
             "coverage": round(self.coverage, 4),
             "absorbed": list(self.absorbed),
         }
@@ -317,6 +319,10 @@ def col_gutters_from_boxes(
     return {r for r in range(rows) if not hit[r]}
 
 
+COL_BAND_UP_ROWS = 1
+BAND_FOREIGN_RUN = 2
+
+
 def expand_col_band(
     box: Tuple[int, int, int, int],
     content: np.ndarray,
@@ -325,6 +331,8 @@ def expand_col_band(
     cols: int,
     blocked_rows: Optional[set] = None,
     max_height: int = 0,
+    owned: Optional[np.ndarray] = None,
+    foreign_run: int = BAND_FOREIGN_RUN,
 ) -> Tuple[int, int, int, int]:
     br = set(blocked_rows or ())
     r_min, r_max, c_min, c_max = (int(v) for v in box)
@@ -337,21 +345,47 @@ def expand_col_band(
                 return True
         return False
 
+    def band_owned(r: int) -> bool:
+        if owned is None:
+            return True
+        for c in range(c_min, c_max + 1):
+            idx = r * cols + c
+            if idx < int(owned.size) and bool(owned[idx]):
+                return True
+        return False
+
+    run = 0
     while (
         r_max + 1 < rows
         and (r_max + 1) not in br
         and (r_max - r_min + 1) < cap
         and band_has(r_max + 1)
     ):
+        if band_owned(r_max + 1):
+            run = 0
+        else:
+            run += 1
+            if run > int(foreign_run):
+                break
         r_max += 1
 
+    run = 0
+    up_left = int(COL_BAND_UP_ROWS)
     while (
-        r_min > 0
+        up_left > 0
+        and r_min > 0
         and (r_min - 1) not in br
         and (r_max - r_min + 1) < cap
         and band_has(r_min - 1)
     ):
+        if band_owned(r_min - 1):
+            run = 0
+        else:
+            run += 1
+            if run > int(foreign_run):
+                break
         r_min -= 1
+        up_left -= 1
 
     return (r_min, r_max, c_min, c_max)
 
@@ -362,6 +396,7 @@ PLINKO_FLOOR_RATIO = 0.55
 PLINKO_SEED_MIN = 0.0
 PLINKO_MAX_ROUNDS = 10
 PLINKO_BRIDGE_BONUS = 0.01
+PLINKO_FOREIGN_RUN = 2
 PLINKO_SIDES = ("down", "right", "up", "left")
 PLINKO_ARROW = {"up": "↑", "down": "↓", "left": "←", "right": "→"}
 
@@ -432,6 +467,11 @@ def plinko_grow_region(
     )
     axis = "조인트 코사인" if anchor is not None else "친화도 평균"
 
+    own_scores = getattr(heatmap, "scores", None)
+    owned_mask = None
+    if own_scores is not None:
+        owned_mask = np.isfinite(np.asarray(own_scores, dtype=np.float32))
+
     def _score(box: Tuple[int, int, int, int]) -> float:
         cells = [i for i in _box_patches(box, cols) if i < total]
         if not cells:
@@ -460,6 +500,7 @@ def plinko_grow_region(
         return cur, trace, axis
 
     floor = seed_s * float(PLINKO_FLOOR_RATIO)
+    foreign_run = 0
 
     for _round in range(max(1, int(max_rounds))):
         best = None
@@ -487,6 +528,15 @@ def plinko_grow_region(
             if inked <= 0 and bridge <= 0:
                 continue
 
+            own_n = 0
+            if owned_mask is not None:
+                own_n = sum(
+                    1 for i in cells
+                    if i < int(owned_mask.size) and bool(owned_mask[i])
+                )
+            if own_n <= 0 and foreign_run >= int(PLINKO_FOREIGN_RUN):
+                continue
+
             s = _score(cand)
             if not np.isfinite(s):
                 continue
@@ -504,20 +554,23 @@ def plinko_grow_region(
 
             gain = (s - cur_s) + PLINKO_BRIDGE_BONUS * float(bridge)
             if best is None or gain > best[0]:
-                best = (gain, side, cand, s, bridge, inked)
+                best = (gain, side, cand, s, bridge, inked, own_n)
 
         if best is None:
             break
 
-        _gain, side, cand, s, bridge, inked = best
+        _gain, side, cand, s, bridge, inked, own_n = best
         why = (
             f"검출박스 {bridge}개가 경계를 가로지름"
             if bridge else f"내용 {inked}칸"
         )
+        if own_n <= 0:
+            why += " / 영토 밖"
         trace.append(
             f"{PLINKO_ARROW[side]} {cur_s:+.4f}→{s:+.4f} ({why})"
         )
         cur, cur_s = cand, s
+        foreign_run = 0 if own_n > 0 else foreign_run + 1
 
     return cur, trace, axis
 
@@ -590,12 +643,21 @@ def presence_gate(
 CROP_PAD_LINES_Y = 0.55
 CROP_PAD_LINES_X = 1.30
 CROP_PAD_FLOOR_PX = 4.0
+STRADDLE_MAX_GROWTH_NOTE = "1.9배"
 
 MERGE_FILL_DROP = 0.65
 MERGE_PAGE_RATIO = 0.55
 MERGE_ROW_GAP = 1
 MULTI_CROP_LIMIT = 3
 CROP_MERGE_IOU = 0.25
+CROP_SNAP_IOU = 0.75
+CROP_TWIN_IOU = 0.90
+COVERAGE_RESCUE_MAX = 5
+COVERAGE_RESCUE_MIN_CELLS = 3
+COVERAGE_RESCUE_SPLIT_ROUNDS = 4
+COVERAGE_RESCUE_SPLIT_PASSES = 4
+RESCUE_OWNER_MIN_SHARE = 0.20
+RESCUE_MIN_LEGIBLE = 1
 
 
 def crop_pad_px(
@@ -782,20 +844,31 @@ def plan_crops(
         col_gutter_cache[key] = out
         return out
 
+    heal_stat = {"boxes": 0, "crops": 0}
+
     def _tight(px: Tuple[int, int, int, int]) -> Tuple[int, int, int, int]:
         if not text_boxes:
             return px
-        from .text_boxes import box_tighten
+        from .text_boxes import box_tighten, heal_straddles
         fitted = box_tighten(
             text_boxes, px,
             pad_x=pad_grid[0], pad_y=pad_grid[1],
             bounds=(grid.orig_width, grid.orig_height),
         )
-        return fitted if fitted is not None else px
+        base = fitted if fitted is not None else px
+        healed, cut = heal_straddles(
+            text_boxes, base,
+            bounds=(grid.orig_width, grid.orig_height),
+        )
+        if cut:
+            heal_stat["boxes"] += int(cut)
+            heal_stat["crops"] += 1
+        return healed
 
     has_legibility = (
         legibility is not None and int(getattr(legibility, "size", 0)) == n
     )
+    det_live = bool(text_boxes)
 
     def _region_ink(
         gb: Tuple[int, int, int, int],
@@ -826,17 +899,26 @@ def plan_crops(
         boxed_n, legible_n, inked_n = _region_ink(gb, px_box)
         if boxed_n > 0:
             return False, boxed_n, legible_n, inked_n
+        if det_live:
+            return True, boxed_n, legible_n, inked_n
         if legible_n >= 0:
             return legible_n <= 0, boxed_n, legible_n, inked_n
         return inked_n <= 0, boxed_n, legible_n, inked_n
 
     if log is not None:
         log.append(
-            f"  🧪 [BLANK GATE] 후보 영역 판정 기준을 STEP 4 의 "
-            f"EMPTY CROP SKIP 과 일치시킵니다 — 교차 검출 박스 0개 이고 "
-            f"{'판독 가능 패치' if has_legibility else '잉크 패치'} 0개면 "
-            f"크롭을 만들지 않습니다. content_ok 는 판독불가 잉크까지 "
-            f"포함하므로 plan 단계에서만 통과시키는 원인이었습니다."
+            f"  🧪 [BLANK GATE] 텍스트 검출기가 이 지면에서 박스 "
+            f"{len(text_boxes or [])}개를 찾았습니다. "
+            + (
+                "교차 박스가 0개인 영역은 판독 가능 패치가 몇 개든 "
+                "크롭하지 않습니다 — STEP 4 의 EMPTY CROP SKIP 이 정확히 "
+                "같은 조건으로 OCR 을 거부하므로, 계획만 무르게 두면 "
+                "업스케일 버퍼를 잡았다가 한 글자도 못 읽고 버립니다"
+                if det_live
+                else "검출기가 이 지면에서 박스를 하나도 못 찾았으므로 "
+                "판독 가능 패치 유무로만 가릅니다"
+            )
+            + "."
         )
 
     if log is not None:
@@ -941,7 +1023,7 @@ def plan_crops(
                 vlocal = _col_gutters(gb[2], gb[3])
                 vb = expand_col_band(
                     gb, content, content_gate, rows, cols,
-                    br | vlocal, cap_h,
+                    br | vlocal, cap_h, owned=finite,
                 )
                 if (vb[0], vb[1]) != (gb[0], gb[1]):
                     col_hits += 1
@@ -1335,12 +1417,15 @@ def plan_crops(
     if text_boxes:
         fitted_n = 0
         saved_px = 0
+        grown_n = 0
         for w in winners:
             fitted = _tight(w.bbox)
             if fitted == w.bbox:
                 continue
             before_a = max(1, (w.bbox[2] - w.bbox[0]) * (w.bbox[3] - w.bbox[1]))
             after_a = max(1, (fitted[2] - fitted[0]) * (fitted[3] - fitted[1]))
+            if after_a > before_a:
+                grown_n += 1
             if log is not None:
                 log.append(
                     f"    📐 [TEXT FIT] '{w.category}' 크롭을 안쪽 글자 "
@@ -1351,12 +1436,27 @@ def plan_crops(
             w.bbox = fitted
             fitted_n += 1
         if log is not None and fitted_n:
+            tail = (
+                f" | 패드 범위 안에서만 넓어진 크롭 {grown_n}건"
+                if grown_n else ""
+            )
             log.append(
                 f"    📐 [TEXT FIT] {fitted_n}건의 크롭이 글자 경계 안쪽으로 "
                 f"정렬되었습니다 — 여백 {saved_px / 1000.0:.0f}K px² 제거. "
                 f"경계 밖으로는 글자 높이에서 계산한 "
                 f"가로 {pad_grid[0]:.0f}px / 세로 {pad_grid[1]:.0f}px 만 "
-                f"넘어갑니다."
+                f"넘어갑니다.{tail}"
+            )
+        if log is not None and heal_stat["crops"]:
+            log.append(
+                f"    🩺 [STRADDLE HEAL] 크롭 경계가 단어 한가운데를 지나던 "
+                f"{heal_stat['crops']}건에서 검출 박스 {heal_stat['boxes']}개를 "
+                f"통째로 끌어왔습니다 (면적 상한 "
+                f"{STRADDLE_MAX_GROWTH_NOTE}). 격자 한 칸이 "
+                f"{grid.cell_width():.0f}px 인데 글자 박스는 "
+                f"{text_h:.0f}px 라, 밴드 확장이 칸 단위로 맞아떨어져도 "
+                f"단어 중심이 경계 밖이면 패드 {pad_grid[0]:.0f}px 로는 "
+                f"닿지 않아 'EXPORTER' 가 'RTER' 로 잘렸습니다."
             )
 
     for h in heatmaps:
@@ -1463,63 +1563,144 @@ def plan_crops(
                     f"| Peak: {peak:+.4f}"
                 )
 
-    covered_rows = set()
+    covered = np.zeros((n,), dtype=bool)
     for w in winners:
-        r0, r1, _c0, _c1 = w.grid_box
-        covered_rows |= set(range(int(r0), int(r1) + 1))
-    missing = [r for r in content_rows if r not in covered_rows]
+        for i in _box_patches(w.grid_box, cols):
+            if i < n:
+                covered[i] = True
+
+    hole = np.asarray(
+        [bool(content_ok[i]) and not bool(covered[i]) for i in range(n)],
+        dtype=bool,
+    )
+    holes = int(hole.sum())
+    missing_rows = sorted({i // cols for i in range(n) if bool(hole[i])})
+
     if log is not None:
-        if missing:
+        if holes:
             log.append(
-                f"    ⚠️ [COVERAGE GUARANTEE] 내용 행 {len(missing)}개가 "
-                f"어떤 크롭에도 없습니다: {missing[:12]}"
+                f"    ⚠️ [COVERAGE GUARANTEE] 내용 칸 {holes}개가 어떤 크롭에도 "
+                f"없습니다 (행 {missing_rows[:12]}). 행 단위로만 세면 같은 행의 "
+                f"다른 열이 통째로 빠져도 통과합니다 — 실제로 CONSIGNEE 주소 "
+                f"셀과 하단 말풍선이 그렇게 빠졌습니다."
             )
         else:
             log.append(
-                "    ✅ [COVERAGE GUARANTEE] 모든 내용 행이 최소 하나의 "
+                "    ✅ [COVERAGE GUARANTEE] 모든 내용 칸이 최소 하나의 "
                 "크롭에 포함되어 있습니다."
             )
 
-    if missing and winners:
-        bands: List[Tuple[int, int]] = []
-        run = [missing[0], missing[0]]
-        for r in missing[1:]:
-            if r == run[1] + 1:
-                run[1] = r
-                continue
-            bands.append((run[0], run[1]))
-            run = [r, r]
-        bands.append((run[0], run[1]))
+    if holes and winners:
+        base = np.where(np.isfinite(content), content, 0.0).astype(np.float32)
+        span = float(np.max(base) - np.min(base))
+        if span < 1e-6:
+            base = np.zeros_like(base)
+            span = 1.0
+        rel = (base - float(np.min(base))) / span
+        hole_field = np.where(hole, rel + 1e-3, -1.0).astype(np.float32)
+        blobs = extract_components(hole_field, rows, cols, 0.0)
+
+        first_over = len([c for c in blobs if c.area > area_cap])
+        before_n = len(blobs)
+        passes = 0
+
+        for _round in range(COVERAGE_RESCUE_SPLIT_PASSES):
+            if not any(c.area > area_cap for c in blobs):
+                break
+            refined: List[Component] = []
+            progressed = False
+            for comp in blobs:
+                if comp.area <= area_cap:
+                    refined.append(comp)
+                    continue
+                subs = split_oversized(
+                    hole_field, comp, rows, cols, 0.0, area_cap,
+                    bc, br, max_rounds=COVERAGE_RESCUE_SPLIT_ROUNDS,
+                )
+                if subs and len(subs) > 1:
+                    refined.extend(subs)
+                    progressed = True
+                else:
+                    refined.append(comp)
+            blobs = refined
+            passes += 1
+            if not progressed:
+                break
+
+        if first_over and log is not None:
+            left = len([c for c in blobs if c.area > area_cap])
+            log.append(
+                f"    ✂️ [RESCUE SPLIT] 미커버 덩이 {first_over}개가 면적 "
+                f"상한 {area_cap}칸을 넘어 {before_n}개 → {len(blobs)}개로 "
+                f"쪼갰습니다 ({passes}회 반복 / 잔여 초과 {left}개). 한 번만 "
+                f"쪼개면 갈라진 조각이 다시 상한을 넘어도 그대로 버려지므로, "
+                f"더 갈라지지 않을 때까지 히트맵 분위수 게이트를 올려 가며 "
+                f"반복합니다."
+            )
+
+        blobs.sort(key=lambda c: len(c.indices), reverse=True)
 
         added = 0
-        for br0, br1 in bands:
-            rc0, rc1 = cols, 0
-            for rr in range(br0, br1 + 1):
-                for c in range(cols):
-                    i = rr * cols + c
-                    if i < n and bool(content_ok[i]):
-                        rc0 = min(rc0, c)
-                        rc1 = max(rc1, c)
-            if rc0 > rc1:
-                rc0, rc1 = 0, cols - 1
+        for comp in blobs:
+            if added >= COVERAGE_RESCUE_MAX:
+                break
+            if len(comp.indices) < COVERAGE_RESCUE_MIN_CELLS:
+                continue
+            if comp.area > area_cap:
+                if log is not None:
+                    log.append(
+                        f"    ⛔ [RESCUE SKIP] 미커버 덩이 grid"
+                        f"({comp.r_min}, {comp.r_max}, {comp.c_min}, "
+                        f"{comp.c_max}) 은 {comp.area}칸으로 상한 "
+                        f"{area_cap}칸을 넘습니다. 쪼개지지 않는 큰 여백이라 "
+                        f"크롭하지 않습니다 — 이 자리에 통 크롭을 만들면 "
+                        f"여러 카테고리 글자가 한 축으로 몰립니다."
+                    )
+                continue
+
+            br0, br1 = comp.r_min, comp.r_max
+            rc0, rc1 = comp.c_min, comp.c_max
 
             owner = ""
             owner_field = ""
             best_score = -np.inf
+            best_share = 0.0
+            best_rank = -np.inf
+            near = ""
+            near_share = 0.0
             for h in heatmaps:
                 fin = np.isfinite(h.scores)
-                for rr in range(br0, br1 + 1):
-                    for c in range(rc0, rc1 + 1):
-                        i = rr * cols + c
-                        if i >= h.scores.size or not fin[i]:
-                            continue
-                        if float(h.scores[i]) > best_score:
-                            best_score = float(h.scores[i])
-                            owner = h.category
-                            owner_field = top_field_of.get(
-                                h.category, h.category
-                            )
+                own = [
+                    float(h.scores[i]) for i in comp.indices
+                    if i < h.scores.size and fin[i]
+                ]
+                if not own:
+                    continue
+                share = float(len(own)) / float(max(1, len(comp.indices)))
+                if share > near_share:
+                    near_share = share
+                    near = h.category
+                if share < RESCUE_OWNER_MIN_SHARE:
+                    continue
+                rank = share * (sum(own) / float(len(own)))
+                if rank > best_rank:
+                    best_rank = rank
+                    best_share = share
+                    best_score = max(own)
+                    owner = h.category
+                    owner_field = top_field_of.get(h.category, h.category)
             if not owner:
+                if log is not None:
+                    log.append(
+                        f"    ⛔ [RESCUE OWNER] 미커버 덩이 grid"
+                        f"({comp.r_min}, {comp.r_max}, {comp.c_min}, "
+                        f"{comp.c_max}) 은 어느 카테고리도 지분이 "
+                        f"{RESCUE_OWNER_MIN_SHARE:.0%} 를 넘지 못합니다 "
+                        f"(최고 '{near or '-'}' {near_share:.0%}). 지분에 "
+                        f"평균 점수를 곱한 값을 지분 임계와 비교하면 한 칸짜리 "
+                        f"봉우리가 점수만으로 문턱을 넘습니다 — 문턱은 지분만, "
+                        f"순위는 지분×평균으로 나눕니다."
+                    )
                 continue
 
             gb = _pad_grid_box(
@@ -1529,46 +1710,91 @@ def plan_crops(
                 grid.region_bbox(*gb),
                 grid.orig_width, grid.orig_height, min_w, min_h,
             ))
+
+            blank, boxed_n, legible_n, inked_n = _region_blank(gb, px)
+            thin = legible_n >= 0 and legible_n < RESCUE_MIN_LEGIBLE
+            if blank or thin:
+                if log is not None:
+                    log.append(
+                        f"    ⛔ [COVERAGE SKIP] 미커버 덩이 grid{gb} 에는 "
+                        f"읽을 글자가 없습니다 (검출 박스 {boxed_n} / 판독 "
+                        f"가능 {max(0, legible_n)} / 잉크 {inked_n}). 구제 "
+                        f"크롭은 판독 가능 패치를 최소 "
+                        f"{RESCUE_MIN_LEGIBLE}개 요구합니다 — 로고 테두리나 "
+                        f"도장도 검출 박스로 잡혀 빈 크롭이 통과했습니다."
+                    )
+                continue
+
             if any(compute_iou(px, w.bbox) >= iou_threshold for w in winners):
                 continue
 
             plan = CropPlan(
                 owner, px, best_score, 0.0,
-                (br1 - br0 + 1) * (rc1 - rc0 + 1),
-                gb, source="coverage-rescue",
+                len(comp.indices), gb, source="coverage-rescue",
             )
             plan.top_field = owner_field
+            plan.owned_patches = int(round(best_share * len(comp.indices)))
             winners.append(plan)
             added += 1
             if log is not None:
                 log.append(
-                    f"    🩹 [COVERAGE RESCUE] 미커버 행 밴드 r{br0}~{br1} "
-                    f"(c{rc0}~{rc1}) 를 '{owner}' 소유로 전용 크롭합니다. "
-                    f"→ px{px} | Peak: {best_score:+.4f} — 기존 크롭을 "
-                    f"넓히지 않습니다."
+                    f"    🩹 [COVERAGE RESCUE] 미커버 덩이 r{br0}~{br1} "
+                    f"c{rc0}~{rc1} ({len(comp.indices)}칸) 를 '{owner}' 소유로 "
+                    f"전용 크롭합니다. → px{px} | Peak: {best_score:+.4f} "
+                    f"— 기존 크롭을 넓히지 않습니다."
                 )
         if log is not None:
             log.append(
-                f"    🩹 [COVERAGE RESCUE] 누락 행 {len(missing)}개를 밴드 "
-                f"{len(bands)}개로 묶어 전용 크롭 {added}건을 추가했습니다."
+                f"    🩹 [COVERAGE RESCUE] 미커버 칸 {holes}개를 덩이 "
+                f"{len(blobs)}개로 묶어 큰 것부터 {added}건만 전용 크롭했습니다 "
+                f"(상한 {COVERAGE_RESCUE_MAX}건 — 크롭이 늘면 OCR 시간과 "
+                f"업스케일 버퍼가 함께 늘어납니다)."
             )
 
-    seen_boxes: Dict[Tuple[int, int, int, int], str] = {}
+    seen_boxes: List[Tuple[Tuple[int, int, int, int], str]] = []
     twins: List[str] = []
+    snapped = 0
     for w in sorted(winners, key=lambda p: -p.score):
-        owner = seen_boxes.get(w.bbox)
-        if owner is None:
-            seen_boxes[w.bbox] = w.category
+        cand = tuple(int(v) for v in w.bbox)
+        owner = ""
+        for box, cat in seen_boxes:
+            if box == cand:
+                owner = cat
+                break
+            iou = compute_iou(box, cand)
+            if iou < CROP_SNAP_IOU:
+                continue
+            covers = (
+                box[0] <= cand[0] and box[1] <= cand[1]
+                and box[2] >= cand[2] and box[3] >= cand[3]
+            )
+            if not covers and iou < CROP_TWIN_IOU:
+                continue
+            if log is not None:
+                log.append(
+                    f"    🔗 [CROP SNAP] '{w.category}' px{cand} 를 "
+                    f"'{cat}' px{box} 에 맞춥니다 (IoU {iou:.2f}"
+                    f"{' / 완전 포함' if covers else ''}). grid 박스가 같은데 "
+                    f"TEXT FIT 뒤 px 가 몇십 px 어긋나면 완전 일치 검사도 OCR "
+                    f"원장도 놓쳐 같은 지면을 두 번 읽습니다."
+                )
+            w.bbox = box
+            owner = cat
+            snapped += 1
+            break
+        if not owner:
+            seen_boxes.append((cand, w.category))
             continue
         twins.append(w.category)
         w.source = f"twin-of:{owner}"
 
     if log is not None and twins:
+        tail = f" | 좌표 스냅 {snapped}건" if snapped else ""
         log.append(
-            f"    👯 [TWIN CROP] 좌표가 완전히 같은 크롭 {len(twins)}건 "
+            f"    👯 [TWIN CROP] 좌표가 같은 크롭 {len(twins)}건 "
             f"({', '.join(twins)}) — 점수가 낮은 쪽은 배열을 만들지 "
             f"않습니다. 같은 표에서 두 카테고리가 같은 값을 복제하는 것을 "
-            f"막습니다."
+            f"막습니다.{tail}"
         )
 
     merged: List[CropPlan] = []
@@ -1616,6 +1842,9 @@ def plan_crops(
         )
         same.score = max(same.score, w.score)
 
+    hm_by_cat = {h.category: h for h in heatmaps}
+    starved: List[str] = []
+
     for p in merged:
         box = _box_patches(p.grid_box, cols)
         p.patches_total = len(box)
@@ -1623,12 +1852,38 @@ def plan_crops(
             p.legible = int(sum(
                 1 for i in box if i < n and bool(legibility.legible[i])
             ))
+
+        own = hm_by_cat.get(p.category)
+        if own is not None:
+            fin = np.isfinite(own.scores)
+            bx0, by0, bx1, by1 = p.bbox
+            hit = 0
+            for i in range(min(int(own.scores.size), n)):
+                if not fin[i] or own.scores[i] <= 0.0:
+                    continue
+                r, c = divmod(i, cols)
+                cx = (c + 0.5) * cw_px
+                cy = (r + 0.5) * ch_px
+                if bx0 <= cx <= bx1 and by0 <= cy <= by1:
+                    hit += 1
+            p.owned_patches = hit
+            if hit <= 0:
+                starved.append(f"{p.category}{p.bbox}")
+
         r0, r1, _c0, _c1 = p.grid_box
         if tb_span > 0:
             p.table_rows = len(
                 set(range(int(r0), int(r1) + 1))
                 & set(range(int(tb_start), int(tb_end) + 1))
             )
+
+    if log is not None and starved:
+        log.append(
+            f"    🧭 [TERRITORY TAG] 최종 좌표 안에 자기 영토 패치가 한 칸도 "
+            f"없는 크롭 {len(starved)}건을 표시했습니다 — "
+            f"{', '.join(starved[:6])}. STEP 4 에서 이 크롭은 라벨↔값 쌍만 "
+            f"쓰고 줄 전체를 값으로 승격하지 않습니다."
+        )
 
     merged.sort(key=lambda p: (p.bbox[1], p.bbox[0]))
     if ident:
