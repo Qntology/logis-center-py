@@ -639,7 +639,7 @@ Both are installed by `requirements.txt`. If neither is present, PDF input is di
 
 Digital PDFs already carry an extractable text layer. When at least half the processed pages qualify (≥40 characters and ≥20 alphanumerics each), the engine skips OCR and the VLM entirely and feeds the embedded text straight into the text pipeline:
 
-### License Compatibility — No Copyleft
+### License Compatibility
 
 Every runtime dependency of this project is permissively licensed. There is **no GPL, no LGPL, and no AGPL** component in the dependency graph, so the Apache-2.0 terms of this repository apply cleanly to any redistribution, including closed-source binaries.
 

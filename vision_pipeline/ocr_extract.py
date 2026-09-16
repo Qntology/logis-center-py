@@ -343,6 +343,12 @@ LABEL_CANDIDATE_TOPK = 3
 LABEL_SHORT_LEN = 9
 LABEL_SHORT_FLOOR = 0.80
 
+FORMAT_MISMATCH_MIN_CHARS = 3
+
+
+def alnum_count(text: str) -> int:
+    return sum(1 for ch in str(text or "") if ch.isalnum())
+
 
 def label_cosine_floor(label: str) -> float:
     n = len(_compact_label(label))
@@ -984,6 +990,7 @@ def promote_by_labels(
     cands: List[Tuple[float, int, str, str]] = []
     trace: Dict[Tuple[int, str], Tuple[str, float, float]] = {}
     picked: Dict[str, Tuple[int, str]] = {}
+    short_blocked: List[str] = []
     noisy = 0
     label_echo = 0
     unmatched = 0
@@ -1007,6 +1014,16 @@ def promote_by_labels(
             adj = float(score) * pen
             if adj < LABEL_COSINE_FLOOR:
                 fmt_blocked += 1
+                continue
+            vlen = alnum_count(value)
+            if pen < 1.0 and vlen < FORMAT_MISMATCH_MIN_CHARS:
+                fmt_blocked += 1
+                if len(short_blocked) < 8:
+                    short_blocked.append(
+                        f"{field} = {value[:16]} "
+                        f"(형식 {fmt or '미추론'} / {vlen}자 / "
+                        f"원점수 {float(score):.2f} × 감점 {pen:.2f})"
+                    )
                 continue
             trace[(idx, str(field))] = (fmt, float(score), pen)
             cands.append((float(adj), idx, str(field), value))
@@ -1051,12 +1068,6 @@ def promote_by_labels(
             f"| 미매칭 {unmatched}건 | 형식 불일치 {fmt_blocked}건 차단 "
             f"| 라벨 에코 {label_echo}건 | 잡음값 {noisy}건 폐기"
         )
-        log.append(
-            f"       ℹ 형식 게이트는 하드 거부가 아니라 곱셈 감점입니다 — "
-            f"원점수 × 감점이 바닥값 {LABEL_COSINE_FLOOR:.2f} 을 넘으면 "
-            f"형식이 어긋나도 통과합니다. 아래 줄의 '형식' 과 '감점' 이 "
-            f"이름 필드가 순수 숫자를 받아들인 경로를 보여 줍니다."
-        )
         for k, payload in list(own.items())[:8]:
             log.append(
                 f"       · {k} = {str(payload[0])[:40]} "
@@ -1067,6 +1078,18 @@ def promote_by_labels(
                 f"       ↗ {k} = {str(payload[0])[:40]} "
                 f"(사전 코사인 {float(payload[1]):.2f}){_pair_note(k)}"
             )
+
+    if log is not None and short_blocked:
+        log.append(
+            f"       🚧 [SHORT MISMATCH] 형식을 어긴 데다 영숫자 "
+            f"{FORMAT_MISMATCH_MIN_CHARS}자 미만인 값 {len(short_blocked)}건을 "
+            f"곱셈 감점 대신 통째로 막았습니다 — 감점은 0.72 라 원점수가 "
+            f"1.00 이면 바닥값 {LABEL_COSINE_FLOOR:.2f} 을 넘어 통과합니다. "
+            f"긴 값은 스키마가 형식을 안 적어 억울하게 감점당한 식별자일 수 "
+            f"있어 살리고, 한두 글자는 형식도 길이도 근거가 없어 버립니다."
+        )
+        for line in short_blocked:
+            log.append(f"          · {line}")
 
     return own, donated
 
