@@ -182,28 +182,6 @@ def build_patch_grid(
             source="ocr",
         )
 
-    if embedder is not None:
-        pg = embedder.embed_image(image)
-        feats = np.asarray(pg.embeddings, dtype=np.float32)
-        grid = VisionPatchGrid(
-            embeddings=feats,
-            rows=pg.grid_rows,
-            cols=pg.grid_cols,
-            orig_width=pg.orig_width,
-            orig_height=pg.orig_height,
-            scale_x=pg.scale_x,
-            scale_y=pg.scale_y,
-            patch_size=pg.patch_size,
-            source="ax-ve",
-        )
-        if align_to is not None and grid.num_patches != align_to.num_patches:
-            grid.embeddings = _l2_rows(
-                _resample_to_grid(grid.embeddings, align_to.num_patches)
-            )
-            grid.rows = align_to.rows
-            grid.cols = align_to.cols
-            grid.num_patches = align_to.num_patches
-        return grid
 
     if ocr is not None and hasattr(ocr, "embed_image_patches"):
         out = ocr.embed_image_patches(image)
@@ -225,11 +203,10 @@ def build_patch_grid(
         )
 
     raise RuntimeError(
-        "패치 격자를 만들 수 있는 모델이 없습니다.\n"
+        "패치 격자를 만들 수 없는 모델이 없습니다.\n"
         "  PP-OCRv5 rec 는 텍스트 라인 인식 전용이라 패치 격자를 만들지 "
         "못합니다.\n"
-        "  SigLIP2 조인트(lang:siglip2) 또는 A.X-VE(base:ax-ve) 중 하나를 "
-        "준비하세요."
+        "  SigLIP2 조인트(lang:siglip2)를 준비하세요."
     )
 
 

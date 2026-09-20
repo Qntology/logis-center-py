@@ -32,7 +32,6 @@ from core.crossover import (
     SLOT_NLP,
     SLOT_OCR,
     SLOT_REFINER,
-    SLOT_VISION,
 )
 from core.device import detect_accelerator, get_vram_info, select_dtype
 from core.lang_codes import (
@@ -188,7 +187,7 @@ class NMSOcrApp:
 
     @property
     def embedder(self):
-        return self.crossover.get(SLOT_VISION)
+        return None
 
     @property
     def ocr(self):
@@ -427,42 +426,9 @@ class NMSOcrApp:
         for line in self.registry.report_lines():
             self._log(line)
 
-    AXVE_CODE_FILES = (
-        "configuration_ax_ve.py",
-        "modeling_ax_ve.py",
-        "image_processing_ax_ve.py",
-    )
-
-    def _axve_ready(self) -> Tuple[bool, str]:
-        try:
-            if is_manual_only("ax-ve"):
-                return False, "수동 배치 전용으로 표시되어 있습니다"
-            if not is_model_ready("ax-ve"):
-                return False, "가중치가 없거나 크기가 비정상입니다"
-        except Exception as e:
-            return False, f"상태 확인 실패 ({type(e).__name__}: {e})"
-
-        from core.model_manager import BASE_DIR as _MM_BASE, VISION_ENC_PATH
-
-        for cand in (Path(_MM_BASE) / "ax-ve", Path(VISION_ENC_PATH)):
-            if not cand.is_dir():
-                continue
-            if all((cand / f).exists() for f in self.AXVE_CODE_FILES):
-                return True, str(cand)
-
-        return False, (
-            f"모델 정의 코드({', '.join(self.AXVE_CODE_FILES)})를 "
-            f"찾지 못했습니다"
-        )
 
     def _register_slots(self):
-        def _load_vision():
-            from core.embedding import AXVEEmbedder
-            return AXVEEmbedder(str(ensure_model_dir("ax-ve")))
-
-        joint_path, joint_label, joint_code = resolve_joint_path(
-            self.lang_code, self.active_codes
-        )
+        joint_path, joint_label, joint_code = resolve_joint_path(self.lang_code, self.active_codes)
 
         if joint_path:
             if SLOT_JOINT not in self.crossover.slots:
@@ -483,73 +449,12 @@ class NMSOcrApp:
                 self.crossover.register(
                     SLOT_JOINT, _load_joint, label=joint_label, est_gb=1.6
                 )
-                self.joint_label = joint_label
-                self.prefer_grid = "joint"
-                self._log(
-                    f"  🪢 SigLIP2 조인트 슬롯 등록 — '{joint_label}' "
-                    f"(언어 {joint_code}) | 패치 격자와 텍스트 앵커를 "
-                    f"동일 대조 공간에서 계산합니다."
-                )
-                self._log(
-                    f"  📌 [GRID POLICY] 격자는 언어와 무관하게 SigLIP2 로 "
-                    f"일원화합니다. A.X-VE 는 텍스트 타워가 없어 "
-                    f"(비전 전용 1152차원) 앵커와 같은 공간을 만들지 "
-                    f"못하므로, SigLIP2 를 쓸 수 없을 때만 임시 격자로 "
-                    f"동원합니다."
-                )
-
-            if SLOT_VISION in self.crossover.slots:
-                self.crossover.release(SLOT_VISION)
-                self.crossover.slots.pop(SLOT_VISION, None)
-
-            ready, why = self._axve_ready()
-            if ready:
-                self.crossover.register(
-                    SLOT_VISION, _load_vision,
-                    label="A.X-VE 비전 인코더 (임시 격자)", est_gb=0.9,
-                )
-                self.axve_standby = True
-                self._log(
-                    "  🅱 [GRID FALLBACK] A.X-VE 를 임시 격자 슬롯으로 "
-                    "등록만 해 둡니다. 평소에는 적재하지 않고, SigLIP2 가 "
-                    "메모리 때문에 오르지 못할 때만 깨웁니다."
-                )
-            else:
-                self.axve_standby = False
-                self._log(
-                    f"  ⏭ [GRID FALLBACK] A.X-VE 임시 격자를 준비하지 "
-                    f"못했습니다 — {why}. SigLIP2 를 적재하지 못하면 "
-                    f"파이프라인이 중단됩니다."
-                )
-        else:
-            self.prefer_grid = "vision"
-            ready, why = self._axve_ready()
-            self.axve_standby = bool(ready)
-
-            if ready and SLOT_VISION not in self.crossover.slots:
-                self.crossover.register(
-                    SLOT_VISION, _load_vision,
-                    label="A.X-VE 비전 인코더 (임시 격자)", est_gb=0.9,
-                )
-
-            self._log(
-                "  ⚠ SigLIP2 언어 텍스트 타워를 찾지 못해 A.X-VE 격자로 "
-                "내려갑니다. PP-OCRv5 rec 는 인식 전용이라 패치 격자를 "
-                "제공하지 않습니다."
-            )
-            if ready:
-                self._log(
-                    "  🚧 [DIM MISMATCH] A.X-VE 격자는 1152차원, 텍스트 "
-                    "앵커는 1024차원입니다. 문서 유형 분류와 필드 히트맵이 "
-                    "차원 불일치로 중단될 수 있습니다."
-                )
-            else:
-                self._log(
-                    f"  ❌ [GRID] A.X-VE 도 쓸 수 없습니다 — {why}. "
-                    f"환경설정 → 모델 관리에서 SigLIP2(lang:siglip2) 를 "
-                    f"내려받아야 파이프라인이 동작합니다."
-                )
-
+        self.joint_label = joint_label
+        self.prefer_grid = "joint"
+        self._log(f" 🪢 SigLIP2 조인트 슬롯 등록 — '{joint_label}' "
+                  f"(언어 {joint_code})| 패치 격자와 텍스트 앵커를 "
+                  f"동일 대조 공간에서 계산합니다.")
+        self.axve_standby = False
         self._register_ocr_slot()
 
     def _pick_ocr_code(self) -> str:
@@ -794,32 +699,12 @@ class NMSOcrApp:
         self._joint_registered = False
         self.joint_label = ""
         self.joint_dim = 0
-        self.prefer_grid = "vision"
-
-        if SLOT_VISION not in self.crossover.slots:
-            def _load_vision():
-                from core.embedding import AXVEEmbedder
-                return AXVEEmbedder(str(ensure_model_dir("ax-ve")))
-            self.crossover.register(
-                SLOT_VISION, _load_vision,
-                label="A.X-VE 비전 인코더 (임시 격자)", est_gb=0.9,
-            )
-
+        self.prefer_grid = "siglip2"
         if "text-router" not in self.vision_router.providers():
-            self.vision_router.register(
-                "text-router", lambda texts: self.router(texts), priority=100
-            )
-
-        self._log(
-            f"  ↩ [GRID FALLBACK] '{label}' 을 {self.joint_failures}회 "
-            f"실패해 A.X-VE 임시 격자 + 텍스트 앵커로 전환합니다."
-            + (f" ({reason})" if reason else "")
-        )
-        self._log(
-            "  🚧 [DIM MISMATCH] A.X-VE 는 비전 전용이라 텍스트 타워가 "
-            "없습니다. 격자 1152차원 vs 앵커 1024차원 불일치로 문서 유형 "
-            "분류가 중단될 수 있습니다. 이 경로는 임시 수단입니다."
-        )
+            self.vision_router.register("text-router", lambda texts: self.router(texts), priority=100)
+        self._log(f" ↩ [GRID FALLBACK] '{label}' 을 {self.joint_failures}회 "
+                  f"실패해 텍스트 앵커로 전환합니다."
+                  + (f" ({reason})" if reason else ""))
         return True
 
     def load_base_models(self) -> dict:
@@ -887,15 +772,6 @@ class NMSOcrApp:
                             self._log(f"      {line}")
                     if self._demote_joint(reason=str(e)[:90]):
                         break
-        else:
-            try:
-                self._log("🔄 A.X-VE 비전 인코더 로드 중...")
-                self._progress(10, "A.X-VE 로드 중")
-                self.crossover.acquire(SLOT_VISION)
-                self._progress(30, "A.X-VE 완료")
-            except Exception as e:
-                self._log(f"❌ A.X-VE 로드 실패: {e}")
-                return {"ok": False, "error": str(e)}
 
         try:
             self._log(
@@ -1681,18 +1557,9 @@ class NMSOcrApp:
                         "늘린 뒤 다시 실행하세요."
                     ),
                 }
-            try:
-                self.crossover.acquire(SLOT_VISION, protect=[SLOT_OCR])
-                self._log(
-                    "  🅱 [GRID FALLBACK] A.X-VE 임시 격자를 깨웠습니다. "
-                    "차원 불일치로 분류가 중단되면 SigLIP2 를 쓸 수 있는 "
-                    "메모리를 확보해야 합니다."
-                )
-            except Exception as e:
-                self._log(f"  ⚠ A.X-VE 임시 격자도 적재 실패({e})")
 
         pipeline = VisionPipeline(
-            self.vision_embed_fn, ocr=self.ocr, embedder=self.embedder,
+            self.vision_embed_fn, ocr=self.ocr, embedder=None,
             config=VisionPipelineConfig(
                 lang_code=self.lang_code if self.language_resolved else "",
                 prefer_grid=prefer,
@@ -2416,9 +2283,12 @@ class NMSOcrApp:
 
         self.crossover.enter_embedding_phase()
         if self.joint is None and self.embedder is None:
-            if SLOT_JOINT not in self.crossover.slots and \
-                    SLOT_VISION not in self.crossover.slots:
-                return {"ok": False, "error": "패치 격자 모델이 로드되지 않았습니다."}
+            if SLOT_JOINT not in self.crossover.slots:
+                return {"ok": False,
+                    "error": ("패치 격자 모델이 없습니다. "
+                        "SigLIP2 조인트(lang:siglip2)를 "
+                        "준비하세요."),
+                    }
 
         if self.ocr is None or not getattr(self.ocr, "available", False):
             self._log(
@@ -2431,26 +2301,12 @@ class NMSOcrApp:
 
         joint_obj = self._acquire_joint_for_grid()
         prefer = self.prefer_grid
-
-        if joint_obj is None and prefer == "vision":
-            if not self.axve_standby:
-                return {
-                    "ok": False,
-                    "error": (
-                        "패치 격자를 만들 모델을 적재하지 못했습니다.\n"
-                        f"  {memory_mod.pressure_summary()}\n"
-                        "  SigLIP2(lang:siglip2) 또는 A.X-VE(base:ax-ve) 중 "
-                        "하나가 메모리에 올라와야 합니다."
-                    ),
-                    "log": self.log_lines,
+        if joint_obj is None:
+            return {"ok": False,
+                "error": ("패치 격자를 만들 모델을 적재하지 못했습니다."
+                    f" {memory_mod.pressure_summary()}"
+                    " SigLIP2(lang:siglip2)가 메모리에 올라와야 합니다."),
                 }
-            try:
-                self.crossover.acquire(SLOT_VISION, protect=[SLOT_OCR])
-                self._log(
-                    "  🅱 [GRID FALLBACK] A.X-VE 임시 격자로 진행합니다."
-                )
-            except Exception as e:
-                self._log(f"  ⚠ A.X-VE 임시 격자 적재 실패({e})")
 
         for line in memory_mod.report_lines():
             self._log(line)
@@ -2506,7 +2362,7 @@ class NMSOcrApp:
             line_overlap=int(os.environ.get("NMS_LINE_OVERLAP", "0") or 0),
         )
         pipeline = VisionPipeline(
-            self.vision_embed_fn, ocr=self.ocr, embedder=self.embedder,
+            self.vision_embed_fn, ocr=self.ocr, embedder=None,
             config=cfg, log=self._log, nlp=self.nlp,
             crossover=self.crossover, joint=joint_obj,
             line_read_fn=self._line_read_fn() if use_refiner else None,
