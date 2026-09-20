@@ -62,7 +62,7 @@ class VisionPipelineConfig:
         enable_grounding: bool = True,
         cross_prejudice: bool = False,
         keep_crop: bool = True,
-        prefer_grid: str = "ocr",
+        prefer_grid: str = "siglip2",
         lang_code: str = "",
         doc_code: str = "",
         source_path: str = "",
@@ -184,9 +184,6 @@ class VisionPipeline:
         ocr = self.crossover.get("ocr")
         if ocr is not None:
             self.ocr = ocr
-        emb = self.crossover.get("vision")
-        if emb is not None:
-            self.embedder = emb
         jnt = self.crossover.get("joint")
         if jnt is not None:
             self.joint = jnt

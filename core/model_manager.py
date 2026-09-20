@@ -43,25 +43,6 @@ MODEL_SPECS: Dict[str, dict] = {
             "(Qwen3-Embedding / Qwen3.5-2B)이 그 역할을 대신합니다."
         ),
     },
-    "ax-ve": {
-        "label": "A.X-VE 비전 인코더",
-        "role": "vision",
-        "dir": VISION_ENC_PATH,
-        "asset_source": BASE_DIR / "ax-ve",
-        "min_size": 10_000_000,
-        "repo": "skt/A.X-VE",
-        "files": (
-            "config.json",
-            "model.safetensors",
-            "preprocessor_config.json",
-            "configuration_ax_ve.py",
-            "modeling_ax_ve.py",
-            "image_processing_ax_ve.py",
-            "processing_ax_ve.py",
-        ),
-        "required": ("config.json", "model.safetensors"),
-        "optional": ("processing_ax_ve.py",),
-    },
     "ppocr-det": {
         "label": "PP-OCRv5 mobile det (텍스트 영역 검출)",
         "role": "ocr",
@@ -99,7 +80,7 @@ MODEL_SPECS: Dict[str, dict] = {
 
 MODEL_KEYS = tuple(MODEL_SPECS.keys())
 
-CORE_MODEL_KEYS = ("ax-ve",)
+CORE_MODEL_KEYS = ()
 
 OPTIONAL_MODEL_KEYS = ("alphaedge-ai",)
 

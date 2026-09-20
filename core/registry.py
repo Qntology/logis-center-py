@@ -49,7 +49,7 @@ STEP_REQUIREMENTS: Dict[str, dict] = {
     },
     "patch_grid": {
         "label": "패치 임베딩 격자",
-        "base": ["ax-ve"],
+        "base": [],
         "lang": ["siglip2"],
         "bootstrap_lang": True,
         "stanza": False,
@@ -96,7 +96,6 @@ STEP_REQUIREMENTS: Dict[str, dict] = {
 
 PREREQUISITES: Dict[str, tuple] = {
     "base:siglip2-naflex": (),
-    "base:ax-ve": (),
     "base:ppocr-det": (),
     "lang:ppocr": (),
     "lang:siglip2": (),
@@ -107,7 +106,6 @@ PREREQUISITES: Dict[str, tuple] = {
 
 DOWNLOAD_ORDER = (
     "base:siglip2-naflex",
-    "base:ax-ve",
     "base:ppocr-det",
     "lang:ppocr",
     "lang:siglip2",
